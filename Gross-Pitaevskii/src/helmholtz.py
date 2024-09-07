@@ -93,6 +93,14 @@ def trainingdata(N_u, N_f):
 
     return X_f_train, X_u_train, u_train
 
+# Define the sine activation function as a custom nn.Module
+class SineActivation(nn.Module):
+    """
+       A custom Sine action function for use with PyTorch.
+    """
+    def forward(self, input):
+        return torch.sin(input)
+
 
 class SequentialModel(nn.Module):
     """
@@ -119,7 +127,7 @@ class SequentialModel(nn.Module):
         super().__init__()  # Call the parent class (nn.Module) initializer
 
         # Tanh activation function
-        self.activation = nn.LeakyReLU()
+        self.activation = SineActivation()
 
         # Mean squared error (MSE) loss function
         self.loss_function = nn.MSELoss(reduction='mean')
@@ -266,7 +274,7 @@ class SequentialModel(nn.Module):
         torch.Tensor
             The computed loss value.
         """
-        optimizer.zero_grad()
+        adam_optimizer.zero_grad()
 
         # Compute total loss
         loss_val = self.loss(X_u_train, u_train, X_f_train)
@@ -299,7 +307,7 @@ class SequentialModel(nn.Module):
         error_vec = torch.linalg.norm((u - u_pred), 2) / torch.linalg.norm(u, 2)
 
         # Reshape the predicted output to a 2D array
-        u_pred = np.reshape(u_pred.cpu().detach().numpy(), (256, 256), order='F')
+        u_pred = np.reshape(u_pred.cpu().detach().numpy(), (num_grid_pts, num_grid_pts), order='F')
 
         return error_vec, u_pred
 
@@ -352,9 +360,12 @@ def solutionplot(u_pred, X_u_train, u_train):
 
 if __name__ == "__main__":
 
+    # Specify the number of grid points
+    num_grid_pts = 256
+
     # Prepare training and test data
-    x_1 = np.linspace(-1, 1, 256)  # 256 points between -1 and 1 [256x1]
-    x_2 = np.linspace(1, -1, 256)  # 256 points between 1 and -1 [256x1]
+    x_1 = np.linspace(-1, 1, num_grid_pts)  # num_grid_pts points between -1 and 1 [num_grid_pts x 1]
+    x_2 = np.linspace(1, -1, num_grid_pts)  # num_grid_pts points between 1 and -1 [num_grid_pts x 1]
 
     X, Y = np.meshgrid(x_1, x_2)
 
@@ -394,8 +405,9 @@ if __name__ == "__main__":
     f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the physics equation residual
 
     # Neural network architecture definition
-    layers = np.array([2, 256, 128, 64, 32, 16,
-                       1])  # Input layer with 2 nodes, 5 hidden layers with variable nodes, and an output layer with 1 node
+
+    # Input layer with 2 nodes, 5 hidden layers with variable nodes, and an output layer with 1 node
+    layers = np.array([2, 300, 300, 300, 1])
 
     # Initialize the neural network model
     PINN = SequentialModel(layers)
@@ -412,31 +424,52 @@ if __name__ == "__main__":
     # Optimization Section
 
     # Adam Optimizer
-    optimizer = optim.Adam(PINN.parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
+    adam_optimizer = optim.Adam(PINN.parameters(), lr=0.01, betas=(0.9, 0.999), eps=1e-08,
+                              weight_decay=1e-4, amsgrad=False)
 
-    max_iter = 5000  # Number of iterations for optimization
+    # L-BFGS Optimizer (for fine-tuning)
+    lbfgs_optimizer = optim.LBFGS(PINN.parameters(), max_iter=500, tolerance_grad=1e-5, tolerance_change=1e-9,
+                                  history_size=100)
 
     start_time = time.time()  # Start the timer to measure training time
 
-    # Training loop
-    for i in range(max_iter):
+    # Number of iterations for Adam optimizer
+    adam_iter = 1000
 
+    # Adam training loop
+    for i in range(adam_iter):
         # Calculate the total loss (boundary condition loss + physics-informed loss)
         loss = PINN.loss(X_u_train, u_train, X_f_train)
 
         # Zero the gradient buffers of all parameters
-        optimizer.zero_grad()
+        adam_optimizer.zero_grad()
 
         # Backpropagation to calculate gradients
         loss.backward()
 
         # Update the model parameters using the optimizer
-        optimizer.step()
+        adam_optimizer.step()
 
-        # Print loss and error every 10 iterations
-        if i % (max_iter / 10) == 0:
+        # Print loss and error every 100 iterations
+        if i % (adam_iter // 10) == 0:
             error_vec, _ = PINN.test()  # Evaluate the model on test data
-            print(loss, error_vec)
+            print(f"Adam - Iteration {i}: Loss {loss.item()}, Error {error_vec.item()}")
+
+
+    # L-BFGS fine-tuning
+    def LBFGS_closure():
+        lbfgs_optimizer.zero_grad()
+        loss = PINN.loss(X_u_train, u_train, X_f_train)
+        loss.backward()
+        return loss
+
+
+    # Run L-BFGS optimizer
+    lbfgs_optimizer.step(LBFGS_closure)
+
+    # After L-BFGS optimization
+    error_vec, u_pred = PINN.test()
+    print(f'L-BFGS Test Error: {error_vec.item()}')
 
     # Measure the elapsed training time
     elapsed = time.time() - start_time
