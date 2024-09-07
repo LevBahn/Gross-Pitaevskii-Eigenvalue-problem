@@ -93,14 +93,6 @@ def trainingdata(N_u, N_f):
 
     return X_f_train, X_u_train, u_train
 
-# Define the sine activation function as a custom nn.Module
-class SineActivation(nn.Module):
-    """
-       A custom Sine action function for use with PyTorch.
-    """
-    def forward(self, input):
-        return torch.sin(input)
-
 
 class SequentialModel(nn.Module):
     """
@@ -126,8 +118,8 @@ class SequentialModel(nn.Module):
         """
         super().__init__()  # Call the parent class (nn.Module) initializer
 
-        # Tanh activation function
-        self.activation = SineActivation()
+        # LeakyReLU activation function
+        self.activation = nn.LeakyReLU()
 
         # Mean squared error (MSE) loss function
         self.loss_function = nn.MSELoss(reduction='mean')
@@ -233,8 +225,7 @@ class SequentialModel(nn.Module):
         u_xx_2 = u_xx[:, [1]]
 
         # Define the PDE residual
-        q = (-(a_1 * np.pi) ** 2 - (a_2 * np.pi) ** 2 + k ** 2) * \
-            torch.sin(a_1 * np.pi * x_1_f) * torch.sin(a_2 * np.pi * x_2_f)
+        q = k**2 * torch.sin(a_1 * x_1_f) * torch.sin(a_2 * x_2_f)
         f = u_xx_1 + u_xx_2 + k ** 2 * u - q
 
         # PDE loss
@@ -341,7 +332,7 @@ def solutionplot(u_pred, X_u_train, u_train):
     plt.colorbar()
     plt.xlabel(r'$x_1$', fontsize=18)
     plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title('Predicted $\hat u(x_1,x_2)$', fontsize=15)
+    plt.title(r'Predicted $\hat u(x_1,x_2)$', fontsize=15)
 
     # Absolute error plot
     plt.subplot(1, 3, 3)
@@ -356,6 +347,34 @@ def solutionplot(u_pred, X_u_train, u_train):
     # Save the figure as a high-resolution image file
     plt.savefig('Helmholtz_non_stiff.png', dpi=500, bbox_inches='tight')
     plt.show()
+
+
+def LBFGS_closure():
+    """
+    Computes the loss and its gradients for use with the LBFGS optimizer.
+
+    This closure function is necessary for optimizers like LBFGS which require
+    multiple evaluations of the function. It performs the following:
+    - Resets gradients to zero.
+    - Calculates the loss using the physics-informed neural network (PINN) model.
+    - Backpropagates the gradients of the loss.
+
+    Returns
+    -------
+    loss : torch.Tensor
+        The computed loss value.
+    """
+    # Zero out the gradients of the optimizer before backpropagation
+    lbfgs_optimizer.zero_grad()
+
+    # Compute the loss using the physics-informed neural network (PINN)
+    loss = PINN.loss(X_u_train, u_train, X_f_train)
+
+    # Perform backpropagation to compute the gradients of the loss
+    loss.backward()
+
+    # Return the loss value to the optimizer
+    return loss
 
 
 if __name__ == "__main__":
@@ -380,11 +399,11 @@ if __name__ == "__main__":
     # Constants for the wave equation or PDE parameters
     a_1 = 1  # Coefficient for the sine term in the x-dimension
     a_2 = 1  # Coefficient for the sine term in the y-dimension
-    k = 1  # Constant parameter, often related to wave number
+    k = 2*np.pi  # Constant parameter, often related to wave number
 
     # Analytical solution of the PDE (sinusoidal) chosen for convenience
     # sin(a_1 * pi * x) * sin(a_2 * pi * y) generates a 2D sine wave solution
-    usol = np.sin(a_1 * np.pi * X) * np.sin(a_2 * np.pi * Y)
+    usol = np.sin(a_1 * X) * np.sin(a_2 * Y)
 
     # Flatten the solution array in column-major order ('F') and reshape it into a column vector
     u_true = usol.flatten('F')[:, None]
@@ -406,8 +425,8 @@ if __name__ == "__main__":
 
     # Neural network architecture definition
 
-    # Input layer with 2 nodes, 5 hidden layers with variable nodes, and an output layer with 1 node
-    layers = np.array([2, 300, 300, 300, 1])
+    # Input layer with 2 nodes, 4 hidden layers with 200 nodes, and an output layer with 1 node
+    layers = np.array([2, 200, 200, 200, 200, 1])
 
     # Initialize the neural network model
     PINN = SequentialModel(layers)
@@ -455,16 +474,7 @@ if __name__ == "__main__":
             error_vec, _ = PINN.test()  # Evaluate the model on test data
             print(f"Adam - Iteration {i}: Loss {loss.item()}, Error {error_vec.item()}")
 
-
-    # L-BFGS fine-tuning
-    def LBFGS_closure():
-        lbfgs_optimizer.zero_grad()
-        loss = PINN.loss(X_u_train, u_train, X_f_train)
-        loss.backward()
-        return loss
-
-
-    # Run L-BFGS optimizer
+    # L-BFGS fine-tuning and optimizer
     lbfgs_optimizer.step(LBFGS_closure)
 
     # After L-BFGS optimization
