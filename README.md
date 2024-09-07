@@ -31,8 +31,8 @@ The network architecture consists of fully connected layers with customizable si
 
 1. **Training Data**: The network is trained on boundary conditions and a set of random collocation points within the domain.
 2. **Loss Function**: The loss function is a combination of boundary condition loss and the Helmholtz PDE loss:
-        - **Boundary Condition Loss**: Mean squared error between predicted and known boundary values.
-        - **PDE Loss**: Residual of the Helmholtz equation computed via automatic differentiation.
+   - **Boundary Condition Loss**: Mean squared error between predicted and known boundary values.
+   - **PDE Loss**: Residual of the Helmholtz equation computed via automatic differentiation.
 3. **Optimizers**: Training is initially performed using the Adam optimizer, followed by fine-tuning with the L-BFGS optimizer for higher precision.
 
 ## LeakyReLU Activation Function
