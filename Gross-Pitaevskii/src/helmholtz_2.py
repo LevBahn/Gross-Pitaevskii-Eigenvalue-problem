@@ -382,7 +382,7 @@ class SequentialModel(nn.Module):
         u_xx_2 = u_xx[:, [1]]
 
         # Define the PDE residual
-        q = k**2 * torch.sin(k * x_1_f) * torch.sin(k * x_2_f)
+        q = k**2 * torch.sin(n * x_1_f) * torch.sin(m * x_2_f)
         f = u_xx_1 + u_xx_2 + k**2 * u - q
 
         # PDE loss
@@ -596,8 +596,10 @@ if __name__ == "__main__":
     X_u_test, lb, ub = prepare_test_data(X, Y)
 
     # Analytical solution of the PDE
-    k = 2 * np.pi
-    usol = np.sin(k * X) * np.sin(k * Y)
+    n = 1
+    m = 1
+    k = np.sqrt(np.pi ** 2 * (m ** 2 + n ** 2))
+    usol = np.sin(n * X) * np.sin(m * Y)
 
     # Flatten the solution in Fortran-like order and reshape it
     u_true = usol.flatten()[:, None]
