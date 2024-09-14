@@ -110,8 +110,7 @@ def visualize_solution(u_pred, x_train, y_train, u_truth):
     plt.show()
 
 
-# Main function
-def main():
+if __name__ == "__main__":
     # Define parameters
     layers = [2, 20, 20, 20, 20, 1]  # Input layer, hidden layers, output layer
     k = 2 * np.pi  # Wavenumber
@@ -147,5 +146,3 @@ def main():
     # Visualize solution
     visualize_solution(u_pred, x_train, y_train, u_truth)
 
-if __name__ == "__main__":
-    main()
