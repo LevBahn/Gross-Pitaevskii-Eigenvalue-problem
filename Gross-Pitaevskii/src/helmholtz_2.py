@@ -24,32 +24,31 @@ np.random.seed(1234)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def create_grid(num_grid_pts=256):
+def create_grid(num_grid_pts=256, n_dim=2):
     """
-    Create a 2D grid of points and return them as NumPy arrays along with the
-    1D arrays for each axis.
+    Create an n-dimensional grid of points as a NumPy array in a memory-efficient way.
 
     Parameters
     ----------
     num_grid_pts : int, optional
         The number of grid points along each dimension (default is 256).
+    n_dim : int, optional
+        The number of dimensions (default is 2).
 
     Returns
     -------
-    X : np.ndarray
-        2D grid points in the x-dimension as a NumPy array.
-    Y : np.ndarray
-        2D grid points in the y-dimension as a NumPy array.
-    x_1 : np.ndarray
-        1D array of points in the x-dimension.
-    x_2 : np.ndarray
-        1D array of points in the y-dimension.
+    grid : np.ndarray
+        n-dimensional grid points as a NumPy array.
+    axis_points : list of np.ndarray
+        List of 1D arrays of points for every dimension.
     """
-    x_1 = np.linspace(0, np.pi, num_grid_pts)
-    x_2 = np.linspace(0, np.pi, num_grid_pts)
-    X, Y = np.meshgrid(x_1, x_2)
+    # Form 1D arrays for every dimension
+    axis_points = [np.linspace(0, np.pi, num_grid_pts) for _ in range(n_dim)]
 
-    return X, Y, x_1, x_2
+    # Generate a meshgrid up to n_dim
+    grids = np.meshgrid(*axis_points, indexing='ij', sparse=False)
+
+    return grids, axis_points
 
 
 def prepare_test_data(X, Y):
@@ -590,9 +589,14 @@ def plot_training_progress(train_losses, test_losses, test_metrics, steps):
 
 if __name__ == "__main__":
 
-    # Create grid and prepare test data
+    # Specify number of grid points and number of dimensions
     num_grid_pts = 256
-    X, Y, x_1, x_2 = create_grid(num_grid_pts=num_grid_pts)  # Default is num_grid_pts=256
+    nDim = 2
+
+    # Prepare test data
+    grids, axis_points = create_grid(num_grid_pts=num_grid_pts, n_dim=nDim)
+    X, Y = grids[0], grids[1]
+    x_1, x_2 = axis_points[0], axis_points[1]
     X_u_test, lb, ub = prepare_test_data(X, Y)
 
     # Analytical solution of the PDE
