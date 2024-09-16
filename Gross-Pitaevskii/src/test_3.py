@@ -42,7 +42,7 @@ class PINN(nn.Module):
         self.layers = nn.ModuleList()
         self.ub = torch.tensor(ub, dtype=torch.float32, device=device)
         self.lb = torch.tensor(lb, dtype=torch.float32, device=device)
-        self.adaptive_bc_scale = nn.Parameter(torch.tensor(1.0, device=device))  # Adaptive weighting for BC loss (lambda)
+        self.adaptive_bc_scale = nn.Parameter(torch.tensor(10.0, device=device))  # Adaptive weighting for BC loss (lambda)
         self.k = nn.Parameter(torch.tensor(np.pi, device=device))  # Initialize k as a learnable parameter
 
         # Define network layers
@@ -244,7 +244,8 @@ def train_pinn(model, optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs):
         scheduler.step(loss)
 
         if epoch % 100 == 0:
-            print(f'Epoch {epoch}/{epochs}, Loss: {loss.item()}, Learned k: {model.k.item()}')
+            print(f'Epoch {epoch}/{epochs}, Loss: {loss.item()}, Learned Adaptive BC: {model.adaptive_bc_scale.item()}, '
+                  f'Learned k: {model.k.item()}')
 
 def visualize_solution(model, x_train, y_train):
     """
@@ -266,16 +267,16 @@ def visualize_solution(model, x_train, y_train):
     y_flat = y_train.reshape(-1, 1)
 
     # Generate predictions using the model
-    with torch.no_grad():  # No need to track gradients for visualization
+    with torch.no_grad():  # Don't track gradients for visualization
         inputs = torch.cat([x_flat, y_flat], dim=1)  # Combine x and y into a 2D tensor
         u_pred = model(inputs)  # Get the model's predictions
 
-    # Detach the predictions and convert to numpy for plotting
+    # Detach the predictions and convert to numpy
     x_train = x_train.detach().cpu().numpy()
     y_train = y_train.detach().cpu().numpy()
     u_pred = u_pred.detach().cpu().numpy().reshape(x_train.shape)
 
-    # Create a grid for plotting
+    # Create a grid
     x_unique = np.unique(x_train)
     y_unique = np.unique(y_train)
     X, Y = np.meshgrid(x_unique, y_unique)
@@ -287,14 +288,10 @@ def visualize_solution(model, x_train, y_train):
     c = ax.pcolor(X, Y, u_pred, cmap='jet')
     fig.colorbar(c, ax=ax)
 
-    # Axis labels
     ax.set_xlabel(r'$x$ (Spatial Coordinate)', fontsize=12)
     ax.set_ylabel(r'$y$ (Spatial Coordinate)', fontsize=12)
 
-    # Title with description
     ax.set_title('Predicted Solution from PINN after Training\n(Prediction over the Spatial Domain)', fontsize=14)
-
-    # Display the plot
     plt.tight_layout()
     plt.show()
 
