@@ -43,7 +43,7 @@ class PINN(nn.Module):
         self.ub = torch.tensor(ub, dtype=torch.float32, device=device)
         self.lb = torch.tensor(lb, dtype=torch.float32, device=device)
         self.adaptive_bc_scale = nn.Parameter(torch.tensor(1.0, device=device))  # Adaptive weighting for BC loss (lambda)
-        self.k = nn.Parameter(torch.tensor(1.0, device=device))  # Initialize k as a learnable parameter
+        self.k = nn.Parameter(torch.tensor(np.pi, device=device))  # Initialize k as a learnable parameter
 
         # Define network layers
         for i in range(len(layers) - 1):
