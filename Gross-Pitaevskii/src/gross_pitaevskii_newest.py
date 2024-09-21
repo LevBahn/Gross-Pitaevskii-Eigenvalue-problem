@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from pyDOE import lhs
-import time
 import matplotlib.pyplot as plt
 from torch.utils.checkpoint import checkpoint
 
@@ -33,7 +32,7 @@ class PINN(nn.Module):
         Learnable parameter for interaction strength.
     """
 
-    def __init__(self, layers, ub, lb, hbar=6.62607015e-34):
+    def __init__(self, layers, ub, lb, hbar=1.0, m=1.0, g=1.0):
         """
         Initializes the PINN model with given layer sizes and boundary conditions.
 
@@ -47,6 +46,10 @@ class PINN(nn.Module):
             Lower bounds of the input domain for feature normalization.
         hbar : float, optional
             Planck's constant, default is the physical value in J⋅Hz−1.
+        m : float
+            Particle mass, scaled is 1.0.
+        g : float
+            Interaction strength, scaled is 1.0.
         """
         super(PINN, self).__init__()
         self.layers = nn.ModuleList()
@@ -55,8 +58,8 @@ class PINN(nn.Module):
 
         self.adaptive_bc_scale = nn.Parameter(torch.tensor(1.0, device=device))  # Adaptive weighting for BC loss (lambda)
         self.hbar = hbar  # Planck's constant (fixed or learnable?)
-        self.m = nn.Parameter(torch.tensor(1.0, device=device))  # Learnable mass parameter
-        self.g = nn.Parameter(torch.tensor(1.0, device=device))  # Learnable interaction strength
+        self.m = m # Particle mass (fixed)
+        self.g = g # Interaction strength (fixed)
 
         # Define network layers
         for i in range(len(layers) - 1):
@@ -64,7 +67,7 @@ class PINN(nn.Module):
             if i < len(layers) - 2:
                 self.layers.append(nn.LeakyReLU())
 
-        self.activation = nn.LeakyReLU()
+        self.activation = nn.LeakyReLU() # Use other activation function? Sine?
         self.init_weights()
 
     def init_weights(self):
@@ -121,8 +124,12 @@ class PINN(nn.Module):
             Scaled mean squared error (MSE) loss for boundary conditions.
         """
         u_pred = self.forward(x_bc)
+        y_bc = torch.zeros_like(y_bc) # Convert this into a torch array of zeros
         adaptive_scale = self.adaptive_bc_scale  # Adaptive scaling
         bc_loss = adaptive_scale * torch.mean((u_pred - y_bc) ** 2)
+
+        # TODO: Make u_pred zero only at the boundary
+        # Look at (and replicate) prepare_training_data in helmholtz_2.py
         return bc_loss
 
     def riesz_loss(self, predictions, inputs):
@@ -141,12 +148,16 @@ class PINN(nn.Module):
         torch.Tensor
             Riesz energy loss.
         """
+
+        psi = predictions
+
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
         gradients = torch.autograd.grad(outputs=predictions, inputs=inputs,
                                         grad_outputs=torch.ones_like(predictions),
                                         create_graph=True, retain_graph=True)[0]
-        riesz_energy = torch.sum(gradients ** 2)
+        # riesz_energy = torch.sum(gradients ** 2)
+        riesz_energy = torch.sum(gradients ** 2) + 0.5 * self.g * psi ** 4 # Functional derivative of the Riesz energy
         return riesz_energy
 
     def pde_loss(self, inputs, predictions):
@@ -173,10 +184,7 @@ class PINN(nn.Module):
         """
         # Calculate gradients of ψ with respect to inputs
         psi = predictions
-        if not inputs.requires_grad:
-            inputs = inputs.clone().detach().requires_grad_(True)
-        # TODO - Add allow_unused=true in the line below?
-        psi_x = torch.autograd.grad(psi, inputs, grad_outputs=torch.ones_like(psi), create_graph=True, allow_unused=True)[0]
+        psi_x = torch.autograd.grad(psi, inputs, grad_outputs=torch.ones_like(psi), create_graph=True)[0]
 
         # Second derivatives of the Laplacian (∇²ψ)
         psi_xx = torch.autograd.grad(psi_x[:, 0], inputs, grad_outputs=torch.ones_like(psi_x[:, 0]), create_graph=True)[0][:, 0]
@@ -186,7 +194,8 @@ class PINN(nn.Module):
         laplacian_psi = psi_xx + psi_yy
 
         # Gross-Pitaevskii equation residual: hbar^2/(2m) * (∇²ψ) - g|ψ|²ψ
-        pde_residual = (- self.hbar ** 2 / (2 * self.m)) * laplacian_psi + self.g * torch.abs(psi) ** 2 * psi
+        # old pde_residual = (- self.hbar ** 2 / (2 * self.m)) * laplacian_psi + self.g * torch.abs(psi) ** 2 * psi
+        pde_residual = -laplacian_psi + self.g * torch.abs(psi) ** 2 * psi
 
         # PDE loss: Mean squared error of the residual
         pde_loss = torch.mean(pde_residual ** 2)
@@ -211,10 +220,10 @@ class PINN(nn.Module):
         torch.Tensor
             Total loss combining BC, PDE, and Riesz losses.
         """
-        loss_u = self.adaptive_bc_scale * self.loss_BC(x_bc, y_bc)  # BC loss
+        loss_u = self.adaptive_bc_scale * self.loss_BC(x_bc, y_bc)  # BC loss - x_bc and y_bc are the entire domain of points in 2D
         predictions = self.forward(x_to_train_f)
 
-        # PDE loss (Helmholtz equation) with learnable k
+        # PDE loss (Gross Pitaevskii equation)
         loss_pde = self.pde_loss(x_to_train_f, predictions)
 
         # Riesz energy loss for smoothness
@@ -222,6 +231,26 @@ class PINN(nn.Module):
 
         total_loss = loss_u + loss_pde + loss_k
         return total_loss
+
+    def get_ground_state(self, x):
+        """
+        Returns the ground state (u vector) and its corresponding energy (lambda scalar).
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input points to evaluate the wave function.
+
+        Returns
+        -------
+        u : torch.Tensor
+            Ground state wave function values.
+        lambda_min : float
+            Corresponding lowest energy value.
+        """
+        u = self.forward(x)
+        energy = self.pde_loss(x, u)
+        return u, energy.item()
 
 
 def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
@@ -257,16 +286,16 @@ def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
 
     # Extract boundary points and values from all four edges
     leftedge_x = np.hstack((X[:, 0][:, None], Y[:, 0][:, None]))
-    leftedge_u = usol[:, 0][:, None]
+    leftedge_u = usol[:, 0][:, None] # 1D array of all zeros
 
     rightedge_x = np.hstack((X[:, -1][:, None], Y[:, -1][:, None]))
-    rightedge_u = usol[:, -1][:, None]
+    rightedge_u = usol[:, -1][:, None] # 1D array of all zeros
 
     topedge_x = np.hstack((X[0, :][:, None], Y[0, :][:, None]))
-    topedge_u = usol[0, :][:, None]
+    topedge_u = usol[0, :][:, None] # 1D array of all zeros
 
     bottomedge_x = np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))
-    bottomedge_u = usol[-1, :][:, None]
+    bottomedge_u = usol[-1, :][:, None] # 1D array of all zeros
 
     # Combine all edge points
     all_X_u_train = np.vstack([leftedge_x, rightedge_x, bottomedge_x, topedge_x])
@@ -287,11 +316,10 @@ def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
 
     return X_f_train, X_u_train, u_train
 
-
-# Training function
-def train_pinn(model, optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs):
+# Training function with mixed precision
+def train_pinn_mixed_precision(model, optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs):
     """
-    Training loop for the PINN model.
+    Training loop for the PINN model with mixed precision.
 
     Parameters
     ----------
@@ -312,6 +340,7 @@ def train_pinn(model, optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs):
     """
 
     scaler = torch.amp.GradScaler('cuda')  # Mixed precision training
+    energy_progress = []
 
     for epoch in range(epochs):
         model.train()
@@ -319,6 +348,10 @@ def train_pinn(model, optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs):
 
         with torch.amp.autocast('cuda'):  # Use mixed precision for forward pass
             loss = model.loss(x_bc, y_bc, x_to_train_f)
+
+        # Make loss a scalar
+        #loss = loss.mean() #  average of all individual losses
+        loss = loss.sum() # total sum of all losses.
 
         scaler.scale(loss).backward()
 
@@ -332,6 +365,12 @@ def train_pinn(model, optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs):
         if epoch % 100 == 0:
             print(f'Epoch {epoch}/{epochs}, Loss: {loss.item()}, Learned Adaptive BC: {model.adaptive_bc_scale.item()}')
 
+        # Get the lowest energy ground state after each epoch
+        u, energy = model.get_ground_state(x_to_train_f)
+        energy_progress.append(energy)
+
+    # Plot energy progress
+    plot_energy_progress(energy_progress)
 
 def visualize_solution(model, x_train, y_train):
     """
@@ -382,249 +421,140 @@ def visualize_solution(model, x_train, y_train):
     plt.show()
 
 
-def solutionplot(u_pred, X_u_train, u_train):
+def plot_energy_progress(energy_list):
     """
-    Plots the ground truth solution, predicted solution, and absolute error between them.
+    Plots the energy progress over training.
 
     Parameters
     ----------
-    u_pred : numpy.ndarray
-        Predicted solution values from the model.
-    X_u_train : numpy.ndarray
-        Training points used for boundary conditions (not plotted but included for context).
-    u_train : numpy.ndarray
-        Corresponding boundary condition values (not plotted but included for context).
+    energy_list : list
+        List of energy values recorded during training.
     """
-
-    # Ground truth solution plot
-    fig_1 = plt.figure(1, figsize=(18, 5))
-    plt.subplot(1, 3, 1)
-    plt.pcolor(x_1, x_2, usol, cmap='jet')  # Plot the ground truth solution 'usol' using a color map
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title('Ground Truth $u(x_1,x_2)$', fontsize=15)
-
-    # Predicted solution plot
-    plt.subplot(1, 3, 2)
-    plt.pcolor(x_1, x_2, u_pred, cmap='jet')  # Plot the predicted solution 'u_pred' using the same color map
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title('Predicted $\hat u(x_1,x_2)$', fontsize=15)
-
-    # Absolute error plot
-    plt.subplot(1, 3, 3)
-    plt.pcolor(x_1, x_2, np.abs(usol - u_pred), cmap='jet')  # Plot the absolute error between ground truth and prediction
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title(r'Absolute error $|u(x_1,x_2)- \hat u(x_1,x_2)|$', fontsize=15)
-
-    plt.tight_layout()  # Adjust subplots to fit into the figure area cleanly
-
-    # Save the figure as a high-resolution image file
-    plt.savefig('Helmholtz_non_stiff.png', dpi=500, bbox_inches='tight')
-    plt.show()
-
-
-def LBFGS_closure():
-    """
-    Computes the loss and its gradients for use with the LBFGS optimizer.
-
-    This closure function is necessary for optimizers like LBFGS which require
-    multiple evaluations of the function. It performs the following:
-    - Resets gradients to zero.
-    - Calculates the loss using the physics-informed neural network (PINN) model.
-    - Backpropagates the gradients of the loss.
-
-    Returns
-    -------
-    loss : torch.Tensor
-        The computed loss value.
-    """
-    # Zero out the gradients of the optimizer before backpropagation
-    lbfgs_optimizer.zero_grad()
-
-    # Compute the loss using the physics-informed neural network (PINN)
-    loss = PINN.loss(X_u_train, u_train, X_f_train, k)
-
-    # Perform backpropagation to compute the gradients of the loss
-    loss.backward()
-
-    # Return the loss value to the optimizer
-    return loss
-
-
-def plot_training_progress(train_losses, test_losses, test_metrics, steps):
-    """
-    Plot the training and test losses, along with the test metric, over the course of training.
-
-    Parameters
-    ----------
-    train_losses : list
-        List of training loss values recorded at each training step.
-    test_losses : list
-        List of test loss values recorded at each evaluation step.
-    test_metrics : list
-        List of test metrics (such as error or accuracy) recorded during training.
-    steps : list
-        List of step numbers corresponding to the recorded losses and metrics.
-
-    Returns
-    -------
-    None
-    """
-
-    plt.figure(figsize=(10, 6))
-
-    # Plot training loss
-    plt.plot(steps, train_losses, label='Train Loss', color='blue', linestyle='-', marker='o')
-
-    # Plot test loss
-    plt.plot(steps, test_losses, label='Test Loss', color='red', linestyle='--', marker='x')
-
-    # Plot test error (or other metrics)
-    plt.plot(steps, test_metrics, label='Test Error', color='green', linestyle='-.', marker='s')
-
-    plt.xlabel('Steps')
-    plt.ylabel('Loss/Error')
+    plt.figure(figsize=(8, 6))
+    plt.plot(energy_list, label='Lowest Energy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Energy')
+    plt.title('Lowest Energy Ground State During Training')
     plt.legend()
-    plt.title('Training Progress')
-
-    plt.tight_layout()
+    plt.grid(True)
     plt.show()
 
-    # Save the plot to a file
-    plt.savefig('training_progress_gpe.png')
+
+def plot_ground_state_2d(model, x_train, y_train):
+    """
+    Plots the lowest energy ground state in 2D as a color map.
+
+    Parameters
+    ----------
+    model : PINN
+        The trained PINN model used for predictions.
+    x_train : torch.Tensor
+        X coordinates of the points to plot.
+    y_train : torch.Tensor
+        Y coordinates of the points to plot.
+    """
+    # Flatten the grid of x_train and y_train
+    x_flat = x_train.reshape(-1, 1)
+    y_flat = y_train.reshape(-1, 1)
+
+    # Generate predictions using the model
+    with torch.no_grad():  # Don't track gradients for visualization
+        inputs = torch.cat([x_flat, y_flat], dim=1)  # Combine x and y into a 2D tensor
+        u_pred = model(inputs)  # Get the model's predictions
+
+    # Detach the predictions and convert to numpy
+    x_train = x_train.detach().cpu().numpy()
+    y_train = y_train.detach().cpu().numpy()
+    u_pred = u_pred.detach().cpu().numpy().reshape(x_train.shape)
+
+    # Create a grid
+    x_unique = np.unique(x_train)
+    y_unique = np.unique(y_train)
+    X, Y = np.meshgrid(x_unique, y_unique)
+
+    # Plotting the ground state as a 2D color map
+    plt.figure(figsize=(8, 6))
+    plt.contourf(X, Y, u_pred, cmap='jet')
+    plt.colorbar(label='Ground State Wave Function (u)')
+    plt.xlabel('X (Spatial Coordinate)')
+    plt.ylabel('Y (Spatial Coordinate)')
+    plt.title('Lowest Energy Ground State (2D)')
+    plt.show()
+
+
+def plot_ground_state_3d(model, x_train, y_train):
+    """
+    Plots the lowest energy ground state in 3D.
+
+    Parameters
+    ----------
+    model : PINN
+        The trained PINN model used for predictions.
+    x_train : torch.Tensor
+        X coordinates of the points to plot.
+    y_train : torch.Tensor
+        Y coordinates of the points to plot.
+    """
+    # Flatten the grid of x_train and y_train
+    x_flat = x_train.reshape(-1, 1)
+    y_flat = y_train.reshape(-1, 1)
+
+    # Generate predictions using the model
+    with torch.no_grad():  # Don't track gradients for visualization
+        inputs = torch.cat([x_flat, y_flat], dim=1)  # Combine x and y into a 2D tensor
+        u_pred = model(inputs)  # Get the model's predictions
+
+    # Detach the predictions and convert to numpy
+    x_train = x_train.detach().cpu().numpy()
+    y_train = y_train.detach().cpu().numpy()
+    u_pred = u_pred.detach().cpu().numpy().reshape(x_train.shape)
+
+    # Create a grid
+    x_unique = np.unique(x_train)
+    y_unique = np.unique(y_train)
+    X, Y = np.meshgrid(x_unique, y_unique)
+
+    # Plotting the ground state as a 3D surface plot
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Surface plot
+    ax.plot_surface(X, Y, u_pred, cmap='viridis')
+
+    ax.set_xlabel('X (Spatial Coordinate)')
+    ax.set_ylabel('Y (Spatial Coordinate)')
+    ax.set_zlabel('Ground State Wave Function (u)')
+    ax.set_title('Lowest Energy Ground State (3D)')
+
+    plt.show()
 
 
 # Model initialization and training
 if __name__ == "__main__":
 
-    # Grid, lower and upper bounds
-    X, Y = np.meshgrid(np.linspace(0, 1, 100), np.linspace(0, 1, 100))
-    lb = np.array([0, 0])
-    ub = np.array([1, 1])
-
-    # Initialize usol with zeros at the boundary
-    usol = np.zeros_like(X)
-
-    # Flatten the solution in Fortran-like order and reshape it
-    u_true = usol.flatten()[:, None]
-
-    # Flatten the grids and stack them into a 2D array
-    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
-
-    N_u = 100  # Number of boundary points
-    N_f = 1000  # Number of collocation points
-    X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, usol, X, Y)
-
     # Input parameters
+    ub = np.array([1, 1])
+    lb = np.array([0.0, 0.0])
     layers = [2, 40, 40, 40, 40, 1]  # Neural network layers
     epochs = 1000
 
-    # Convert numpy arrays to PyTorch tensors and move to GPU (if available)
-    X_f_train = torch.from_numpy(X_f_train_np_array).float().to(device)  # Collocation points
-    X_u_train = torch.from_numpy(X_u_train_np_array).float().to(device)  # Boundary condition points
-    u_train = torch.from_numpy(u_train_np_array).float().to(device)  # Boundary condition values
-    X_u_test_tensor = torch.from_numpy(X_u_test).float().to(device)  # Test data for boundary conditions
-    u = torch.from_numpy(u_true).float().to(device)  # True solution values (ground truth for testing)
-    f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the physics equation residual
+    # Training data with boundary condition points
+    x_train = torch.linspace(0.0, 1.0, 100, device=device).view(-1, 1).requires_grad_(True)
+    y_train = torch.linspace(0.0, 1.0, 100, device=device).view(-1, 1).requires_grad_(True)
+    x_train, y_train = torch.meshgrid(x_train.squeeze(), y_train.squeeze(), indexing='ij')
+    x_bc, y_bc = x_train.reshape(-1, 1), y_train.reshape(-1, 1)
 
-    # OLD APPROACH
-
-    # Training data (boundary condition points)
-    #x_train = torch.linspace(0.0, 1.0, 100, device=device).view(-1, 1).requires_grad_(True)
-    #y_train = torch.linspace(0.0, 1.0, 100, device=device).view(-1, 1).requires_grad_(True)
-    #x_train, y_train = torch.meshgrid(x_train.squeeze(), y_train.squeeze(), indexing='ij')
-    #x_bc, y_bc = x_train.reshape(-1, 1), y_train.reshape(-1, 1)
-
-    # Model initialization
-    #model = PINN(layers, ub=ub, lb=lb).to(device)
-    #optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-6)
-    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=200, factor=0.5, verbose=True)
+    # Initialize model
+    model = PINN(layers, ub=ub, lb=lb).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-6)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=200, factor=0.5, verbose=True)
 
     # Train the model
-    #train_pinn(model, optimizer, scheduler, x_bc, y_bc, torch.cat([x_bc, y_bc], dim=1), epochs)
+    train_pinn_mixed_precision(model, optimizer, scheduler, x_bc, y_bc, torch.cat([x_bc, y_bc], dim=1), epochs)
+
+    # Return lowest energy ground state (u as a vector and lambda as a scalar) and plot values
+    plot_ground_state_2d(model, x_train, y_train)
+    plot_ground_state_3d(model, x_train, y_train)
 
     # Visualize solution
-    #visualize_solution(model, x_train, y_train)
-
-    # END OLD APPROACH
-
-    # Neural network architecture - # Input layer with 2 nodes, 4 hidden layers with 200 nodes, and
-    # an output layer with 1 node
-    layers = np.array([2, 200, 200, 200, 200, 1])
-    PINN = PINN(layers, ub=ub, lb=lb).to(device)
-
-    # Move the model to the GPU (if available)
-    PINN.to(device)
-
-    # Print the neural network architecture
-    print(PINN)
-
-    # Store the neural network parameters for optimization
-    params = list(PINN.parameters())
-
-    # Optimizer setup
-    adam_optimizer = optim.Adam(PINN.parameters(), lr=0.01, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-6,
-                                amsgrad=False)
-    lbfgs_optimizer = optim.LBFGS(PINN.parameters(), max_iter=500, tolerance_grad=1e-5, tolerance_change=1e-9,
-                                  history_size=100)
-
-    start_time = time.time()  # Start timer
-
-    # Adam optimization loop
-    adam_iter = 1000
-
-    # Lists to store training progress for plotting
-    train_losses = []
-    test_losses = []
-    test_errors = []
-    steps = []
-
-    for i in range(adam_iter):
-        # Calculate loss (boundary condition + physics-informed loss)
-        loss = PINN.loss(X_u_train, u_train, X_f_train)
-
-        # Zero gradient buffers
-        adam_optimizer.zero_grad()
-
-        # Backpropagate gradients
-        loss.backward()
-
-        # Update model parameters
-        adam_optimizer.step()
-
-        # Train/Test loss and error at each step
-        if i % (adam_iter // 10) == 0:
-            error_vec, _ = PINN.test()  # Test on validation data
-            print(f"Adam - Iteration {i}: Loss {loss.item()}, Error {error_vec.item()}")
-
-            # Append step and corresponding losses
-            steps.append(i)
-            train_losses.append(loss.item())
-            test_losses.append(loss.item())  # TODO: Fix this! Write proper test loss
-            test_errors.append(error_vec.item())
-
-    # L-BFGS optimization
-    lbfgs_optimizer.step(LBFGS_closure)
-
-    # Test after L-BFGS optimization
-    error_vec, u_pred = PINN.test()
-    print(f'L-BFGS Test Error: {error_vec.item()}')
-
-    # Total training time
-    elapsed = time.time() - start_time
-    print(f'Training time: {elapsed:.2f} seconds')
-
-    # Final test accuracy
-    error_vec, u_pred = PINN.test()
-    print(f'Test Error: {error_vec:.5f}')
-
-    # Plot training progress
-    plot_training_progress(train_losses, test_losses, test_errors, steps)
-
-    # Plot ground truth, predicted solution, and error
-    solutionplot(u_pred, X_u_train, u_train)
+    visualize_solution(model, x_train, y_train)
