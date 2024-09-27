@@ -9,6 +9,9 @@ from torch.utils.checkpoint import checkpoint
 # Check if GPU is available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+import matplotlib
+matplotlib.use('TkAgg')
+
 
 class PINN(nn.Module):
     """
@@ -127,10 +130,12 @@ class PINN(nn.Module):
         u_pred = self.forward(X_u_test_tensor)
 
         # Compute relative L2 norm of the error
-        error_vec = torch.linalg.norm((u - u_pred), 2) / (torch.linalg.norm(u, 2) + 1e-2) # Scale if dividing by zeros
+        # TODO: u should not be all zeros, we do not know the ground truth
+        error_vec = torch.norm(u_pred)
+        #error_vec = torch.linalg.norm((u - u_pred), 2) / (torch.linalg.norm(u, 2) + 1e-2) # Scale if dividing by zeros
 
         # Reshape the predicted output to a 2D array
-        u_pred = np.reshape(u_pred.cpu().detach().numpy(), (num_grid_pts, num_grid_pts), order='F')
+        #u_pred = np.reshape(u_pred.cpu().detach().numpy(), (num_grid_pts, num_grid_pts), order='F')
 
         return error_vec, u_pred
 
@@ -153,6 +158,7 @@ class PINN(nn.Module):
         u_pred = self.forward(x_bc)
         y_bc = torch.zeros_like(y_bc) # Convert this into a torch array of zeros
         adaptive_scale = self.adaptive_bc_scale  # Adaptive scaling
+        # TODO: Look at other implementations (2022 paper)
         bc_loss = adaptive_scale * torch.mean((u_pred - y_bc) ** 2)
 
         # TODO: Make u_pred zero only at the boundary
@@ -184,7 +190,9 @@ class PINN(nn.Module):
                                         grad_outputs=torch.ones_like(predictions),
                                         create_graph=True, retain_graph=True)[0]
         # riesz_energy = torch.sum(gradients ** 2)
+        # The 0.5 * self.g * psi ** 4 comes from Dirichlet's theorem (minimizing the energy functional)
         riesz_energy = torch.sum(gradients ** 2) + 0.5 * self.g * psi ** 4 # Functional derivative of the Riesz energy
+        riesz_energy = torch.mean(gradients ** 2 + 0.5 * self.g * psi ** 4) # TODO: Review
         return riesz_energy
 
     def pde_loss(self, inputs, predictions):
@@ -223,7 +231,8 @@ class PINN(nn.Module):
         # Gross-Pitaevskii equation residual: hbar^2/(2m) * (∇²ψ) - g|ψ|²ψ
         # old pde_residual = (- self.hbar ** 2 / (2 * self.m)) * laplacian_psi + self.g * torch.abs(psi) ** 2 * psi
         #pde_residual = -laplacian_psi + self.g * torch.abs(psi) ** 2 * psi
-        mu = torch.mean(abs(psi_x) ** 2 + self.g * abs(psi) ** 4)
+        # TODO: Fix definition of mu and lambda in code
+        mu = torch.mean(abs(psi_x) ** 2 + self.g * abs(psi) ** 4) # TODO: mu is lambda in paper - eenrgy term + integral term in paper
         pde_residual = -laplacian_psi + self.g * torch.abs(psi**2) * psi - mu*psi
 
         # PDE loss: Mean squared error of the residual
@@ -255,8 +264,15 @@ class PINN(nn.Module):
         # PDE loss (Gross Pitaevskii equation)
         loss_pde = self.pde_loss(x_to_train_f, predictions)
 
+        # TODO: Scale the L^2-norm of u to 1
+        # TODO: Scale the predictions to the L^2 norm of 1?
+        #predictions = predictions / torch.linalg.norm(predictions)
+
         # Riesz energy loss
-        loss_k = self.riesz_loss(predictions, x_to_train_f)
+        loss_k = self.riesz_loss(predictions, x_to_train_f) # Script E in paper
+
+        # TODO: Use Riez loss to compute lambda (see after equation (2.5) in paper)
+        #lambda = constant in paper
 
         total_loss = loss_u + loss_pde + loss_k
         return total_loss
@@ -282,7 +298,34 @@ class PINN(nn.Module):
         return u, energy.item()
 
 
-def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
+def create_grid(num_grid_pts=256, n_dim=2):
+    """
+    Create an n-dimensional grid of points as a NumPy array in a memory-efficient way.
+
+    Parameters
+    ----------
+    num_grid_pts : int, optional
+        The number of grid points along each dimension (default is 256).
+    n_dim : int, optional
+        The number of dimensions (default is 2).
+
+    Returns
+    -------
+    grid : np.ndarray
+        n-dimensional grid points as a NumPy array.
+    axis_points : list of np.ndarray
+        List of 1D arrays of points for every dimension.
+    """
+    # Form 1D arrays for every dimension
+    axis_points = [np.linspace(0, np.pi, num_grid_pts) for _ in range(n_dim)]
+
+    # Generate a meshgrid up to n_dim
+    grids = np.meshgrid(*axis_points, indexing='ij', sparse=False)
+
+    return grids, axis_points
+
+
+def prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y):
     """
     Prepare boundary condition data and collocation points for training.
 
@@ -296,8 +339,8 @@ def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
         Lower bound of the domain.
     ub : np.Tensor
         Upper bound of the domain.
-    usol : np.Tensor
-        Analytical solution of the PDE.
+    num_grid_pts : int
+        Number of grid points.
     X : np.Tensor
         X grid of points.
     Y : np.Tensor
@@ -315,16 +358,16 @@ def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
 
     # Extract boundary points and values from all four edges
     leftedge_x = np.hstack((X[:, 0][:, None], Y[:, 0][:, None]))
-    leftedge_u = usol[:, 0][:, None] # 1D array of all zeros
+    leftedge_u = np.zeros((num_grid_pts, 1))
 
     rightedge_x = np.hstack((X[:, -1][:, None], Y[:, -1][:, None]))
-    rightedge_u = usol[:, -1][:, None] # 1D array of all zeros
+    rightedge_u = np.zeros((num_grid_pts, 1))
 
     topedge_x = np.hstack((X[0, :][:, None], Y[0, :][:, None]))
-    topedge_u = usol[0, :][:, None] # 1D array of all zeros
+    topedge_u = np.zeros((num_grid_pts, 1))
 
     bottomedge_x = np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))
-    bottomedge_u = usol[-1, :][:, None] # 1D array of all zeros
+    bottomedge_u = np.zeros((num_grid_pts, 1))
 
     # Combine all edge points
     all_X_u_train = np.vstack([leftedge_x, rightedge_x, bottomedge_x, topedge_x])
@@ -344,6 +387,36 @@ def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
     X_f_train = np.vstack((X_f, X_u_train))
 
     return X_f_train, X_u_train, u_train
+
+
+def prepare_test_data(X, Y):
+    """
+    Prepare test data by flattening the 2D grids and stacking them column-wise.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        2D grid points in the x-dimension as a NumPy array.
+    Y : np.ndarray
+        2D grid points in the y-dimension as a NumPy array.
+
+    Returns
+    -------
+    X_u_test : np.ndarray
+        Test data prepared by stacking the flattened x and y grids.
+    lb : np.ndarray
+        Lower bound for the domain (boundary conditions).
+    ub : np.ndarray
+        Upper bound for the domain (boundary conditions).
+    """
+    # Flatten the grids and stack them into a 2D array
+    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
+
+    # Domain bounds as NumPy arrays
+    lb = np.array([0, 0], dtype=np.float32)
+    ub = np.array([np.pi, np.pi], dtype=np.float32)
+
+    return X_u_test, lb, ub
 
 
 def train_pinn_mixed_precision(model, optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs):
@@ -825,33 +898,25 @@ def plot_training_progress(train_losses, test_losses, test_metrics, steps):
 # Model initialization and training
 if __name__ == "__main__":
 
-    # Grid, lower and upper bounds
-    x_1 = np.linspace(0, 1, 100)
-    x_2 = np.linspace(0, 1, 100)
-    X, Y = np.meshgrid(x_1, x_2)
-    lb = np.array([0, 0])
-    ub = np.array([1, 1])
-    x_bc, y_bc = X.reshape(-1, 1), Y.reshape(-1, 1)
+    # Specify number of grid points and number of dimensions
+    num_grid_pts = 256
+    nDim = 2
 
-    # Initialize usol with zeros at the boundary
-    usol = np.zeros_like(X)
-
-    # Flatten the solution
-    u_true = usol.flatten()[:, None]
-
-    # Flatten the grids and stack them into a 2D array
-    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
+    # Prepare test data
+    grids, axis_points = create_grid(num_grid_pts=num_grid_pts, n_dim=nDim)
+    X, Y = grids[0], grids[1]
+    x_1, x_2 = axis_points[0], axis_points[1]
+    X_u_test, lb, ub = prepare_test_data(X, Y)
 
     N_u = 100  # Number of boundary points
     N_f = 1000  # Number of collocation points
-    X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, usol, X, Y)
+    X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y)
 
     # Convert numpy arrays to PyTorch tensors and move to GPU (if available)
     X_f_train = torch.from_numpy(X_f_train_np_array).float().to(device)  # Collocation points
     X_u_train = torch.from_numpy(X_u_train_np_array).float().to(device)  # Boundary condition points
     u_train = torch.from_numpy(u_train_np_array).float().to(device)  # Boundary condition values
     X_u_test_tensor = torch.from_numpy(X_u_test).float().to(device)  # Test data for boundary conditions
-    u = torch.from_numpy(u_true).float().to(device)  # True solution values (ground truth for testing)
     f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the physics equation residual
 
     # Model parameters
@@ -862,13 +927,18 @@ if __name__ == "__main__":
     # Initialize the model
     model = PINN(layers, ub=ub, lb=lb).to(device)
 
+    # Print the neural network architecture
+    print(model)
+
     # Optimizers and scheduler
-    adam_optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-6)
-    lbfgs_optimizer = optim.LBFGS(model.parameters(), max_iter=500, history_size=100)
+    adam_optimizer = optim.Adam(model.parameters(), lr=0.01, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-6,
+                                amsgrad=False)
+    lbfgs_optimizer = optim.LBFGS(model.parameters(), max_iter=500, tolerance_grad=1e-5, tolerance_change=1e-9,
+                                  history_size=100)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(adam_optimizer, patience=200, factor=0.5, verbose=True)
 
     # Train the model using the hybrid approach
-    train_pinn_hybrid_2(model, adam_optimizer, lbfgs_optimizer, scheduler, X_u_train, u_train, X_f_train, epochs_adam,
+    train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, X_u_train, u_train, X_f_train, epochs_adam,
                       epochs_lbfgs)
 
     # Use the training data (X_f_train) to compute and visualize the lowest energy ground state
