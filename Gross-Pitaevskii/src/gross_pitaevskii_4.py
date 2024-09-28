@@ -110,14 +110,14 @@ class PINN(nn.Module):
 
         return x
 
-    def test(self, num_grid_pts):
+    def test(self, X_u_test_tensor):
         """
         Tests the model on the test data and computes the relative L2 norm of the error.
 
         Parameters
         ----------
-        num_grid_pts : torch.Tensor
-            Input tensor for the number of grid points.
+        X_u_test_tensor : torch.Tensor
+            Input tensor for the test data.
 
         Returns
         -------
@@ -126,18 +126,28 @@ class PINN(nn.Module):
         u_pred : numpy.ndarray
             The predicted output reshaped as a 2D array.
         """
+
+        # Ensure the test data requires gradients
+        X_u_test_tensor.requires_grad_(True)
+
+        # Use mixed precision during inference
+        with torch.cuda.amp.autocast():
+            u_pred = self.forward(X_u_test_tensor)
+            u_ground_truth, _ = self.get_ground_state(X_u_test_tensor)
+
         # Model prediction on test data
-        u_pred = self.forward(X_u_test_tensor)
+        #u_pred = self.forward(X_u_test_tensor)
+
+        # Use the predicted solution as the "ground truth"
+        #u_ground_truth, _ = self.get_ground_state(X_u_test_tensor)
 
         # Compute relative L2 norm of the error
-        # TODO: u should not be all zeros, we do not know the ground truth
-        error_vec = torch.norm(u_pred)
-        #error_vec = torch.linalg.norm((u - u_pred), 2) / (torch.linalg.norm(u, 2) + 1e-2) # Scale if dividing by zeros
+        error_vec = torch.linalg.norm(u_pred - u_ground_truth) / torch.linalg.norm(u_ground_truth)
 
         # Reshape the predicted output to a 2D array
-        #u_pred = np.reshape(u_pred.cpu().detach().numpy(), (num_grid_pts, num_grid_pts), order='F')
+        u_pred_reshaped = u_pred.cpu().detach().numpy().reshape((num_grid_pts, num_grid_pts), order='F')
 
-        return error_vec, u_pred
+        return error_vec, u_pred_reshaped
 
     def loss_BC(self, x_bc, y_bc):
         """
@@ -214,8 +224,10 @@ class PINN(nn.Module):
 
         Returns
         -------
-        torch.Tensor
-            Gross-Pitaevskii PDE loss.
+        pde_loss: torch.Tensor
+            Constant representing the Gross-Pitaevskii PDE loss.
+        pde_residual: torch.Tensor
+            Tensor representing the residual of the Gross-Pitaevskii PDE.
         """
         # Calculate gradients of ψ with respect to inputs
         psi = predictions
@@ -233,12 +245,12 @@ class PINN(nn.Module):
         #pde_residual = -laplacian_psi + self.g * torch.abs(psi) ** 2 * psi
         # TODO: Fix definition of mu and lambda in code
         mu = torch.mean(abs(psi_x) ** 2 + self.g * abs(psi) ** 4) # TODO: mu is lambda in paper - eenrgy term + integral term in paper
-        pde_residual = -laplacian_psi + self.g * torch.abs(psi**2) * psi - mu*psi
+        pde_residual = -laplacian_psi + self.g * torch.abs(psi ** 2) * psi - (mu * psi)
 
         # PDE loss: Mean squared error of the residual
         pde_loss = torch.mean(pde_residual ** 2)
 
-        return pde_loss
+        return pde_loss, pde_residual
 
     def loss(self, x_bc, y_bc, x_to_train_f):
         """
@@ -262,7 +274,7 @@ class PINN(nn.Module):
         predictions = self.forward(x_to_train_f)
 
         # PDE loss (Gross Pitaevskii equation)
-        loss_pde = self.pde_loss(x_to_train_f, predictions)
+        loss_pde, _ = self.pde_loss(x_to_train_f, predictions)
 
         # TODO: Scale the L^2-norm of u to 1
         # TODO: Scale the predictions to the L^2 norm of 1?
@@ -294,7 +306,7 @@ class PINN(nn.Module):
             Corresponding lowest energy value.
         """
         u = self.forward(x)
-        energy = self.pde_loss(x, u)
+        energy, _ = self.pde_loss(x, u)
         return u, energy.item()
 
 
@@ -799,7 +811,7 @@ def plot_ground_state_3d(model, x_train, y_train):
     plt.show()
 
 
-def solutionplot(u_pred, X_u_train, u_train, x_bc, y_bc):
+def solutionplot(u_pred, x_bc, y_bc, u_bc):
     """
     Plots the ground truth solution, predicted solution, and absolute error between them.
 
@@ -807,46 +819,45 @@ def solutionplot(u_pred, X_u_train, u_train, x_bc, y_bc):
     ----------
     u_pred : numpy.ndarray
         Predicted solution values from the model.
-    X_u_train : numpy.ndarray
-        Training points used for boundary conditions.
-    u_train : numpy.ndarray
-        Corresponding boundary condition values.
     x_bc : numpy.ndarray
         Boundary condition values for X.
     y_bc : numpy.ndarray
         Boundary condition values for Y.
+    u_bc : numpy.ndarray
+        Ground truth boundary condition values (u_train).
     """
 
-    # Change X_u_train into numpy arrays - Don't do this!
-    # x_bc = X_u_train[:, 0]
-    # x_bc = x_bc.detach().cpu().numpy()
-    # y_bc = X_u_train[:, 1]
-    # y_bc = y_bc.detach().cpu().numpy()
-
-    # Ground truth solution plot
-    fig_1 = plt.figure(1, figsize=(18, 5))
+    # Predicted solution
     plt.subplot(1, 3, 1)
-    plt.pcolor(x_bc, y_bc, usol, cmap='jet')
+    plt.pcolor(x_bc, y_bc, u_pred, cmap='jet')
     plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title('Ground Truth $u(x_1,x_2)$', fontsize=15)
+    plt.xlabel(r'$x$', fontsize=18)
+    plt.ylabel(r'$y$', fontsize=18)
+    plt.title('Predicted $\hat u(x,y)$', fontsize=15)
 
-    # Predicted solution plot
+    # Absolute error plot (predicted solution and boundary condition)
+    # plt.subplot(1, 3, 3)
+    # plt.pcolor(x_bc, y_bc, np.abs(u_bc - u_pred), cmap='jet')
+    # plt.colorbar()
+    # plt.xlabel(r'$x$', fontsize=18)
+    # plt.ylabel(r'$y$', fontsize=18)
+    # plt.title(r'Error between boundary and prediction $|u_{bc}(x,y)- \hat u(x,y)|$', fontsize=15)
+
+    # Predicted solution
     plt.subplot(1, 3, 2)
     plt.pcolor(x_bc, y_bc, u_pred, cmap='jet')
     plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title('Predicted $\hat u(x_1,x_2)$', fontsize=15)
+    plt.xlabel(r'$x$', fontsize=18)
+    plt.ylabel(r'$y$', fontsize=18)
+    plt.title('Predicted $\hat u(x,y)$', fontsize=15)
 
-    # Absolute error plot
+    # Magnitude of predicted solution
     plt.subplot(1, 3, 3)
-    plt.pcolor(x_bc, y_bc, np.abs(usol - u_pred), cmap='jet')
+    plt.pcolor(x_bc, y_bc, np.abs(u_pred), cmap='jet')
     plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title(r'Absolute error $|u(x_1,x_2)- \hat u(x_1,x_2)|$', fontsize=15)
+    plt.xlabel(r'$x$', fontsize=18)
+    plt.ylabel(r'$y$', fontsize=18)
+    plt.title(r'Predicted $|\hat u(x,y)|$', fontsize=15)
 
     plt.tight_layout()
     plt.savefig('gross_pitaevskii.png', dpi=500, bbox_inches='tight')
@@ -895,11 +906,43 @@ def plot_training_progress(train_losses, test_losses, test_metrics, steps):
     plt.savefig('training_progress_gpe_2.png')
 
 
+def plot_pde_residual(model, X_test):
+    """
+    Plots the residual of the PDE, indicating how well the predicted solution satisfies the GPE equation.
+
+    Parameters
+    ----------
+    model : PINN
+        Trained PINN model.
+    X_test : torch.Tensor
+        Input test points for computing the residual.
+    """
+
+    # Ensure X_test requires gradients
+    X_test.requires_grad_(True)
+
+    # Perform forward pass to get predicted solution (without torch.no_grad())
+    u_pred = model(X_test)
+
+    # Now compute pde_loss with gradients
+    _, pde_residual = model.pde_loss(X_test, u_pred)
+
+    # Convert tensors to numpy arrays
+    X_test = X_test.cpu().detach().numpy()
+    pde_residual = pde_residual.cpu().detach().numpy()
+
+    # Plot residual
+    plt.contourf(X_test[:, 0], X_test[:, 1], pde_residual, cmap='jet')
+    plt.colorbar()
+    plt.title('PDE Residual')
+    plt.show()
+
+
 # Model initialization and training
 if __name__ == "__main__":
 
     # Specify number of grid points and number of dimensions
-    num_grid_pts = 256
+    num_grid_pts = 64
     nDim = 2
 
     # Prepare test data
@@ -908,8 +951,8 @@ if __name__ == "__main__":
     x_1, x_2 = axis_points[0], axis_points[1]
     X_u_test, lb, ub = prepare_test_data(X, Y)
 
-    N_u = 100  # Number of boundary points
-    N_f = 1000  # Number of collocation points
+    N_u = 50  # Number of boundary points
+    N_f = 500  # Number of collocation points
     X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y)
 
     # Convert numpy arrays to PyTorch tensors and move to GPU (if available)
@@ -920,7 +963,7 @@ if __name__ == "__main__":
     f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the physics equation residual
 
     # Model parameters
-    layers = [2, 40, 40, 40, 40, 1]  # Neural network layers
+    layers = [2, 20, 20, 20, 20, 1]  # Neural network layers
     epochs_adam = 1000
     epochs_lbfgs = 500
 
@@ -948,11 +991,15 @@ if __name__ == "__main__":
     # plot_ground_state_3d(model, X_f_train[:, 0], X_f_train[:, 1])
 
     # Final test accuracy
-    error_vec, u_pred = model.test(N_u)
+    error_vec, u_pred = model.test(X_u_test_tensor)
     print(f'Test Error: {error_vec:.5f}') # TODO - Fix this!
+
+    plot_pde_residual(model, X_u_test_tensor)
 
     # Visualize solution over the boundary points
     # visualize_solution(model, X_u_train[:, 0], X_u_train[:, 1])
 
     # Plot ground truth, predicted solution, and error
-    solutionplot(u_pred, X_u_train, u_train, x_1, x_2)
+    solutionplot(u_pred, x_1, x_2, u_train_np_array)
+
+    Ellipsis
