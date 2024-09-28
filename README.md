@@ -33,7 +33,7 @@ The network architecture consists of fully connected layers with customizable si
 2. **Loss Function**: The loss function is a combination of boundary condition loss and the Helmholtz PDE loss:
    - **Boundary Condition Loss**: Mean squared error between predicted and known boundary values.
    - **PDE Loss**: Residual of the Helmholtz equation computed via automatic differentiation.
-   - **Riez Loss**: The Riesz energy loss from the energy functional (for regularization).
+   - **Riesz Loss**: The Riesz energy loss from the energy functional (for regularization).
 3. **Optimizers**: Training is initially performed using the Adam optimizer, followed by fine-tuning with the L-BFGS optimizer for higher precision.
 
 ## LeakyReLU Activation Function
