@@ -13,6 +13,12 @@ import matplotlib
 matplotlib.use('TkAgg')
 
 
+class SineActivation(nn.Module):
+    """ Sine Activation function. """
+    def forward(self, input):
+            return torch.sin(input)
+
+
 class PINN(nn.Module):
     """
     Physics-Informed Neural Network (PINN) for solving the Gross-Pitaevskii equation (GPE).
@@ -59,7 +65,7 @@ class PINN(nn.Module):
         self.ub = torch.tensor(ub, dtype=torch.float32, device=device)
         self.lb = torch.tensor(lb, dtype=torch.float32, device=device)
 
-        self.adaptive_bc_scale = nn.Parameter(torch.tensor(1.0, device=device))  # Adaptive weighting for BC loss
+        self.adaptive_bc_scale = nn.Parameter(torch.tensor(0.1, device=device))  # Adaptive weighting for BC loss (adjusted 09/29/2024)
         self.hbar = hbar  # Planck's constant (fixed or learnable?)
         self.m = m # Particle mass (fixed)
         self.g = g # Interaction strength (fixed)
@@ -68,9 +74,9 @@ class PINN(nn.Module):
         for i in range(len(layers) - 1):
             self.layers.append(nn.Linear(layers[i], layers[i + 1]))
             if i < len(layers) - 2:
-                self.layers.append(nn.LeakyReLU())
+                self.layers.append(nn.Tanh()) # Replaced LeakyReLU/Tanh with Sine on 09/29/2024
 
-        self.activation = nn.LeakyReLU() # Use other activation function? Sine?
+        self.activation = nn.Tanh() # Replaced LeakyReLU/Tanh with Sine on 09/29/2024
         self.init_weights()
 
     def init_weights(self):
@@ -78,6 +84,7 @@ class PINN(nn.Module):
         for m in self.layers:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
+                nn.init.constant_(m.bias, 1e-2)  # Perturb bias from zero (Added 09/29/24)
 
     def forward(self, x):
         """
@@ -110,6 +117,9 @@ class PINN(nn.Module):
 
         x = x / torch.sqrt(torch.sum(x ** 2)) # Normalize to L^2 norm = 1
 
+        # Add small perturbation to avoid converging to the trivial zero solution (added on 09/29/2024)
+        perturbation = 1e-1 * torch.randn_like(x)
+        x += perturbation
         return x
 
     def test(self, X_u_test_tensor):
@@ -135,7 +145,6 @@ class PINN(nn.Module):
         # Use mixed precision during inference
         with torch.cuda.amp.autocast():
             u_pred = self.forward(X_u_test_tensor)
-            u_pred = u_pred / torch.sqrt(torch.sum(u_pred ** 2))  # Normalize to L^2 norm = 1
             u_ground_truth, _ = self.get_ground_state(X_u_test_tensor)
 
         # Compute relative L2 norm of the error
@@ -162,14 +171,16 @@ class PINN(nn.Module):
         torch.Tensor
             Scaled mean squared error (MSE) loss for boundary conditions.
         """
-        u_pred = self.forward(x_bc)
-        y_bc = torch.zeros_like(y_bc) # Convert this into a torch array of zeros
-        adaptive_scale = self.adaptive_bc_scale  # Adaptive scaling
-        # TODO: Look at other implementations (2022 paper)
-        bc_loss = adaptive_scale * torch.mean((u_pred - y_bc) ** 2)
 
-        # TODO: Make u_pred zero only at the boundary
-        # Look at (and replicate) prepare_training_data in helmholtz_2.py
+        # Predict values for boundary points
+        u_pred = self.forward(x_bc)
+
+        # Ensure boundary conditions are enforced by making y_bc a zero tensor
+        y_bc = torch.zeros_like(u_pred)
+
+        # Adaptive scaling for boundary loss
+        bc_loss = self.adaptive_bc_scale * torch.mean((u_pred - y_bc) ** 2)
+
         return bc_loss
 
     def riesz_loss(self, predictions, inputs):
@@ -210,6 +221,10 @@ class PINN(nn.Module):
 
         # The 0.5 * self.g * u ** 4 comes from Dirichlet's theorem (minimizing the energy functional)
         riesz_energy = torch.mean(gradients ** 2 + V * u ** 2 + 0.5 * self.g * u ** 4)
+
+        # Regularize to avoid trivial zero solution (added on 09/29/24)
+        epsilon = 1e-4  # Small regularization coefficient
+        riesz_energy += epsilon * torch.mean(torch.abs(u))
         return riesz_energy
 
     def pde_loss(self, inputs, predictions):
@@ -252,14 +267,27 @@ class PINN(nn.Module):
         # Residual of the PDE (Gross-Pitaevskii equation)
         pde_residual = -laplacian_u + self.g * torch.abs(u ** 2) * u - (lambda_pde * u)
 
-        # PDE loss: Mean squared error of the residual
-        pde_loss = torch.mean(pde_residual ** 2)
+        # Regularization: See https://arxiv.org/abs/2010.05075
+
+        # Regularization term 1: L_f = 1 / (f(x, λ))^2, penalizes the network if the PDE residual is close to zero to
+        # avoid trivial eigenfunctions
+        L_f = 1 / (torch.mean(pde_residual ** 2) + 1e-6)  # Add small constant to avoid division by zero
+
+        # Regularization term 2: L_λ = 1 / λ^2, penalizes small eigenvalues λ, ensuring non-trivial eigenvalues
+        L_lambda = 1 / (lambda_pde ** 2 + 1e-6)
+
+        # Regularization term 3: L_drive = e^(-λ + c), encourages λ to grow, preventing collapse to small values
+        c = 1.0  # Tunable
+        L_drive = torch.exp(-lambda_pde + c)
+
+        # PDE loss as the residual plus regularization
+        pde_loss = torch.mean(pde_residual ** 2) + L_f + L_lambda #+ L_drive
 
         return pde_loss, pde_residual
 
-    def loss(self, x_bc, y_bc, x_to_train_f):
+    def loss(self, x_bc, y_bc, x_to_train_f, current_epoch):
         """
-        Computes the total loss combining BC loss, PDE loss (Helmholtz), and Riesz loss.
+        Computes the total loss combining BC loss, PDE loss (Gross Pitaevskii), and Riesz loss.
 
         Parameters
         ----------
@@ -269,15 +297,23 @@ class PINN(nn.Module):
             Boundary condition true values.
         x_to_train_f : torch.Tensor
             Input points for PDE training.
+        current_epoch : int
+        The current training epoch to control the boundary condition scaling over time.
 
         Returns
         -------
         torch.Tensor
             Total loss combining BC, PDE, and Riesz losses.
         """
-        loss_u = self.adaptive_bc_scale * self.loss_BC(x_bc, y_bc)  # BC loss - x_bc and y_bc are the entire domain of points in 2D
+
+        # Decrease boundary loss weight over time as needed (added 09/29/204)
+        epoch_factor = min(1, current_epoch / 500)  # Increase weight gradually over first 500 epochs
+        loss_u = epoch_factor * self.adaptive_bc_scale * self.loss_BC(x_bc, y_bc)  # Boundary loss
+
+        # Add weights for Riesz loss (added on 09/29/24)
+        alpha = 1.0  # Weight for Riesz loss
+
         predictions = self.forward(x_to_train_f)
-        predictions = predictions / torch.sqrt(torch.sum(predictions ** 2)) # Normalize to L^2 norm = 1
 
         # PDE loss (Gross Pitaevskii equation)
         loss_pde, _ = self.pde_loss(x_to_train_f, predictions)
@@ -288,8 +324,10 @@ class PINN(nn.Module):
         # TODO: Use Riez loss to compute lambda (see after equation (2.5) in paper)
         #lambda = constant in paper
 
-        #total_loss = loss_u + loss_pde + loss_riesz
-        total_loss = loss_pde + loss_riesz
+        # Add a norm regularization term to prevent trivial solutions
+        norm_constraint = 1e-3 * torch.mean(predictions ** 2)  # Penalize zero solutions
+
+        total_loss = loss_u + loss_pde + alpha * loss_riesz + norm_constraint
         return total_loss
 
     def compute_potential(self, inputs):
@@ -336,7 +374,6 @@ class PINN(nn.Module):
             Corresponding lowest energy value.
         """
         u = self.forward(x)
-        u = u / torch.sqrt(torch.sum(u ** 2))  # Normalize to L^2 norm = 1
 
         energy, _ = self.pde_loss(x, u)
         return u, energy.item()
@@ -493,7 +530,7 @@ def train_pinn_mixed_precision(model, optimizer, scheduler, x_bc, y_bc, x_to_tra
         optimizer.zero_grad()
 
         with torch.amp.autocast('cuda'):  # Use mixed precision for forward pass
-            loss = model.loss(x_bc, y_bc, x_to_train_f)
+            loss = model.loss(x_bc, y_bc, x_to_train_f, current_epoch=epoch)
 
         # Make loss a scalar
         #loss = loss.mean() #  average of all individual losses
@@ -569,9 +606,13 @@ def train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, x_bc, y
         adam_optimizer.zero_grad()
 
         with torch.amp.autocast('cuda'):
-            loss = model.loss(x_bc, y_bc, x_to_train_f)
+            loss = model.loss(x_bc, y_bc, x_to_train_f, current_epoch=epoch)
 
         loss = loss.sum()  # total sum of all losses
+
+        # Gradient clipping - Prevents exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         scaler.scale(loss).backward()
         scaler.step(adam_optimizer)
         scaler.update()
@@ -599,7 +640,7 @@ def train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, x_bc, y
     # LBFGS optimization phase (full precision)
     def closure():
         lbfgs_optimizer.zero_grad()
-        loss = model.loss(x_bc, y_bc, x_to_train_f)
+        loss = model.loss(x_bc, y_bc, x_to_train_f, current_epoch=epoch)
 
         loss = loss.sum()
         loss.backward()
@@ -736,6 +777,57 @@ def solutionplot(u_pred, x_bc, y_bc, u_bc):
     plt.show()
 
 
+def solutionplot2(u_pred, X_f_train_np_array, X_u_train_np_array, u_train_np_array, x_bc, y_bc):
+    """
+    Plots the predicted solution, ground truth boundary condition, and absolute error between them.
+
+    Parameters
+    ----------
+    u_pred : numpy.ndarray
+        Predicted solution values from the model.
+    X_f_train_np_array : numpy.ndarray
+        Training data points including boundary and internal points.
+    X_u_train_np_array : numpy.ndarray
+        Boundary condition points (X, Y).
+    u_train_np_array : numpy.ndarray
+        Ground truth boundary condition values (zeros).
+    x_bc : numpy.ndarray
+        X-coordinate boundary values.
+    y_bc : numpy.ndarray
+        Y-coordinate boundary values.
+    """
+
+    # Plot the predicted solution
+    # plt.subplot(1, 3, 1)
+    # plt.pcolor(x_bc, y_bc, u_pred, cmap='jet')
+    # plt.colorbar()
+    # plt.xlabel(r'$x$', fontsize=18)
+    # plt.ylabel(r'$y$', fontsize=18)
+    # plt.title('Predicted $\hat u(x,y)$', fontsize=15)
+
+    # Plot the actual boundary condition data from the training set
+    plt.subplot(1, 2, 1)
+    plt.scatter(X_u_train_np_array[:, 0], X_u_train_np_array[:, 1], c=u_train_np_array, cmap='jet', marker='o', label='Boundary Data')
+    plt.colorbar()
+    plt.xlabel(r'$x$', fontsize=18)
+    plt.ylabel(r'$y$', fontsize=18)
+    plt.title('Boundary Data from Training', fontsize=15)
+
+    # Absolute error between prediction and ground truth at boundary points
+    plt.subplot(1, 2, 2)
+    #boundary_error = np.abs(u_train_np_array - u_pred.reshape(u_train_np_array.shape))
+    #plt.scatter(X_u_train_np_array[:, 0], X_u_train_np_array[:, 1], c=boundary_error, cmap='jet', marker='o')
+    plt.scatter(X_u_train_np_array[:, 0], X_u_train_np_array[:, 1], c=u_train_np_array, cmap='jet', marker='o',
+                label='Boundary Data')
+    plt.colorbar()
+    plt.xlabel(r'$x$', fontsize=18)
+    plt.ylabel(r'$y$', fontsize=18)
+    plt.title('Boundary Error $|u_{bc}(x,y) - \hat u(x,y)|$', fontsize=15)
+
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_training_progress(train_losses, test_losses, test_metrics, steps):
     """
     Plot the training and test losses, along with the test metric, over the course of training.
@@ -780,7 +872,8 @@ def plot_training_progress(train_losses, test_losses, test_metrics, steps):
 
 def plot_pde_residual(model, X_test):
     """
-    Plots the residual of the PDE, indicating how well the predicted solution satisfies the GPE equation.
+    Plots the magnitude of the residual of the PDE, indicating how well the predicted solution satisfies the GPE
+    equation.
 
     Parameters
     ----------
@@ -804,9 +897,58 @@ def plot_pde_residual(model, X_test):
     pde_residual = pde_residual.cpu().detach().numpy()
 
     # Plot residual
-    plt.contour(X_test[:, 0], X_test[:, 1], pde_residual, cmap='jet')
+    plt.contour(X_test[:, 0], X_test[:, 1], np.abs(pde_residual), cmap='jet')
     plt.colorbar()
     plt.title('PDE Residual')
+    plt.show()
+
+
+def pinn_solution_plot(u_pred, X_f_train_np_array, X_u_train_np_array, u_train_np_array, x_bc, y_bc):
+    """
+    Comprehensive plot of the PINN solution for the Gross-Pitaevskii problem, including boundary and interior points.
+
+    Parameters
+    ----------
+    u_pred : numpy.ndarray
+        Predicted solution from the PINN model.
+    X_f_train_np_array : numpy.ndarray
+        All training points (both boundary and internal).
+    X_u_train_np_array : numpy.ndarray
+        Boundary condition points.
+    u_train_np_array : numpy.ndarray
+        Boundary condition values (zeros).
+    x_bc : numpy.ndarray
+        X-coordinate boundary values.
+    y_bc : numpy.ndarray
+        Y-coordinate boundary values.
+    """
+
+    # Predicted solution on the entire domain (X_f_train_np_array)
+    plt.subplot(1, 3, 1)
+    plt.scatter(X_f_train_np_array[:, 0], X_f_train_np_array[:, 1], c=u_pred.flatten(), cmap='jet', marker='o')
+    plt.colorbar()
+    plt.xlabel(r'$x$', fontsize=18)
+    plt.ylabel(r'$y$', fontsize=18)
+    plt.title('Predicted Solution Across Domain', fontsize=15)
+
+    # Plot boundary data as a separate plot
+    plt.subplot(1, 3, 2)
+    plt.scatter(X_u_train_np_array[:, 0], X_u_train_np_array[:, 1], c=u_train_np_array, cmap='jet', marker='o')
+    plt.colorbar()
+    plt.xlabel(r'$x$', fontsize=18)
+    plt.ylabel(r'$y$', fontsize=18)
+    plt.title('Boundary Data (Ground Truth)', fontsize=15)
+
+    # Absolute error between prediction and boundary data
+    plt.subplot(1, 3, 3)
+    boundary_error = np.abs(u_train_np_array - u_pred.reshape(u_train_np_array.shape))
+    plt.scatter(X_u_train_np_array[:, 0], X_u_train_np_array[:, 1], c=boundary_error, cmap='jet', marker='o')
+    plt.colorbar()
+    plt.xlabel(r'$x$', fontsize=18)
+    plt.ylabel(r'$y$', fontsize=18)
+    plt.title('Boundary Condition Error', fontsize=15)
+
+    plt.tight_layout()
     plt.show()
 
 
@@ -814,7 +956,7 @@ def plot_pde_residual(model, X_test):
 if __name__ == "__main__":
 
     # Specify number of grid points and number of dimensions
-    num_grid_pts = 64
+    num_grid_pts = 32
     nDim = 2
 
     # Prepare test data
@@ -841,9 +983,9 @@ if __name__ == "__main__":
     f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the physics equation residual
 
     # Model parameters
-    layers = [2, 40, 40, 40, 40, 1]  # Neural network layers
-    epochs_adam = 1000
-    epochs_lbfgs = 500
+    layers = [2, 256, 256, 256, 1]  # Neural network layers
+    epochs_adam = 500
+    epochs_lbfgs = 100
 
     # Initialize the model
     model = PINN(layers, ub=ub, lb=lb).to(device)
@@ -872,6 +1014,11 @@ if __name__ == "__main__":
     visualize_solution(model, x_bc, y_bc)
 
     # Plot ground truth, predicted solution, and error
-    solutionplot(u_pred, x_1, x_2, u_train_np_array)
+    #solutionplot(u_pred, x_1, x_2, u_train_np_array)
+    x_bc_np_array = x_bc.cpu().detach().numpy()
+    y_bc_np_array = y_bc.cpu().detach().numpy()
+    solutionplot2(u_pred, X_f_train_np_array, X_u_train_np_array, u_train_np_array, x_bc_np_array, y_bc_np_array)
+
+    pinn_solution_plot(u_pred, X_f_train_np_array, X_u_train_np_array, u_train_np_array, x_bc_np_array, y_bc_np_array)
 
     Ellipsis
