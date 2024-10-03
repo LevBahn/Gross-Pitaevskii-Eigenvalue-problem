@@ -257,8 +257,11 @@ class PINN(nn.Module):
         u_x = torch.autograd.grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
 
         # Second derivatives of the Laplacian (∇²u)
-        u_xx = torch.autograd.grad(u_x[:, 0], inputs, grad_outputs=torch.ones_like(u_x[:, 0]), create_graph=True)[0][:, 0]
-        u_yy = torch.autograd.grad(u_x[:, 1], inputs, grad_outputs=torch.ones_like(u_x[:, 1]), create_graph=True)[0][:, 1]
+        #u_xx = torch.autograd.grad(u_x[:, 0], inputs, grad_outputs=torch.ones_like(u_x[:, 0]), create_graph=True)[0][:, 0]
+        #u_yy = torch.autograd.grad(u_x[:, 1], inputs, grad_outputs=torch.ones_like(u_x[:, 1]), create_graph=True)[0][:, 1]
+        # inputs is a 2D tensor where the first row corresponds to x and the second row corresponds to y
+        u_xx = torch.autograd.grad(u_x[0, :], inputs, grad_outputs=torch.ones_like(u_x[0, :]), create_graph=True)[0][0,:]
+        u_yy = torch.autograd.grad(u_x[1, :], inputs, grad_outputs=torch.ones_like(u_x[1, :]), create_graph=True)[0][1,:]
         laplacian_u = u_xx + u_yy
 
         # Compute λ directly from the energy functional as the average energy per unit u.
@@ -327,7 +330,7 @@ class PINN(nn.Module):
         # Add a norm regularization term to prevent trivial solutions
         norm_constraint = 1e-3 * torch.mean(predictions ** 2)  # Penalize zero solutions
 
-        total_loss = loss_u + loss_pde + alpha * loss_riesz + norm_constraint
+        total_loss = loss_u + loss_pde + alpha * loss_riesz #+ norm_constraint
         return total_loss
 
     def compute_potential(self, inputs):
@@ -771,13 +774,35 @@ def plot_solution(X_test, u_pred):
     Y = X_test[:, 1].reshape((num_grid_pts, num_grid_pts))
 
     # Plot the predicted solution as a contour plot
-    #plt.contourf(X, Y, u_pred, levels=50, cmap='viridis')
-    plt.pcolor(X, Y, u_pred, cmap='viridis')
+    plt.contourf(X, Y, u_pred, levels=50, cmap='viridis')
+    #plt.pcolor(X, Y, u_pred, cmap='viridis')
     plt.colorbar(label='u_pred')
     plt.title('Predicted Solution $u_{pred}$ for Gross-Pitaevskii Equation')
     plt.xlabel('$x$')
     plt.ylabel('$y$')
     plt.grid(True)
+    plt.show()
+
+
+def plot_1d_solution(u_pred):
+    """
+    Plots the predicted solution vector u_pred for the Gross-Pitaevskii equation.
+
+    Parameters
+    ----------
+    u_pred : np.ndarray
+        Predicted solution vector u_pred from the neural network (1D).
+    """
+    plt.figure(figsize=(8, 6))
+
+    # Plot the 1D predicted solution
+    plt.plot(u_pred, label='Predicted $u_{pred}$', color='blue', marker='o')
+
+    plt.title('Predicted solution for the Gross-Pitaevskii Equation')
+    plt.xlabel('Index')
+    plt.ylabel('$u_{pred}$')
+    plt.grid(True)
+    plt.legend()
     plt.show()
 
 
@@ -831,9 +856,12 @@ if __name__ == "__main__":
     print(f'Test Error: {error_vec:.5f}')
 
     # Plot PDE Residual
-    plot_pde_residual(model, X_u_test_tensor)
+    #plot_pde_residual(model, X_u_test_tensor)
 
     # Plot solution
     plot_solution(X_u_test_tensor.detach().cpu().numpy(), u_pred)
+
+    # Plot 1D GPE
+    plot_1d_solution(u_pred)
 
     Ellipsis
