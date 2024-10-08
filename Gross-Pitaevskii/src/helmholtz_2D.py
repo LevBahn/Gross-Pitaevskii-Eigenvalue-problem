@@ -82,36 +82,6 @@ def prepare_test_data(X, Y):
     return X_u_test, lb, ub
 
 
-def prepare_training_data(lb, ub, num_points=1000):
-    """
-    Prepare training data by generating random points within the domain
-    and computing the ground truth based on the analytical solution.
-
-    Parameters
-    ----------
-    lb : np.ndarray
-        Lower bound for the domain (boundary conditions).
-    ub : np.ndarray
-        Upper bound for the domain (boundary conditions).
-    num_points : int, optional
-        The number of random points to generate for training (default is 1000).
-
-    Returns
-    -------
-    X_train : np.ndarray
-        Randomly generated training points within the domain.
-    u_train : np.ndarray
-        Ground truth training values based on the analytical solution.
-    """
-    # Generate random points within the domain as training data
-    X_train = lb + (ub - lb) * np.random.rand(num_points, 2)
-
-    # Placeholder for actual training labels using a simple analytical solution
-    u_train = np.sin(X_train[:, 0]) * np.sin(X_train[:, 1])
-
-    return X_train, u_train
-
-
 def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
     """
     Prepare boundary condition data and collocation points for training.
@@ -169,10 +139,10 @@ def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
     return X_f_train, X_u_train, u_train
 
 
-class SequentialModel(nn.Module):
+class HelmholtzPINN(nn.Module):
     """
-    A custom sequential neural network model for solving boundary condition (BC) and
-    partial differential equation (PDE) loss functions using PyTorch.
+    A neural network for solving data (boundary condition) loss and partial differential equation (residual) loss
+    for the 2D Helmholtz equation in PyTorch.
 
     Parameters
     ----------
@@ -191,7 +161,7 @@ class SequentialModel(nn.Module):
             A list of integers where each element defines the number of neurons
             in the respective layer.
         """
-        super().__init__()  # Call the parent class (nn.Module) initializer
+        super().__init__()
 
         # LeakyReLU activation function
         self.activation = nn.LeakyReLU()
@@ -294,7 +264,7 @@ class SequentialModel(nn.Module):
 
     def test(self, X_test, u_true):
         """
-        Test the model on the test data and compute the relative L2 norm of the error and the mean absolute error.
+        Test the model on the test data and computes the relative L2 norm of the error and the mean absolute error.
 
         Parameters
         ----------
@@ -321,7 +291,7 @@ class SequentialModel(nn.Module):
         # Compute the mean absolute error (MAE)
         mae = torch.mean(torch.abs(u_true - u_pred))
 
-        # Reshape the predicted output for plotting
+        # Reshape the predicted output
         u_pred = np.reshape(u_pred.cpu().detach().numpy(), (num_grid_pts, num_grid_pts), order='F')
 
         return error_vec, u_pred, mae
@@ -383,8 +353,6 @@ def solutionplot(u_pred, usol, x_1, x_2, index, X_f_train=None):
     plt.tight_layout()
     plt.show()
     plt.pause(0.1)
-
-    # Save the figure as a high-resolution image file
     plt.savefig(f'Helmholtz_iter_{index}.png', dpi=500, bbox_inches='tight')
 
 
@@ -392,8 +360,7 @@ def LBFGS_training():
     """
     Computes the loss and its gradients for use with the LBFGS optimizer.
 
-    This closure function is necessary for optimizers like LBFGS which require
-    multiple evaluations of the function. It performs the following:
+    Necessary for optimizers which require multiple evaluations of the function. It performs the following:
     - Resets gradients to zero.
     - Calculates the loss using the physics-informed neural network (PINN) model.
     - Backpropagates the gradients of the loss.
@@ -495,7 +462,7 @@ if __name__ == "__main__":
 
     # Number of training points and collocation points
     N_u = 500  # Total number of data points for 'u', used to train the model on boundary conditions
-    N_f = 10000  # Total number of collocation points for training the physics-informed part of the model
+    N_f = 10000  # Total number of collocation points for training the physics-informed part of the model in the domain
 
     # Prepare training data
     X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, usol, X, Y)
@@ -508,7 +475,7 @@ if __name__ == "__main__":
     u = torch.from_numpy(u_true).float().to(device)  # True solution values (ground truth for testing)
     f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the physics equation residual
 
-    # Neural network architecture - # Input layer with 2 nodes, 4 hidden layers with 200 nodes, and
+    # Neural network architecture - Input layer with 2 nodes, 4 hidden layers with 200 nodes, and
     # an output layer with 1 node
     layers = np.array([2, 200, 200, 200, 200, 1])
     PINN = SequentialModel(layers)
@@ -529,7 +496,7 @@ if __name__ == "__main__":
     start_time = time.time()  # Start timer
 
     # Adam optimization loop
-    adam_iter = 1000
+    adam_iter = 350
 
     # Store training progress
     train_losses = []
@@ -584,7 +551,7 @@ if __name__ == "__main__":
             train_maes.append(train_mae.item())
             test_maes.append(test_mae.item())
 
-        if i % 100 == 0:
+        if i % 50 == 0:
 
             # Predict the solution
             _, u_pred, _ = PINN.test(X_u_test_tensor, u)
