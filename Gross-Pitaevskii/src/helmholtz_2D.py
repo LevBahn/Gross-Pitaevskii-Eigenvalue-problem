@@ -478,7 +478,7 @@ if __name__ == "__main__":
     # Neural network architecture - Input layer with 2 nodes, 4 hidden layers with 200 nodes, and
     # an output layer with 1 node
     layers = np.array([2, 200, 200, 200, 200, 1])
-    PINN = SequentialModel(layers)
+    PINN = HelmholtzPINN(layers)
 
     # Move the model to the GPU (if available)
     PINN.to(device)
