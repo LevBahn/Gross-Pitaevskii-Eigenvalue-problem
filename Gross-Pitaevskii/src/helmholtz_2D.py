@@ -25,120 +25,6 @@ np.random.seed(1234)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def create_grid(num_grid_pts=256, n_dim=2):
-    """
-    Creates an n-dimensional grid of points as a NumPy array.
-
-    Parameters
-    ----------
-    num_grid_pts : int, optional
-        The number of grid points along each dimension (default is 256).
-    n_dim : int, optional
-        The number of dimensions (default is 2).
-
-    Returns
-    -------
-    grid : np.ndarray
-        n-dimensional grid points as a NumPy array.
-    axis_points : list of np.ndarray
-        List of 1D arrays of points for every dimension.
-    """
-    # Form 1D arrays for every dimension
-    axis_points = [np.linspace(0, np.pi, num_grid_pts) for _ in range(n_dim)]
-
-    # Generate a meshgrid up to n_dim
-    grids = np.meshgrid(*axis_points, indexing='ij', sparse=False)
-
-    return grids, axis_points
-
-
-def prepare_test_data(X, Y):
-    """
-    Prepare test data by flattening the 2D grids and stacking them column-wise.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        2D grid points in the x-dimension as a NumPy array.
-    Y : np.ndarray
-        2D grid points in the y-dimension as a NumPy array.
-
-    Returns
-    -------
-    X_u_test : np.ndarray
-        Test data prepared by stacking the flattened x and y grids.
-    lb : np.ndarray
-        Lower bound for the domain (boundary conditions).
-    ub : np.ndarray
-        Upper bound for the domain (boundary conditions).
-    """
-    # Flatten the grids and stack them into a 2D array
-    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
-
-    # Domain bounds as NumPy arrays
-    lb = np.array([0, 0], dtype=np.float32)
-    ub = np.array([np.pi, np.pi], dtype=np.float32)
-
-    return X_u_test, lb, ub
-
-
-def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
-    """
-    Prepare boundary condition data and collocation points for training.
-
-    Parameters
-    ----------
-    N_u : int
-        Number of boundary condition points to select.
-    N_f : int
-        Number of collocation points for the physics-informed model.
-    lb : np.ndarray
-        Lower bound for the domain.
-    ub : np.ndarray
-        Upper bound for the domain.
-    usol : np.ndarray
-        Analytical solution of the PDE.
-    X : np.ndarray
-        X grid of points.
-    Y : np.ndarray
-        Y grid of points.
-
-    Returns
-    -------
-    X_f_train : np.ndarray
-        Collocation points in the domain.
-    X_u_train : np.ndarray
-        Boundary condition points.
-    u_train : np.ndarray
-        Corresponding boundary condition values.
-    """
-    # Boundary points from all four edges
-    boundary_points = np.vstack((
-        np.hstack((X[:, 0][:, None], Y[:, 0][:, None])),
-        np.hstack((X[:, -1][:, None], Y[:, -1][:, None])),
-        np.hstack((X[0, :][:, None], Y[0, :][:, None])),
-        np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))
-    ))
-
-    # Boundary values (analytical solution at boundary points)
-    boundary_values = np.vstack((
-        usol[:, 0][:, None],
-        usol[:, -1][:, None],
-        usol[0, :][:, None],
-        usol[-1, :][:, None]
-    ))
-
-    # Randomly select N_u boundary points
-    idx = np.random.choice(boundary_points.shape[0], N_u, replace=False)
-    X_u_train = boundary_points[idx, :]
-    u_train = boundary_values[idx, :]
-
-    # Generate N_f collocation points using Latin Hypercube Sampling
-    X_f_train = lb + (ub - lb) * lhs(2, N_f)  # Collocation points in [lb, ub]
-
-    return X_f_train, X_u_train, u_train
-
-
 class HelmholtzPINN(nn.Module):
     """
     A neural network for solving data (boundary condition) loss and partial differential equation (residual) loss
@@ -297,63 +183,119 @@ class HelmholtzPINN(nn.Module):
         return error_vec, u_pred, mae
 
 
-def solutionplot(u_pred, usol, x_1, x_2, index, X_f_train=None):
+
+def create_grid(num_grid_pts=256, n_dim=2):
     """
-    Plots the ground truth solution, predicted solution, and absolute error between them.
-    Optionally includes the collocation points.
+    Creates an n-dimensional grid of points as a NumPy array.
 
     Parameters
     ----------
-    u_pred : numpy.ndarray
-        Predicted solution values from the model.
-    usol : numpy.ndarray
-        Ground truth solution values to be plotted.
-    x_1 : numpy.ndarray
-        1D array of grid points in the x1-dimension.
-    x_2 : numpy.ndarray
-        1D array of grid points in the x2-dimension.
-    index : int
-        Current iteration of the optimizer.
-    X_f_train : torch.Tensor, optional
-        Collocation points used for PDE loss (optional, default is None).
+    num_grid_pts : int, optional
+        The number of grid points along each dimension (default is 256).
+    n_dim : int, optional
+        The number of dimensions (default is 2).
+
+    Returns
+    -------
+    grid : np.ndarray
+        n-dimensional grid points as a NumPy array.
+    axis_points : list of np.ndarray
+        List of 1D arrays of points for every dimension.
     """
+    # Form 1D arrays for every dimension
+    axis_points = [np.linspace(0, np.pi, num_grid_pts) for _ in range(n_dim)]
 
-    plt.figure(figsize=(18, 5))
+    # Generate a meshgrid up to n_dim
+    grids = np.meshgrid(*axis_points, indexing='ij', sparse=False)
 
-    # Plot ground truth solution
-    plt.subplot(1, 3, 1)
-    plt.pcolor(x_1, x_2, usol, cmap='jet')
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title('Ground Truth $u(x_1,x_2)$', fontsize=15)
+    return grids, axis_points
 
-    # Plot predicted solution
-    plt.subplot(1, 3, 2)
-    plt.pcolor(x_1, x_2, u_pred, cmap='jet')
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title(f'Predicted $\hat u(x_1,x_2)$ - Iteration {index}', fontsize=15)
 
-    # Optionally plot collocation points
-    if X_f_train is not None:
-        X_f_train_np = X_f_train.cpu().numpy()
-        plt.scatter(X_f_train_np[:, 0], X_f_train_np[:, 1], color='white', s=1, label="Collocation Points")
-        plt.legend()
+def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
+    """
+    Prepare boundary condition data and collocation points for training.
 
-    # Plot absolute error
-    plt.subplot(1, 3, 3)
-    plt.pcolor(x_1, x_2, np.abs(usol - u_pred), cmap='jet')
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title(r'Absolute error $|u(x_1,x_2)- \hat u(x_1,x_2)|$', fontsize=15)
+    Parameters
+    ----------
+    N_u : int
+        Number of boundary condition points to select.
+    N_f : int
+        Number of collocation points for the physics-informed model.
+    lb : np.ndarray
+        Lower bound for the domain.
+    ub : np.ndarray
+        Upper bound for the domain.
+    usol : np.ndarray
+        Analytical solution of the PDE.
+    X : np.ndarray
+        X grid of points.
+    Y : np.ndarray
+        Y grid of points.
 
-    plt.tight_layout()
-    plt.show()
-    plt.pause(0.1)
-    plt.savefig(f'Helmholtz_iter_{index}.png', dpi=500, bbox_inches='tight')
+    Returns
+    -------
+    X_f_train : np.ndarray
+        Collocation points in the domain.
+    X_u_train : np.ndarray
+        Boundary condition points.
+    u_train : np.ndarray
+        Corresponding boundary condition values.
+    """
+    # Boundary points from all four edges
+    boundary_points = np.vstack((
+        np.hstack((X[:, 0][:, None], Y[:, 0][:, None])),
+        np.hstack((X[:, -1][:, None], Y[:, -1][:, None])),
+        np.hstack((X[0, :][:, None], Y[0, :][:, None])),
+        np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))
+    ))
+
+    # Boundary values (analytical solution at boundary points)
+    boundary_values = np.vstack((
+        usol[:, 0][:, None],
+        usol[:, -1][:, None],
+        usol[0, :][:, None],
+        usol[-1, :][:, None]
+    ))
+
+    # Randomly select N_u boundary points
+    idx = np.random.choice(boundary_points.shape[0], N_u, replace=False)
+    X_u_train = boundary_points[idx, :]
+    u_train = boundary_values[idx, :]
+
+    # Generate N_f collocation points using Latin Hypercube Sampling
+    X_f_train = lb + (ub - lb) * lhs(2, N_f)  # Collocation points in [lb, ub]
+
+    return X_f_train, X_u_train, u_train
+
+
+def prepare_test_data(X, Y):
+    """
+    Prepare test data by flattening the 2D grids and stacking them column-wise.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        2D grid points in the x-dimension as a NumPy array.
+    Y : np.ndarray
+        2D grid points in the y-dimension as a NumPy array.
+
+    Returns
+    -------
+    X_u_test : np.ndarray
+        Test data prepared by stacking the flattened x and y grids.
+    lb : np.ndarray
+        Lower bound for the domain (boundary conditions).
+    ub : np.ndarray
+        Upper bound for the domain (boundary conditions).
+    """
+    # Flatten the grids and stack them into a 2D array
+    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
+
+    # Domain bounds as NumPy arrays
+    lb = np.array([0, 0], dtype=np.float32)
+    ub = np.array([np.pi, np.pi], dtype=np.float32)
+
+    return X_u_test, lb, ub
 
 
 def LBFGS_training():
@@ -439,6 +381,65 @@ def plot_training_progress(train_losses, test_losses, train_maes, test_maes, ste
     plt.savefig('training_progress.png', dpi=500, bbox_inches='tight')
 
 
+def solutionplot(u_pred, usol, x_1, x_2, index, X_f_train=None):
+    """
+    Plots the ground truth solution, predicted solution, and absolute error between them.
+    Optionally includes the collocation points.
+
+    Parameters
+    ----------
+    u_pred : numpy.ndarray
+        Predicted solution values from the model.
+    usol : numpy.ndarray
+        Ground truth solution values to be plotted.
+    x_1 : numpy.ndarray
+        1D array of grid points in the x1-dimension.
+    x_2 : numpy.ndarray
+        1D array of grid points in the x2-dimension.
+    index : int
+        Current iteration of the optimizer.
+    X_f_train : torch.Tensor, optional
+        Collocation points used for PDE loss (optional, default is None).
+    """
+
+    plt.figure(figsize=(18, 5))
+
+    # Plot ground truth solution
+    plt.subplot(1, 3, 1)
+    plt.pcolor(x_1, x_2, usol, cmap='jet')
+    plt.colorbar()
+    plt.xlabel(r'$x_1$', fontsize=18)
+    plt.ylabel(r'$x_2$', fontsize=18)
+    plt.title('Ground Truth $u(x_1,x_2)$', fontsize=15)
+
+    # Plot predicted solution
+    plt.subplot(1, 3, 2)
+    plt.pcolor(x_1, x_2, u_pred, cmap='jet')
+    plt.colorbar()
+    plt.xlabel(r'$x_1$', fontsize=18)
+    plt.ylabel(r'$x_2$', fontsize=18)
+    plt.title(f'Predicted $\hat u(x_1,x_2)$ - Iteration {index}', fontsize=15)
+
+    # Optionally plot collocation points
+    if X_f_train is not None:
+        X_f_train_np = X_f_train.cpu().numpy()
+        plt.scatter(X_f_train_np[:, 0], X_f_train_np[:, 1], color='white', s=1, label="Collocation Points")
+        plt.legend()
+
+    # Plot absolute error
+    plt.subplot(1, 3, 3)
+    plt.pcolor(x_1, x_2, np.abs(usol - u_pred), cmap='jet')
+    plt.colorbar()
+    plt.xlabel(r'$x_1$', fontsize=18)
+    plt.ylabel(r'$x_2$', fontsize=18)
+    plt.title(r'Absolute error $|u(x_1,x_2)- \hat u(x_1,x_2)|$', fontsize=15)
+
+    plt.tight_layout()
+    plt.show()
+    plt.pause(0.1)
+    plt.savefig(f'Helmholtz_iter_{index}.png', dpi=500, bbox_inches='tight')
+
+
 if __name__ == "__main__":
 
     # Specify number of grid points and number of dimensions
@@ -495,8 +496,8 @@ if __name__ == "__main__":
 
     start_time = time.time()  # Start timer
 
-    # Adam optimization loop
-    adam_iter = 350
+    # Number of iterations in Adam optimization loop
+    adam_iter = 250
 
     # Store training progress
     train_losses = []
