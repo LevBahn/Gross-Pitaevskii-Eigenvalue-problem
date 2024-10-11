@@ -227,17 +227,18 @@ class GrossPitaevskiiPINN(nn.Module):
                                         grad_outputs=torch.ones_like(predictions),
                                         create_graph=True, retain_graph=True)[0]
 
-        laplacian_term = 0.5 * torch.mean(gradients ** 2)  # Kinetic term
-        V = self.compute_potential(inputs).unsqueeze(1)  # Potential term
-        interaction_term = 0.5 * self.g * torch.mean(u_normalized ** 4)  # Interaction term
+        #laplacian_term = 0.5 * torch.mean(gradients ** 2)  # Kinetic term
+        #V = self.compute_potential(inputs).unsqueeze(1)  # Potential term
+        #interaction_term = 0.5 * self.g * torch.mean(u_normalized ** 4)  # Interaction term
 
-        riesz_energy = laplacian_term + torch.mean(V * u_normalized ** 2) + interaction_term
+        #riesz_energy = laplacian_term + torch.mean(V * u_normalized ** 2) + interaction_term
 
         # Potential V(x)
-        #V = self.compute_potential(inputs).unsqueeze(1)
+        V = self.compute_potential(inputs).unsqueeze(1)
+        #plot_potential(X_u_test_tensor.cpu().numpy(), V.cpu().detach().numpy())
 
         # Energy functional (to minimize)
-        #riesz_energy = torch.mean(gradients ** 2 + V * u_normalized ** 2 + 0.5 * self.g * u_normalized ** 4)
+        riesz_energy = torch.mean(gradients ** 2 + V * u_normalized ** 2 + 0.5 * self.g * u_normalized ** 4)
 
         # Regularize to avoid trivial zero solution (added on 09/29/24)
         #epsilon = 1e-4  # Small regularization coefficient
@@ -328,7 +329,7 @@ class GrossPitaevskiiPINN(nn.Module):
         """
 
         # Clamp g to be within the desired range [0, 500]
-        self.g.data = torch.clamp(torch.tensor(g, device='cuda'), 1000, 1000)
+        self.g.data = torch.clamp(self.g.data, 0, 500)
 
         # Data loss at boundary
         data_loss = self.data_loss(x_bc, y_bc)
@@ -579,7 +580,7 @@ def train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, x_bc, y
         adam_optimizer.zero_grad()
 
         # Randomly sample g in [0, 500] for each epoch
-        g_sample = torch.FloatTensor(1).uniform_(0, 1).to('cuda')
+        g_sample = torch.FloatTensor(1).uniform_(0, 500).to('cuda')
 
         with torch.amp.autocast('cuda'):
             loss = model.loss(x_bc, y_bc, x_to_train_f, current_epoch=epoch, g=g_sample)
@@ -794,11 +795,25 @@ def plot_absolute_error(X_test, abs_error, epoch):
     plt.show()
 
 
-# Model initialization and training
+def plot_potential(X_test, potential):
+    """
+    Plot the potential.
+    """
+    plt.figure(figsize=(6, 5))
+    X = X_test[:, 0].reshape((num_grid_pts, num_grid_pts))
+    Y = X_test[:, 1].reshape((num_grid_pts, num_grid_pts))
+    potential = potential.reshape((num_grid_pts, num_grid_pts))
+
+    plt.contourf(X, Y, potential, levels=50, cmap='viridis')
+    plt.colorbar()
+    plt.title('Potential V(x, y)')
+    plt.show()
+
+
 if __name__ == "__main__":
 
     # Specify number of grid points and number of dimensions
-    num_grid_pts = 32
+    num_grid_pts = 64
     nDim = 2
 
     # Prepare test data
@@ -808,7 +823,7 @@ if __name__ == "__main__":
     X_u_test, lb, ub = prepare_test_data(X, Y)
 
     N_u = 100  # Number of boundary points
-    N_f = 5000  # Number of collocation points
+    N_f = 1000  # Number of collocation points
     X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y)
 
     # Convert numpy arrays to PyTorch tensors and move to GPU (if available)
