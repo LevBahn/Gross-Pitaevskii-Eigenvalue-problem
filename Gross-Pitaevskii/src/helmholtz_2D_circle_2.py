@@ -107,12 +107,13 @@ class HelmholtzPINN(nn.Module):
 
     def loss_PDE(self, x_to_train_f, k):
         """
-        Computes the PDE loss for the Helmholtz equation in polar coordinates for a circular domain.
+        Computes the partial differential equation (PDE) loss using automatic differentiation
+        to calculate the second-order derivatives.
 
         Parameters
         ----------
         x_to_train_f : torch.Tensor
-            Input tensor containing points in the domain.
+            Input tensor for training PDE.
         k : int
             Wave number of the Helmholtz equation.
 
@@ -121,62 +122,37 @@ class HelmholtzPINN(nn.Module):
         torch.Tensor
             Loss value for the PDE.
         """
-        # Make requires_grad = True
-        x_to_train_f = x_to_train_f.clone().requires_grad_(True)
+        x_1_f = x_to_train_f[:, [0]]
+        x_2_f = x_to_train_f[:, [1]]
 
-        x_1_f = x_to_train_f[:, [0]]  # x-component
-        x_2_f = x_to_train_f[:, [1]]  # y-component
+        g = x_to_train_f.clone()
+        g.requires_grad = True
 
-        # Convert to polar coordinates
+        # Forward pass through the network
+        u = self.forward(g)
+
+        # Compute first-order derivatives
+        u_x = autograd.grad(u, g, torch.ones([x_to_train_f.shape[0], 1]).to(device),
+                            retain_graph=True, create_graph=True)[0]
+
+        # Compute second-order derivatives
+        u_xx = autograd.grad(u_x, g, torch.ones(x_to_train_f.shape).to(device),
+                             create_graph=True)[0]
+        u_xx_1 = u_xx[:, [0]]
+        u_xx_2 = u_xx[:, [1]]
+
+        # Define the PDE residual
         r = torch.sqrt(x_1_f ** 2 + x_2_f ** 2)  # Radius r = sqrt(x^2 + y^2)
         theta = torch.atan2(x_2_f, x_1_f)  # Angle theta = atan2(y, x)
-
-        # Avoid division by zero
-        r = torch.clamp(r, min=1e-8)
-
-        # Forward pass to get u
-        u = self.forward(x_to_train_f)
-
-        # First-order derivatives
-        u_x = autograd.grad(u, x_to_train_f, torch.ones_like(u).to(device),
-                            retain_graph=True, create_graph=True)[0]
-        u_x1 = u_x[:, 0]  # ∂u/∂x1
-        u_x2 = u_x[:, 1]  # ∂u/∂x2
-
-        # Second-order derivatives
-        u_xx = autograd.grad(u_x, x_to_train_f, torch.ones_like(u_x).to(device),
-                             create_graph=True)[0]
-        u_xx_1 = u_xx[:, 0]  # ∂²u/∂x1²
-        u_xx_2 = u_xx[:, 1]  # ∂²u/∂x2²
-
-        # Polar derivatives through Cartesian derivatives
-        u_r = (x_1_f / r) * u_x1 + (x_2_f / r) * u_x2
-        u_rr = (x_1_f ** 2 / r ** 2) * u_xx_1 + (2 * x_1_f * x_2_f / r ** 2) * u_xx_2 + (
-                x_2_f ** 2 / r ** 2) * u_xx_2
-
-        # Angular derivatives using Cartesian derivatives
-        u_theta = -x_2_f * u_x1 + x_1_f * u_x2  # First derivative wrt theta
-        u_theta_grad = autograd.grad(u_theta, x_to_train_f, torch.ones_like(u_theta).to(device),
-                                     create_graph=True)[0]
-        u_theta_theta = -x_2_f * u_theta_grad[:, 0] + x_1_f * u_theta_grad[:, 1]  # ∂²u/∂θ²
-
-        # Helmholtz PDE in polar coordinates: u_rr + (1/r)*u_r + (1/r²)*u_θθ + k²*u = q
-
-        n = 1  # Angular mode number
-        m = 1  # Constant mode number
-        k = torch.sqrt(torch.tensor(np.pi ** 2 * (m ** 2 + n ** 2), device=device))  # Wavenumber
-        r_cpu = r.detach().cpu().numpy()
-        jn_values = jn(n, k.cpu().numpy() * r_cpu)  # Bessel function values using scipy
-        jn_torch = torch.tensor(jn_values, dtype=torch.float64, device=device)
+        jn_values = jn(n, k * r.cpu().numpy())  # Bessel function
+        jn_torch = torch.tensor(jn_values, dtype=torch.float32, device=device)
 
         # Source term
-        q = k**2 * jn_torch * torch.cos(n * theta)
+        q = k ** 2 * jn_torch * torch.cos(n * theta)
+        f = u_xx_1 + u_xx_2 + k ** 2 * u - q
 
-        # PDE residual
-        f = u_rr + (1 / r) * u_r + (1 / r ** 2) * u_theta_theta + k ** 2 * u  - q
-
-        # Reshape for loss calculation
-        return self.loss_function(f.view(-1), torch.zeros_like(f).view(-1))
+        # PDE loss
+        return self.loss_function(f, f_hat)
 
     def test(self, X_test, u_true):
         """
@@ -661,13 +637,13 @@ if __name__ == "__main__":
             train_maes.append(train_mae.item())
             test_maes.append(test_mae.item())
 
-        if i % 50 == 0:
+        if i % 100 == 0:
 
             # Predict the solution
             _, u_pred, _ = PINN.test(X_u_test_tensor, u)
 
             # Visualize the current prediction
-            #solutionplot(u_pred, usol, x_1, x_2, i)
+            solutionplot(u_pred, usol, x_1, x_2, i)
 
     # L-BFGS optimization
     lbfgs_optimizer.step(LBFGS_training)

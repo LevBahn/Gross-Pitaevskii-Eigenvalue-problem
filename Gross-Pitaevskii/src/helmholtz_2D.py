@@ -10,8 +10,6 @@ import matplotlib
 import matplotlib.pyplot as plt
 matplotlib.use('TkAgg')
 
-plt.ion()  # Enable interactive mode
-
 # Set default dtype to float32
 torch.set_default_dtype(torch.float)
 
@@ -298,6 +296,42 @@ def prepare_test_data(X, Y):
     return X_u_test, lb, ub
 
 
+def visualize_training_data(X_f_train, X_u_train, u_train):
+    """
+    Visualizes the boundary points and collocation points on a π × π square domain.
+
+    Parameters
+    ----------
+    X_f_train : np.ndarray
+        Collocation points to visualize.
+    X_u_train : np.ndarray
+        Boundary points to visualize.
+    u_train : np.ndarray
+        Corresponding boundary condition values.
+    """
+    plt.figure(figsize=(8, 8))
+
+    # Plot boundary points
+    plt.scatter(X_u_train[:, 0], X_u_train[:, 1], color='red', label='Boundary Points', alpha=0.6)
+
+    # Plot collocation points
+    plt.scatter(X_f_train[:, 0], X_f_train[:, 1], color='blue', label='Collocation Points', alpha=0.3)
+
+    # Plot the π × π square
+    square = plt.Rectangle((0, 0), np.pi, np.pi, edgecolor='green', fill=False, label='π-Square')
+    plt.gca().add_artist(square)
+
+    plt.xlim([0, np.pi])
+    plt.ylim([0, np.pi])
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.xlabel('$x_1$', fontsize=14)
+    plt.ylabel('$x_2$', fontsize=14)
+    plt.title('Boundary and Collocation Points inside the π-Square')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+
 def LBFGS_training():
     """
     Computes the loss and its gradients for use with the LBFGS optimizer.
@@ -467,6 +501,9 @@ if __name__ == "__main__":
 
     # Prepare training data
     X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, usol, X, Y)
+
+    # Visualize the training data
+    visualize_training_data(X_f_train_np_array, X_u_train_np_array, u_train_np_array)
 
     # Convert numpy arrays to PyTorch tensors and move to GPU (if available)
     X_f_train = torch.from_numpy(X_f_train_np_array).float().to(device)  # Collocation points
