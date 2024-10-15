@@ -105,54 +105,59 @@ class HelmholtzPINN(nn.Module):
 
         return a
 
-    def loss_PDE(self, x_to_train_f, k):
+    def loss_PDE(self, x_to_train_f, n=1, m=1):
         """
         Computes the partial differential equation (PDE) loss using automatic differentiation
-        to calculate the second-order derivatives.
+        to calculate the second-order derivatives in a circular domain.
 
         Parameters
         ----------
         x_to_train_f : torch.Tensor
-            Input tensor for training PDE.
-        k : int
-            Wave number of the Helmholtz equation.
+            Input tensor for training PDE, should contain (r, theta).
+        n : int
+            Integer corresponding to the sine function's frequency in the radial direction.
+        m : int
+            Integer corresponding to the sine function's frequency in the angular direction.
 
         Returns
         -------
         torch.Tensor
             Loss value for the PDE.
         """
-        x_1_f = x_to_train_f[:, [0]]
-        x_2_f = x_to_train_f[:, [1]]
-
         g = x_to_train_f.clone()
-        g.requires_grad = True
+        g.requires_grad = True  # Enable gradient computation
+
+        # Convert polar coordinates to Cartesian coordinates
+        r = g[:, 0]  # r (radius)
+        theta = g[:, 1]  # theta (angle)
+        X = r * torch.cos(theta)
+        Y = r * torch.sin(theta)
 
         # Forward pass through the network
         u = self.forward(g)
 
         # Compute first-order derivatives
-        u_x = autograd.grad(u, g, torch.ones([x_to_train_f.shape[0], 1]).to(device),
-                            retain_graph=True, create_graph=True)[0]
+        u_r = autograd.grad(u, g, torch.ones_like(u), retain_graph=True, create_graph=True)[0][:,
+              [0]]  # Derivative wrt r
+        u_theta = autograd.grad(u, g, torch.ones_like(u), retain_graph=True, create_graph=True)[0][:,
+                  [1]]  # Derivative wrt theta
 
         # Compute second-order derivatives
-        u_xx = autograd.grad(u_x, g, torch.ones(x_to_train_f.shape).to(device),
-                             create_graph=True)[0]
-        u_xx_1 = u_xx[:, [0]]
-        u_xx_2 = u_xx[:, [1]]
+        u_rr = autograd.grad(u_r, g, torch.ones_like(u_r), create_graph=True)[0][:, [0]]  # Second derivative wrt r
+        u_theta_theta = autograd.grad(u_theta, g, torch.ones_like(u_theta), create_graph=True)[0][:,
+                        [1]]  # Second derivative wrt theta
 
-        # Define the PDE residual
-        r = torch.sqrt(x_1_f ** 2 + x_2_f ** 2)  # Radius r = sqrt(x^2 + y^2)
-        theta = torch.atan2(x_2_f, x_1_f)  # Angle theta = atan2(y, x)
-        jn_values = jn(n, k * r.cpu().numpy())  # Bessel function
-        jn_torch = torch.tensor(jn_values, dtype=torch.float32, device=device)
+        # Calculate wave number k based on n and m
+        k = torch.sqrt(torch.tensor(np.pi ** 2 * (m ** 2 + n ** 2), dtype=torch.float32, device=g.device))
 
-        # Source term
-        q = k ** 2 * jn_torch * torch.cos(n * theta)
-        f = u_xx_1 + u_xx_2 + k ** 2 * u - q
+        # Define the source term q based on the analytical solution
+        q = (k ** 2) * torch.sin(n * r * theta) * torch.sin(m * r * theta)
 
-        # PDE loss
-        return self.loss_function(f, f_hat)
+        # Define the PDE residual in polar coordinates
+        f = u_rr + (1 / r) * u_r + (1 / r ** 2) * u_theta_theta + k ** 2 * u - q
+
+        # PDE loss (mean squared error)
+        return self.loss_function(f, torch.zeros_like(f))
 
     def test(self, X_test, u_true):
         """
@@ -529,13 +534,14 @@ if __name__ == "__main__":
     r = np.sqrt(X ** 2 + Y ** 2)
     theta = np.arctan2(Y, X)
 
-    # Constants for the wavenumber
+    # Analytical solution of the PDE
     n = 1
     m = 1
-    k = np.sqrt(np.pi ** 2 * (m ** 2 + n ** 2))  # Wavenumber
+    k = np.sqrt(np.pi ** 2 * (m ** 2 + n ** 2))
+    usol = np.sin(n * r * theta) * np.sin(m * r * theta)
 
-    # Analytical solution using Bessel function
-    usol = jn(n, k * r) * np.cos(n * theta)
+    # Flatten the solution
+    u_true = usol.flatten()[:, None]
 
     # Flatten the solution
     u_true = usol.flatten()[:, None]

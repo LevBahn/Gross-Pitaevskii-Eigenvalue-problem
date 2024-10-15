@@ -381,7 +381,7 @@ class SequentialModel(nn.Module):
         u_xx_2 = u_xx[:, [1]]
 
         # Define the PDE residual
-        q = k**2 * torch.sin(n * x_1_f) * torch.sin(m * x_2_f)
+        q = k**2 * torch.sin(n * theta) * torch.sin(m * theta)
         f = u_xx_1 + u_xx_2 + k**2 * u - q
 
         # PDE loss
