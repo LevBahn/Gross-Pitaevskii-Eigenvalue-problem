@@ -39,7 +39,7 @@ class GrossPitaevskiiPINN(nn.Module):
         Interaction strength, initialized but learned over the interval [0, 500].
     """
 
-    def __init__(self, layers, ub, lb, hbar=1.0, m=1.0):
+    def __init__(self, layers, ub, lb, hbar=1.0, m=1.0, g=100.0):
         """
         Initializes the PINN model with given layer sizes and boundary conditions.
 
@@ -69,7 +69,7 @@ class GrossPitaevskiiPINN(nn.Module):
         self.m = m  # Particle mass, fixed
 
         # Learnable interaction strength 'g', varying over [0, 500]
-        self.g = nn.Parameter(torch.tensor(1.0, device='cuda'))  # Learnable interaction strength, initialized to 1.0
+        self.g = g  # Learnable interaction strength, initialized to 100.0
 
         # MSE and MAE loss functions
         self.loss_function = nn.MSELoss(reduction='mean')
@@ -94,20 +94,18 @@ class GrossPitaevskiiPINN(nn.Module):
     def forward(self, x):
         """
         Forward pass through the network. Applies input scaling and passes through layers.
+
         Parameters
         ----------
         x : torch.Tensor
             Input spatial coordinates.
         g : float
-            Interaction strength (learned over [0, 500]).
+            Interaction strength.
         """
 
         # Ensure lb and ub are broadcastable to the shape of x
         lb = self.lb.view(1, -1)  # Reshape lb to (1, num_features)
         ub = self.ub.view(1, -1)  # Reshape ub to (1, num_features)
-
-        # Normalize the inputs
-        x = (x - lb) / (ub - lb)
 
         # Use gradient checkpointing in layers to save memory
         for i, layer in enumerate(self.layers):
@@ -115,9 +113,6 @@ class GrossPitaevskiiPINN(nn.Module):
                 x = checkpoint(layer, x, use_reentrant=False)
             else:
                 x = layer(x)
-
-        # Normalize to L² norm = 1
-        x = x / torch.sqrt(torch.sum(x ** 2))
 
         return x
 
@@ -184,15 +179,6 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return bc_loss
 
-    def trial_data_loss(self, xy, u_pred):
-        # Improve through (random) sampling method similar to Latin Hypercube Sampling
-        N_train = 1000
-        xy = np.random.rand(N_train, 2)
-        xy = torch.tensor(xy, dtype=torch.float32, requires_grad=True).to(device)
-
-        x = xy[:, 0]
-        y = xy[:, 1]
-        return (1 - x) * (1 - y) * x * y * u_pred  # Ensures u=0 at the boundary
 
     def riesz_loss(self, predictions, inputs):
         """
@@ -218,8 +204,8 @@ class GrossPitaevskiiPINN(nn.Module):
         torch.Tensor
             Riesz energy loss.
         """
-
-        u_normalized = predictions / torch.sqrt(torch.sum(predictions ** 2)) # Normalize to L^2 norm = 1
+        # u = predictions / torch.sqrt(torch.sum(predictions ** 2)) # Normalize to L^2 norm = 1
+        u = predictions
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
@@ -227,21 +213,15 @@ class GrossPitaevskiiPINN(nn.Module):
                                         grad_outputs=torch.ones_like(predictions),
                                         create_graph=True, retain_graph=True)[0]
 
-        laplacian_term = 0.5 * torch.mean(gradients ** 2)  # Kinetic term
-        V = self.compute_potential(inputs).unsqueeze(1)  # Potential term
-        interaction_term = 0.5 * self.g * torch.mean(u_normalized ** 4)  # Interaction term
+        laplacian_term = torch.sum(gradients ** 2)  # Kinetic term
+        V = self.compute_potential(inputs).unsqueeze(1)
+        potential_term = torch.sum(V * u ** 2)  # Potential term
+        interaction_term = 0.5 * self.g * torch.sum(u ** 4)  # Interaction term
 
-        riesz_energy = laplacian_term + torch.mean(V * u_normalized ** 2) + interaction_term
-
-        # Potential V(x)
-        #V = self.compute_potential(inputs).unsqueeze(1)
+        riesz_energy = 0.5 * (laplacian_term + potential_term + interaction_term)
 
         # Energy functional (to minimize)
-        #riesz_energy = torch.mean(gradients ** 2 + V * u_normalized ** 2 + 0.5 * self.g * u_normalized ** 4)
-
-        # Regularize to avoid trivial zero solution (added on 09/29/24)
-        #epsilon = 1e-4  # Small regularization coefficient
-        #riesz_energy += epsilon * torch.mean(torch.abs(u))
+        # riesz_energy = 0.5 * torch.sum(gradients ** 2 + V * u ** 2 + 0.5 * self.g * u ** 4)
 
         return riesz_energy
 
@@ -271,7 +251,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Constant representing the smallest eigenvalue of the Gross-Pitaevskii PDE.
         """
 
-        u = predictions / torch.sqrt(torch.sum(predictions ** 2)) # Normalize to L^2 norm = 1
+        #u = predictions / torch.sqrt(torch.sum(predictions ** 2)) # Normalize to L^2 norm = 1
+        u = predictions
 
         # Compute gradients
         u_x = torch.autograd.grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -301,8 +282,8 @@ class GrossPitaevskiiPINN(nn.Module):
         L_drive = torch.exp(-lambda_pde + c)
 
         # PDE loss as the residual plus regularization
-        pde_loss = torch.mean(pde_residual ** 2) + L_f + L_lambda #+ L_drive
-        #pde_loss = torch.mean(pde_residual ** 2)
+        #pde_loss = torch.mean(pde_residual ** 2) + L_f + L_lambda #+ L_drive
+        pde_loss = torch.mean(pde_residual ** 2)
 
         return pde_loss, pde_residual, lambda_pde
 
@@ -328,15 +309,12 @@ class GrossPitaevskiiPINN(nn.Module):
         """
 
         # Clamp g to be within the desired range [0, 500]
-        self.g.data = torch.clamp(torch.tensor(g, device='cuda'), 1000, 1000)
+        #self.g.data = torch.clamp(self.g.data, 0, 500)
 
         # Data loss at boundary
         data_loss = self.data_loss(x_bc, y_bc)
 
         predictions = self.forward(x_to_train_f)
-
-        # TODO: Better way to form xy? Pass into PINN constructor or individual method?
-        data_loss_2 = self.trial_data_loss(X_u_train,predictions)
 
         # PDE loss
         loss_pde, _, _ = self.pde_loss(x_to_train_f, predictions)
@@ -347,11 +325,13 @@ class GrossPitaevskiiPINN(nn.Module):
         # Add a norm regularization term to prevent trivial solutions
         #norm_constraint = 1e-3 * torch.mean(predictions ** 2)  # Penalize zero solutions
 
-        total_loss = data_loss + loss_pde + loss_riesz #+ norm_constraint
-        total_loss_2 = data_loss_2 + loss_pde + loss_riesz
+        alpha = 0
+        beta = 1.0
+        gamma = 1.0
+        total_loss = alpha * data_loss + beta * loss_pde + gamma * loss_riesz #+ norm_constraint
         return total_loss
 
-    def compute_potential(self, inputs, V0=1.0, x0=np.pi / 2, y0=np.pi / 2, sigma=0.5):
+    def compute_potential(self, inputs, V0=1.0, x0=np.pi/2, y0=np.pi/2, sigma=0.5):
         """
         Compute the Gaussian potential V(x,y) over the domain.
 
@@ -380,11 +360,11 @@ class GrossPitaevskiiPINN(nn.Module):
 
         # Gaussian potential
         V = V0 * torch.exp(-((x - x0)**2 + (y - y0)**2) / (2 * sigma**2))
-        #V = V0 * torch.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
 
         #omega = 1.0
         # Harmonic potential
         #V = 0.5 * omega ** 2 * (x ** 2 + y ** 2)
+        #v = V = 0.5 * omega ** 2 * ((x - x0) ** 2 + (y - y0) ** 2)
         return V
 
     def get_ground_state(self, x):
@@ -438,6 +418,79 @@ def create_grid(num_grid_pts=256, n_dim=2):
     grids = np.meshgrid(*axis_points, indexing='ij', sparse=False)
 
     return grids, axis_points
+
+
+def is_inside_circle(x, y, center=(np.pi/2, np.pi/2), radius=np.pi/2):
+    """Check if a point is inside the specified circle."""
+    return (x - center[0])**2 + (y - center[1])**2 <= radius**2
+
+def prepare_training_data_in_potential(N_u, N_f, lb, ub, num_grid_pts, X, Y):
+    """
+    Prepare boundary condition data and collocation points for training, restricted to a circular domain.
+
+    Parameters
+    ----------
+    N_u : int
+        Number of boundary condition points to select.
+    N_f : int
+        Number of collocation points for the physics-informed model.
+    lb : np.ndarray
+        Lower bound of the domain.
+    ub : np.ndarray
+        Upper bound of the domain.
+    num_grid_pts : int
+        Number of grid points.
+    X : np.ndarray
+        X grid of points.
+    Y : np.ndarray
+        Y grid of points.
+
+    Returns
+    -------
+    X_f_train : np.ndarray
+        Combined collocation points and boundary points as training data.
+    X_u_train : np.ndarray
+        Selected boundary condition points.
+    u_train : np.ndarray
+        Corresponding boundary condition values.
+    """
+    # Extract all edge points
+    leftedge_x = np.hstack((X[:, 0][:, None], Y[:, 0][:, None]))  # Left boundary (x = 0)
+    rightedge_x = np.hstack((X[:, -1][:, None], Y[:, -1][:, None]))  # Right boundary (x = pi)
+    topedge_x = np.hstack((X[0, :][:, None], Y[0, :][:, None]))  # Top boundary (y = pi)
+    bottomedge_x = np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))  # Bottom boundary (y = 0)
+
+    # Combine all edge points
+    all_X_u_train = np.vstack([leftedge_x, rightedge_x, bottomedge_x, topedge_x])
+
+    # Randomly select boundary condition points within the circular area
+    idx = []
+    while len(idx) < N_u:
+        # Randomly sample points within the bounds
+        random_x = np.random.uniform(lb[0], ub[0])
+        random_y = np.random.uniform(lb[1], ub[1])
+
+        # Check if the point is inside the circle
+        if is_inside_circle(random_x, random_y):
+            idx.append((random_x, random_y))
+
+    X_u_train = np.array(idx)
+    u_train = np.zeros((X_u_train.shape[0], 1))  # Corresponding u values
+
+    # Generate N_f collocation points using Latin Hypercube Sampling
+    X_f = lb + (ub - lb) * lhs(2, N_f)  # Generates points in the domain [lb, ub]
+
+    # Filter collocation points to keep only those within the circle
+    valid_collocation_indices = [
+        i for i in range(X_f.shape[0])
+        if is_inside_circle(X_f[i, 0], X_f[i, 1])
+    ]
+    X_f_valid = X_f[valid_collocation_indices]
+
+    # Combine collocation points with boundary points
+    X_f_train = np.vstack((X_f_valid, X_u_train))
+
+    return X_f_train, X_u_train, u_train
 
 
 def prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y):
@@ -504,34 +557,44 @@ def prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y):
     return X_f_train, X_u_train, u_train
 
 
-def prepare_test_data(X, Y):
+def visualize_training_data(X_f_train, X_u_train, u_train, lb, ub):
     """
-    Prepare test data by flattening the 2D grids and stacking them column-wise.
+    Visualizes the boundary points, collocation points, and the domain.
 
     Parameters
     ----------
-    X : np.ndarray
-        2D grid points in the x-dimension as a NumPy array.
-    Y : np.ndarray
-        2D grid points in the y-dimension as a NumPy array.
-
-    Returns
-    -------
-    X_u_test : np.ndarray
-        Test data prepared by stacking the flattened x and y grids.
+    X_f_train : np.ndarray
+        Collocation points to visualize.
+    X_u_train : np.ndarray
+        Boundary points to visualize.
+    u_train : np.ndarray
+        Corresponding boundary condition values.
     lb : np.ndarray
-        Lower bound for the domain (boundary conditions).
+        Lower bound of the domain.
     ub : np.ndarray
-        Upper bound for the domain (boundary conditions).
+        Upper bound of the domain.
     """
-    # Flatten the grids and stack them into a 2D array
-    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
+    plt.figure(figsize=(8, 8))
 
-    # Domain bounds as NumPy arrays
-    lb = np.array([0, 0], dtype=np.float32)
-    ub = np.array([np.pi, np.pi], dtype=np.float32)
+    # Plot boundary points
+    plt.scatter(X_u_train[:, 0], X_u_train[:, 1], color='red', label='Boundary Points', alpha=0.6)
 
-    return X_u_test, lb, ub
+    # Plot collocation points
+    plt.scatter(X_f_train[:, 0], X_f_train[:, 1], color='blue', label='Collocation Points', alpha=0.3)
+
+    # Plot the domain as a rectangle
+    rect = plt.Rectangle(lb, ub[0]-lb[0], ub[1]-lb[1], color='green', fill=False, label='Domain')
+    plt.gca().add_artist(rect)
+
+    plt.xlim([lb[0] - 0.2, ub[0] + 0.2])
+    plt.ylim([lb[1] - 0.2, ub[1] + 0.2])
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.xlabel('$x$', fontsize=14)
+    plt.ylabel('$y$', fontsize=14)
+    plt.title('Boundary and Collocation Points')
+    plt.legend()
+    plt.grid()
+    plt.show()
 
 
 def train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs_adam, epochs_lbfgs):
@@ -579,7 +642,8 @@ def train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, x_bc, y
         adam_optimizer.zero_grad()
 
         # Randomly sample g in [0, 500] for each epoch
-        g_sample = torch.FloatTensor(1).uniform_(0, 1).to('cuda')
+        #g_sample = torch.FloatTensor(1).uniform_(0, 500).to('cuda')
+        g_sample = 100
 
         with torch.amp.autocast('cuda'):
             loss = model.loss(x_bc, y_bc, x_to_train_f, current_epoch=epoch, g=g_sample)
@@ -595,12 +659,12 @@ def train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, x_bc, y
 
         scheduler.step(loss)
 
-        if epoch % 100 == 0:
+        if epoch % 200 == 0:
             train_losses.append(loss.item())
 
             # Evaluation on test data
             u_pred_test = model(X_u_test_tensor)
-            u_pred_test = u_pred_test / torch.sqrt(torch.sum(u_pred_test ** 2))  # Normalize to L² norm = 1
+            #u_pred_test = u_pred_test / torch.sqrt(torch.sum(u_pred_test ** 2))  # Normalize to L² norm = 1
 
             # Reshape predicted solution
             num_grid_pts = int(np.sqrt(X_u_test_tensor.shape[0]))
@@ -794,21 +858,81 @@ def plot_absolute_error(X_test, abs_error, epoch):
     plt.show()
 
 
-# Model initialization and training
+def plot_potential(X_test, potential):
+    """
+    Plot the potential.
+    """
+    plt.figure(figsize=(6, 5))
+    X = X_test[:, 0].reshape((num_grid_pts, num_grid_pts))
+    Y = X_test[:, 1].reshape((num_grid_pts, num_grid_pts))
+    potential = potential.reshape((num_grid_pts, num_grid_pts))
+
+    plt.contourf(X, Y, potential, levels=50, cmap='viridis')
+    plt.colorbar()
+    plt.title('Potential V(x, y)')
+    plt.show()
+
+
+def visualize_training_data(X_f_train, X_u_train, u_train, lb, ub):
+    """
+    Visualizes the boundary points, collocation points, and the domain.
+
+    Parameters
+    ----------
+    X_f_train : np.ndarray
+        Collocation points to visualize.
+    X_u_train : np.ndarray
+        Boundary points to visualize.
+    u_train : np.ndarray
+        Corresponding boundary condition values.
+    lb : np.ndarray
+        Lower bound of the domain.
+    ub : np.ndarray
+        Upper bound of the domain.
+    """
+    plt.figure(figsize=(8, 8))
+
+    # Plot boundary points
+    plt.scatter(X_u_train[:, 0], X_u_train[:, 1], color='red', label='Boundary Points', alpha=0.6)
+
+    # Plot collocation points
+    plt.scatter(X_f_train[:, 0], X_f_train[:, 1], color='blue', label='Collocation Points', alpha=0.3)
+
+    # Plot the domain as a rectangle
+    rect = plt.Rectangle(lb, ub[0]-lb[0], ub[1]-lb[1], color='green', fill=False, label='Domain')
+    plt.gca().add_artist(rect)
+
+    plt.xlim([lb[0] - 0.2, ub[0] + 0.2])
+    plt.ylim([lb[1] - 0.2, ub[1] + 0.2])
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.xlabel('$x$', fontsize=14)
+    plt.ylabel('$y$', fontsize=14)
+    plt.title('Boundary and Collocation Points')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+
 if __name__ == "__main__":
 
     # Specify number of grid points and number of dimensions
-    num_grid_pts = 32
+    num_grid_pts = 256
     nDim = 2
 
-    # Prepare test data
+    # Prepare data
     grids, axis_points = create_grid(num_grid_pts=num_grid_pts, n_dim=nDim)
     X, Y = grids[0], grids[1]
     x_1, x_2 = axis_points[0], axis_points[1]
-    X_u_test, lb, ub = prepare_test_data(X, Y)
 
-    N_u = 100  # Number of boundary points
-    N_f = 5000  # Number of collocation points
+    # Flatten the grids and stack them into a 2D array
+    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
+
+    # Domain bounds
+    lb = np.array([0, 0])
+    ub = np.array([np.pi, np.pi])
+
+    N_u = 500  # Number of boundary points
+    N_f = 10000  # Number of collocation points
     X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y)
 
     # Convert numpy arrays to PyTorch tensors and move to GPU (if available)
@@ -819,7 +943,7 @@ if __name__ == "__main__":
     f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the GPE equation residual
 
     # Model parameters
-    layers = [2, 256, 256, 256, 1]  # Neural network layers
+    layers = [2, 200, 200, 200, 200, 1]  # Neural network layers
     epochs_adam = 1000
     epochs_lbfgs = 500
 
@@ -829,8 +953,18 @@ if __name__ == "__main__":
     # Print the neural network architecture
     print(model)
 
+    # Calculate the potential
+    X_test_tensor = torch.from_numpy(X_u_test).float().to(device)  # Convert test data to tensor
+    potential = model.compute_potential(X_test_tensor).cpu().detach().numpy()  # Calculate potential and move to CPU
+
+    # Visualize the potential
+    plot_potential(X_u_test, potential)
+
+    # Visualize training data
+    visualize_training_data(X_f_train_np_array, X_u_train_np_array, u_train_np_array, lb, ub)
+
     # Optimizers and scheduler
-    adam_optimizer = optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-6,
+    adam_optimizer = optim.Adam(model.parameters(), lr=0.01, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-6,
                                 amsgrad=False)
     lbfgs_optimizer = optim.LBFGS(model.parameters(), max_iter=500, tolerance_grad=1e-5, tolerance_change=1e-9,
                                   history_size=100)
