@@ -94,12 +94,13 @@ class GrossPitaevskiiPINN(nn.Module):
     def forward(self, x):
         """
         Forward pass through the network. Applies input scaling and passes through layers.
+
         Parameters
         ----------
         x : torch.Tensor
             Input spatial coordinates.
         g : float
-            Interaction strength (learned over [0, 500]).
+            Interaction strength.
         """
 
         # Ensure lb and ub are broadcastable to the shape of x
@@ -112,9 +113,6 @@ class GrossPitaevskiiPINN(nn.Module):
                 x = checkpoint(layer, x, use_reentrant=False)
             else:
                 x = layer(x)
-
-        # Normalize to L² norm = 1
-        # x = x / torch.sqrt(torch.sum(x ** 2))
 
         return x
 
@@ -181,15 +179,6 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return bc_loss
 
-    def trial_data_loss(self, xy, u_pred):
-        # Improve through (random) sampling method similar to Latin Hypercube Sampling
-        N_train = 1000
-        xy = np.random.rand(N_train, 2)
-        xy = torch.tensor(xy, dtype=torch.float32, requires_grad=True).to(device)
-
-        x = xy[:, 0]
-        y = xy[:, 1]
-        return (1 - x) * (1 - y) * x * y * u_pred  # Ensures u=0 at the boundary
 
     def riesz_loss(self, predictions, inputs):
         """
@@ -215,9 +204,8 @@ class GrossPitaevskiiPINN(nn.Module):
         torch.Tensor
             Riesz energy loss.
         """
-
-        #u_normalized = predictions / torch.sqrt(torch.sum(predictions ** 2)) # Normalize to L^2 norm = 1
-        u_normalized = predictions
+        # u = predictions / torch.sqrt(torch.sum(predictions ** 2)) # Normalize to L^2 norm = 1
+        u = predictions
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
@@ -225,22 +213,15 @@ class GrossPitaevskiiPINN(nn.Module):
                                         grad_outputs=torch.ones_like(predictions),
                                         create_graph=True, retain_graph=True)[0]
 
-        laplacian_term = 0.5 * torch.mean(gradients ** 2)  # Kinetic term
-        V = self.compute_potential(inputs).unsqueeze(1)  # Potential term
-        interaction_term = 0.5 * self.g * torch.mean(u_normalized ** 4)  # Interaction term
+        laplacian_term = torch.sum(gradients ** 2)  # Kinetic term
+        V = self.compute_potential(inputs).unsqueeze(1)
+        potential_term = torch.sum(V * u ** 2)  # Potential term
+        interaction_term = 0.5 * self.g * torch.sum(u ** 4)  # Interaction term
 
-        riesz_energy = laplacian_term + torch.mean(V * u_normalized ** 2) + interaction_term
-
-        # Potential V(x)
-        #V = self.compute_potential(inputs).unsqueeze(1)
-        #plot_potential(X_u_test_tensor.cpu().numpy(), V.cpu().detach().numpy())
+        riesz_energy = 0.5 * (laplacian_term + potential_term + interaction_term)
 
         # Energy functional (to minimize)
-        #riesz_energy = torch.mean(gradients ** 2 + V * u_normalized ** 2 + 0.5 * self.g * u_normalized ** 4)
-
-        # Regularize to avoid trivial zero solution (added on 09/29/24)
-        #epsilon = 1e-4  # Small regularization coefficient
-        #riesz_energy += epsilon * torch.mean(torch.abs(u))
+        # riesz_energy = 0.5 * torch.sum(gradients ** 2 + V * u ** 2 + 0.5 * self.g * u ** 4)
 
         return riesz_energy
 
@@ -301,8 +282,8 @@ class GrossPitaevskiiPINN(nn.Module):
         L_drive = torch.exp(-lambda_pde + c)
 
         # PDE loss as the residual plus regularization
-        pde_loss = torch.mean(pde_residual ** 2) + L_f + L_lambda #+ L_drive
-        #pde_loss = torch.mean(pde_residual ** 2)
+        #pde_loss = torch.mean(pde_residual ** 2) + L_f + L_lambda #+ L_drive
+        pde_loss = torch.mean(pde_residual ** 2)
 
         return pde_loss, pde_residual, lambda_pde
 
@@ -334,9 +315,6 @@ class GrossPitaevskiiPINN(nn.Module):
         data_loss = self.data_loss(x_bc, y_bc)
 
         predictions = self.forward(x_to_train_f)
-
-        # TODO: Better way to form xy? Pass into PINN constructor or individual method?
-        data_loss_2 = self.trial_data_loss(X_u_train,predictions)
 
         # PDE loss
         loss_pde, _, _ = self.pde_loss(x_to_train_f, predictions)
@@ -442,6 +420,79 @@ def create_grid(num_grid_pts=256, n_dim=2):
     return grids, axis_points
 
 
+def is_inside_circle(x, y, center=(np.pi/2, np.pi/2), radius=np.pi/2):
+    """Check if a point is inside the specified circle."""
+    return (x - center[0])**2 + (y - center[1])**2 <= radius**2
+
+def prepare_training_data_in_potential(N_u, N_f, lb, ub, num_grid_pts, X, Y):
+    """
+    Prepare boundary condition data and collocation points for training, restricted to a circular domain.
+
+    Parameters
+    ----------
+    N_u : int
+        Number of boundary condition points to select.
+    N_f : int
+        Number of collocation points for the physics-informed model.
+    lb : np.ndarray
+        Lower bound of the domain.
+    ub : np.ndarray
+        Upper bound of the domain.
+    num_grid_pts : int
+        Number of grid points.
+    X : np.ndarray
+        X grid of points.
+    Y : np.ndarray
+        Y grid of points.
+
+    Returns
+    -------
+    X_f_train : np.ndarray
+        Combined collocation points and boundary points as training data.
+    X_u_train : np.ndarray
+        Selected boundary condition points.
+    u_train : np.ndarray
+        Corresponding boundary condition values.
+    """
+    # Extract all edge points
+    leftedge_x = np.hstack((X[:, 0][:, None], Y[:, 0][:, None]))  # Left boundary (x = 0)
+    rightedge_x = np.hstack((X[:, -1][:, None], Y[:, -1][:, None]))  # Right boundary (x = pi)
+    topedge_x = np.hstack((X[0, :][:, None], Y[0, :][:, None]))  # Top boundary (y = pi)
+    bottomedge_x = np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))  # Bottom boundary (y = 0)
+
+    # Combine all edge points
+    all_X_u_train = np.vstack([leftedge_x, rightedge_x, bottomedge_x, topedge_x])
+
+    # Randomly select boundary condition points within the circular area
+    idx = []
+    while len(idx) < N_u:
+        # Randomly sample points within the bounds
+        random_x = np.random.uniform(lb[0], ub[0])
+        random_y = np.random.uniform(lb[1], ub[1])
+
+        # Check if the point is inside the circle
+        if is_inside_circle(random_x, random_y):
+            idx.append((random_x, random_y))
+
+    X_u_train = np.array(idx)
+    u_train = np.zeros((X_u_train.shape[0], 1))  # Corresponding u values
+
+    # Generate N_f collocation points using Latin Hypercube Sampling
+    X_f = lb + (ub - lb) * lhs(2, N_f)  # Generates points in the domain [lb, ub]
+
+    # Filter collocation points to keep only those within the circle
+    valid_collocation_indices = [
+        i for i in range(X_f.shape[0])
+        if is_inside_circle(X_f[i, 0], X_f[i, 1])
+    ]
+    X_f_valid = X_f[valid_collocation_indices]
+
+    # Combine collocation points with boundary points
+    X_f_train = np.vstack((X_f_valid, X_u_train))
+
+    return X_f_train, X_u_train, u_train
+
+
 def prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y):
     """
     Prepare boundary condition data and collocation points for training.
@@ -504,6 +555,46 @@ def prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y):
     X_f_train = np.vstack((X_f, X_u_train))
 
     return X_f_train, X_u_train, u_train
+
+
+def visualize_training_data(X_f_train, X_u_train, u_train, lb, ub):
+    """
+    Visualizes the boundary points, collocation points, and the domain.
+
+    Parameters
+    ----------
+    X_f_train : np.ndarray
+        Collocation points to visualize.
+    X_u_train : np.ndarray
+        Boundary points to visualize.
+    u_train : np.ndarray
+        Corresponding boundary condition values.
+    lb : np.ndarray
+        Lower bound of the domain.
+    ub : np.ndarray
+        Upper bound of the domain.
+    """
+    plt.figure(figsize=(8, 8))
+
+    # Plot boundary points
+    plt.scatter(X_u_train[:, 0], X_u_train[:, 1], color='red', label='Boundary Points', alpha=0.6)
+
+    # Plot collocation points
+    plt.scatter(X_f_train[:, 0], X_f_train[:, 1], color='blue', label='Collocation Points', alpha=0.3)
+
+    # Plot the domain as a rectangle
+    rect = plt.Rectangle(lb, ub[0]-lb[0], ub[1]-lb[1], color='green', fill=False, label='Domain')
+    plt.gca().add_artist(rect)
+
+    plt.xlim([lb[0] - 0.2, ub[0] + 0.2])
+    plt.ylim([lb[1] - 0.2, ub[1] + 0.2])
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.xlabel('$x$', fontsize=14)
+    plt.ylabel('$y$', fontsize=14)
+    plt.title('Boundary and Collocation Points')
+    plt.legend()
+    plt.grid()
+    plt.show()
 
 
 def train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, x_bc, y_bc, x_to_train_f, epochs_adam, epochs_lbfgs):
@@ -782,259 +873,67 @@ def plot_potential(X_test, potential):
     plt.show()
 
 
-def check_boundary_conditions(X_u_train, u_train, num_grid_pts, lb, ub, tolerance=1e-10):
+def visualize_training_data(X_f_train, X_u_train, u_train, lb, ub):
     """
-    Checks that boundary points are at the edges of the grid and have u_train values of zero.
+    Visualizes the boundary points, collocation points, and the domain.
 
     Parameters
     ----------
+    X_f_train : np.ndarray
+        Collocation points to visualize.
     X_u_train : np.ndarray
-        Array containing boundary points.
+        Boundary points to visualize.
     u_train : np.ndarray
-        Array containing boundary values.
-    num_grid_pts : int
-        Number of grid points in each dimension.
-    lb : list
-        Lower bound of the grid domain (e.g., [0, 0]).
-    ub : list
-        Upper bound of the grid domain (e.g., [pi, pi]).
-    tolerance : float
-        Tolerance for floating point comparisons (default: 1e-10).
-
-    Returns
-    -------
-    None
+        Corresponding boundary condition values.
+    lb : np.ndarray
+        Lower bound of the domain.
+    ub : np.ndarray
+        Upper bound of the domain.
     """
-    # Extract x and y bounds
-    x_min, y_min = lb
-    x_max, y_max = ub
-
-    # Logical checks for boundary points, within a tolerance
-    left_boundary = np.isclose(X_u_train[:, 0], x_min, atol=tolerance)  # x = 0
-    right_boundary = np.isclose(X_u_train[:, 0], x_max, atol=tolerance)  # x = pi
-    bottom_boundary = np.isclose(X_u_train[:, 1], y_min, atol=tolerance)  # y = 0
-    top_boundary = np.isclose(X_u_train[:, 1], y_max, atol=tolerance)  # y = pi
-
-    # Combine all boundary points
-    all_boundary = left_boundary | right_boundary | bottom_boundary | top_boundary
-
-    # Check if all boundary points are correctly set to zero
-    boundary_values_zero = (u_train[all_boundary] == 0).all()
-
-    # Print the results
-    if all_boundary.all():
-        print("All boundary points are located at the grid edges.")
-    else:
-        print("Some boundary points are not at the grid edges.")
-
-    if boundary_values_zero:
-        print("All boundary values are correctly set to zero.")
-    else:
-        print("Some boundary values are not zero!")
-
-
-def plot_boundary_conditions(X_u_train, u_train, num_grid_pts):
-    """
-    Visualize the boundary conditions.
-
-    Parameters
-    ----------
-    X_u_train : np.ndarray
-        Boundary points.
-    u_train : np.ndarray
-        Corresponding boundary values.
-    num_grid_pts : int
-        Number of grid points along each dimension.
-    """
-    plt.figure(figsize=(8, 6))
-
-    # Extract x and y values
-    X_bc = X_u_train[:, 0]
-    Y_bc = X_u_train[:, 1]
+    plt.figure(figsize=(8, 8))
 
     # Plot boundary points
-    plt.scatter(X_bc, Y_bc, c=u_train, cmap='viridis', marker='o', label='Boundary points')
-    plt.colorbar(label='$u_{boundary}$')
-    plt.title('Boundary Conditions')
-    plt.xlabel('$x$')
-    plt.ylabel('$y$')
-    plt.axis('equal')
-    plt.grid(True)
+    plt.scatter(X_u_train[:, 0], X_u_train[:, 1], color='red', label='Boundary Points', alpha=0.6)
+
+    # Plot collocation points
+    plt.scatter(X_f_train[:, 0], X_f_train[:, 1], color='blue', label='Collocation Points', alpha=0.3)
+
+    # Plot the domain as a rectangle
+    rect = plt.Rectangle(lb, ub[0]-lb[0], ub[1]-lb[1], color='green', fill=False, label='Domain')
+    plt.gca().add_artist(rect)
+
+    plt.xlim([lb[0] - 0.2, ub[0] + 0.2])
+    plt.ylim([lb[1] - 0.2, ub[1] + 0.2])
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.xlabel('$x$', fontsize=14)
+    plt.ylabel('$y$', fontsize=14)
+    plt.title('Boundary and Collocation Points')
     plt.legend()
+    plt.grid()
     plt.show()
-
-
-def check_symmetry(X, Y, tolerance=1e-10):
-    """
-    Checks whether the grid points along the left, right, top, and bottom edges are symmetric.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        The grid points in the x-dimension (2D array).
-    Y : np.ndarray
-        The grid points in the y-dimension (2D array).
-    tolerance : float
-        Tolerance for floating point comparisons (default: 1e-6).
-
-    Returns
-    -------
-    None
-    """
-    # Left and Right boundaries
-    leftedge_x = np.hstack((X[:, 0][:, None], Y[:, 0][:, None]))  # Left boundary (x = 0)
-    rightedge_x = np.hstack((X[:, -1][:, None], Y[:, -1][:, None]))  # Right boundary (x = pi)
-
-    # Bottom and Top boundaries
-    bottomedge_x = np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))  # Bottom boundary (y = 0)
-    topedge_x = np.hstack((X[0, :][:, None], Y[0, :][:, None]))  # Top boundary (y = pi)
-
-    # Check for symmetry
-    symmetric_left_right = np.all(np.isclose(leftedge_x[:, 1], rightedge_x[:, 1], atol=tolerance))
-    symmetric_top_bottom = np.all(np.isclose(bottomedge_x[:, 0], topedge_x[:, 0], atol=tolerance))
-
-    # Output results
-    if symmetric_left_right:
-        print("The left and right boundaries are symmetric.")
-    else:
-        print("The left and right boundaries are NOT symmetric.")
-
-    if symmetric_top_bottom:
-        print("The top and bottom boundaries are symmetric.")
-    else:
-        print("The top and bottom boundaries are NOT symmetric.")
-
-
-def generate_symmetric_boundary_points(X, Y, num_points):
-    """
-    Generates symmetric boundary points by selecting an equal number of points
-    from each of the four boundaries.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        The x-coordinates of the grid.
-    Y : np.ndarray
-        The y-coordinates of the grid.
-    num_points : int
-        Total number of boundary points to select (should be divisible by 4).
-
-    Returns
-    -------
-    X_u_train : np.ndarray
-        Symmetric boundary points.
-    u_train : np.ndarray
-        Boundary values (Dirichlet boundary values set to zero).
-    """
-    assert num_points % 4 == 0, "num_points should be divisible by 4 for symmetry."
-
-    points_per_edge = num_points // 4
-
-    # Select points from each edge
-    leftedge_x = np.hstack((X[:, 0][:, None], Y[:, 0][:, None]))  # Left boundary (x = 0)
-    rightedge_x = np.hstack((X[:, -1][:, None], Y[:, -1][:, None]))  # Right boundary (x = pi)
-    topedge_x = np.hstack((X[0, :][:, None], Y[0, :][:, None]))  # Top boundary (y = pi)
-    bottomedge_x = np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))  # Bottom boundary (y = 0)
-
-    # Uniformly sample points from each edge (evenly spaced)
-    left_boundary = leftedge_x[np.linspace(0, leftedge_x.shape[0] - 1, points_per_edge, dtype=int)]
-    right_boundary = rightedge_x[np.linspace(0, rightedge_x.shape[0] - 1, points_per_edge, dtype=int)]
-    top_boundary = topedge_x[np.linspace(0, topedge_x.shape[0] - 1, points_per_edge, dtype=int)]
-    bottom_boundary = bottomedge_x[np.linspace(0, bottomedge_x.shape[0] - 1, points_per_edge, dtype=int)]
-
-    # Combine all boundary points
-    X_u_train = np.vstack([left_boundary, right_boundary, top_boundary, bottom_boundary])
-
-    # Set boundary values to zero (Dirichlet boundary condition)
-    u_train = np.zeros(X_u_train.shape[0])
-
-    return X_u_train, u_train
-
-
-def trainingdata(N_u, N_f, num_grid_pts):
-    leftedge_x = np.hstack((X[:, 0][:, None], Y[:, 0][:, None]))
-    leftedge_u = np.zeros((num_grid_pts, 1))
-
-    rightedge_x = np.hstack((X[:, -1][:, None], Y[:, -1][:, None]))
-    rightedge_u = np.zeros((num_grid_pts, 1))
-
-    topedge_x = np.hstack((X[0, :][:, None], Y[0, :][:, None]))
-    topedge_u = np.zeros((num_grid_pts, 1))
-
-    bottomedge_x = np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))
-    bottomedge_u = np.zeros((num_grid_pts, 1))
-
-    all_X_u_train = np.vstack([leftedge_x, rightedge_x, bottomedge_x, topedge_x])
-    all_u_train = np.vstack([leftedge_u, rightedge_u, bottomedge_u, topedge_u])
-
-    # choose random N_u points for training
-    idx = np.random.choice(all_X_u_train.shape[0], N_u, replace=False)
-
-    X_u_train = all_X_u_train[idx[0:N_u], :]  # choose indices from  set 'idx' (x,t)
-    u_train = all_u_train[idx[0:N_u], :]  # choose corresponding u
-
-    '''Collocation Points'''
-
-    # Latin Hypercube sampling for collocation points
-    # N_f sets of tuples(x,t)
-    X_f = lb + (ub - lb) * lhs(2, N_f)
-    X_f_train = np.vstack((X_f, X_u_train))  # append training points to collocation points
-
-    return X_f_train, X_u_train, u_train
 
 
 if __name__ == "__main__":
 
+    # Specify number of grid points and number of dimensions
+    num_grid_pts = 256
+    nDim = 2
 
-    x_1 = np.linspace(0, np.pi, 256)  # 256 points between -1 and 1 [256x1]
-    x_2 = np.linspace(np.pi, 0, 256)  # 256 points between 1 and -1 [256x1]
+    # Prepare data
+    grids, axis_points = create_grid(num_grid_pts=num_grid_pts, n_dim=nDim)
+    X, Y = grids[0], grids[1]
+    x_1, x_2 = axis_points[0], axis_points[1]
 
-    X, Y = np.meshgrid(x_1, x_2)
-
-    X_u_test = np.hstack((X.flatten(order='F')[:, None], Y.flatten(order='F')[:, None]))
+    # Flatten the grids and stack them into a 2D array
+    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
 
     # Domain bounds
-    lb = np.array([0, 0])  # lower bound
-    ub = np.array([np.pi, np.pi])  # upper bound
+    lb = np.array([0, 0])
+    ub = np.array([np.pi, np.pi])
 
-    N_u = 1000  # Total number of data points for 'u'
-    N_f = 10000  # Total number of collocation points
-
-    num_grid_pts = 256
-
-    # Training data
-    X_f_train_np_array, X_u_train_np_array, u_train_np_array = trainingdata(N_u, N_f, num_grid_pts)
-
-    # Specify number of grid points and number of dimensions
-    # num_grid_pts = 256
-    # nDim = 2
-    #
-    # # Prepare data
-    # grids, axis_points = create_grid(num_grid_pts=num_grid_pts, n_dim=nDim)
-    # X, Y = grids[0], grids[1]
-    # x_1, x_2 = axis_points[0], axis_points[1]
-    #
-    # # Flatten the grids and stack them into a 2D array
-    # X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
-    #
-    # # Domain bounds
-    # lb = np.array([-np.pi, 0])
-    # ub = np.array([-np.pi, 0])
-    #
-    # N_u = 100  # Number of boundary points
-    # N_f = 1000  # Number of collocation points
-    # X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y)
-
-    # Visualize boundary conditions
-    plot_boundary_conditions(X_u_train_np_array, u_train_np_array, num_grid_pts)
-
-    # Check boundary conditions are set up correctly
-    check_boundary_conditions(X_u_train_np_array, u_train_np_array, num_grid_pts, lb, ub)
-
-    # Check for symmetry
-    check_symmetry(X, Y)
-
-    X_u_train, u_train = generate_symmetric_boundary_points(X, Y, num_grid_pts)
+    N_u = 500  # Number of boundary points
+    N_f = 10000  # Number of collocation points
+    X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, num_grid_pts, X, Y)
 
     # Convert numpy arrays to PyTorch tensors and move to GPU (if available)
     X_f_train = torch.from_numpy(X_f_train_np_array).float().to(device)  # Collocation points
@@ -1044,7 +943,7 @@ if __name__ == "__main__":
     f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the GPE equation residual
 
     # Model parameters
-    layers = [2, 64, 64, 64, 1]  # Neural network layers
+    layers = [2, 200, 200, 200, 200, 1]  # Neural network layers
     epochs_adam = 1000
     epochs_lbfgs = 500
 
@@ -1060,6 +959,9 @@ if __name__ == "__main__":
 
     # Visualize the potential
     plot_potential(X_u_test, potential)
+
+    # Visualize training data
+    visualize_training_data(X_f_train_np_array, X_u_train_np_array, u_train_np_array, lb, ub)
 
     # Optimizers and scheduler
     adam_optimizer = optim.Adam(model.parameters(), lr=0.01, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-6,
