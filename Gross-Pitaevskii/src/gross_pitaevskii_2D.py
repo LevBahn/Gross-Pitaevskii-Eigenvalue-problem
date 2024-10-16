@@ -36,7 +36,7 @@ class GrossPitaevskiiPINN(nn.Module):
     m : torch.nn.Parameter
         Particle mass, scaled to 1.0.
     g : torch.nn.Parameter
-        Interaction strength, initialized but learned over the interval [0, 500].
+        Interaction strength, currently set to 100.
     """
 
     def __init__(self, layers, ub, lb, hbar=1.0, m=1.0, g=100.0):
@@ -58,7 +58,7 @@ class GrossPitaevskiiPINN(nn.Module):
         g : float
             Interaction strength, over the range of [0,500].
         """
-        super(GrossPitaevskiiPINN, self).__init__()
+        super().__init__()
 
         # Feature scaling
         self.ub = torch.tensor(ub, dtype=torch.float32, device='cuda')
@@ -395,7 +395,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
 def create_grid(num_grid_pts=256, n_dim=2):
     """
-    Create an n-dimensional grid of points as a NumPy array in a memory-efficient way.
+    Create an n-dimensional grid of points as a NumPy array.
 
     Parameters
     ----------
@@ -677,11 +677,8 @@ def train_pinn_hybrid(model, adam_optimizer, lbfgs_optimizer, scheduler, x_bc, y
             # Compute the absolute error
             abs_error = np.abs(u_pred_test_reshaped - u_true_full_grid_reshaped)
 
-            # Plot the predicted solution and pass the current epoch
-            plot_solution(X_u_test_tensor.detach().cpu().numpy(), u_pred_test_reshaped, epoch)
-
-            # Plot the absolute error and pass the current epoch
-            plot_absolute_error(X_u_test_tensor.detach().cpu().numpy(), abs_error, epoch)
+            # Plot the predicted solution and absolute error in the current epoch
+            plot_solution_and_error(X_u_test_tensor.detach().cpu().numpy(), u_pred_test_reshaped, abs_error, epoch)
 
             print(f'Epoch {epoch}/{epochs_adam}, Train Loss: {loss.item():.8f}')
 
@@ -798,9 +795,9 @@ def plot_pde_residual(model, X_test):
     plt.show()
 
 
-def plot_solution(X_test, u_pred, epoch):
+def plot_solution_and_error(X_test, u_pred, abs_error, epoch):
     """
-    Plots the predicted solution u_pred for the Gross-Pitaevskii equation.
+    Plots the predicted solution and the absolute error for the Gross-Pitaevskii equation.
 
     Parameters
     ----------
@@ -808,10 +805,12 @@ def plot_solution(X_test, u_pred, epoch):
         Test data (2D grid points) used for predictions.
     u_pred : np.ndarray
         Predicted solution u_pred from the neural network.
+    abs_error : np.ndarray
+        Absolute error between predicted solution and ground truth.
     epoch : int
         Current iteration of the optimizer.
     """
-    plt.figure(figsize=(12, 8))
+    plt.figure(figsize=(16, 6))
 
     # Reshape X_test to 2D
     X = X_test[:, 0].reshape((num_grid_pts, num_grid_pts))
@@ -820,41 +819,24 @@ def plot_solution(X_test, u_pred, epoch):
     # Reshape u_pred to 2D
     u_pred = u_pred.reshape((num_grid_pts, num_grid_pts))
 
-    # Plot the predicted solution as a contour plot
+    # Subplot 1: Predicted solution
+    plt.subplot(1, 2, 1)
     plt.pcolor(X, Y, u_pred, cmap='viridis')
     plt.colorbar(label='u_pred')
-    plt.title(f'Predicted Solution $u_{{pred}}$ for Gross-Pitaevskii Equation - Iteration {epoch}')
+    plt.title(f'Predicted Solution $u_{{pred}}$ - Iteration {epoch}')
     plt.xlabel('$x$')
     plt.ylabel('$y$')
-    plt.show()
 
-
-def plot_absolute_error(X_test, abs_error, epoch):
-    """
-    Plot the absolute error between the predicted solution and the ground truth.
-
-    Parameters
-    ----------
-    X_test : np.ndarray
-        Test data (2D grid points) used for predictions.
-    abs_error : np.ndarray
-        Absolute error between predicted solution and ground truth.
-    epoch : int
-        Current iteration of the optimizer.
-    """
-    plt.figure(figsize=(8, 6))
-
-    # Reshape X_test to 2D
-    X = X_test[:, 0].reshape((num_grid_pts, num_grid_pts))
-    Y = X_test[:, 1].reshape((num_grid_pts, num_grid_pts))
-
-    # Plot the absolute error
+    # Subplot 2: Absolute error
+    plt.subplot(1, 2, 2)
     plt.contourf(X, Y, abs_error, levels=50, cmap='inferno')
     plt.colorbar(label='Absolute Error')
-    plt.title(f'Absolute Error between Prediction and Ground Truth - Iteration {epoch}')
+    plt.title(f'Absolute Error - Iteration {epoch}')
     plt.xlabel('$x$')
     plt.ylabel('$y$')
     plt.grid(True)
+
+    plt.tight_layout()
     plt.show()
 
 
