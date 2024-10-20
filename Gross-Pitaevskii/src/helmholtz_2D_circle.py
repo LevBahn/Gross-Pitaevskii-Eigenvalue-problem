@@ -50,7 +50,7 @@ class HelmholtzPINN(nn.Module):
         super().__init__()
 
         # LeakyReLU activation function
-        self.activation = nn.LeakyReLU()
+        self.activation = nn.Tanh()
 
         # Mean squared error (MSE) loss function
         self.loss_function = nn.MSELoss(reduction='mean')

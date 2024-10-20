@@ -1,22 +1,15 @@
 import numpy as np
 import torch
-import torch.autograd as autograd         # Computation graph
-from torch import Tensor                  # Tensor node in the computation graph
-import torch.nn as nn                     # Neural networks
-import torch.optim as optim               # Optimizers for gradient descent, ADAM, etc.
-import time
-from pyDOE import lhs                     # Latin Hypercube Sampling
-import matplotlib
+import torch.nn as nn
+import torch.optim as optim
+from torch.autograd import grad
+import os
+from pyDOE import lhs
 import matplotlib.pyplot as plt
-matplotlib.use('TkAgg')
 
-# Set default dtype to float32
-torch.set_default_dtype(torch.float)
-
-# PyTorch random number generator
+# Set default data type and random seeds
+torch.set_default_dtype(torch.float32)
 torch.manual_seed(1234)
-
-# NumPy random number generator
 np.random.seed(1234)
 
 # Use GPU if available
@@ -25,278 +18,245 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class HelmholtzPINN(nn.Module):
     """
-    A neural network for solving data (boundary condition) loss and partial differential equation (residual) loss
-    for the 2D Helmholtz equation in PyTorch.
+    PINN for solving the 2D Helmholtz equation in a rectangular domain.
 
     Parameters
     ----------
-    layers : list
+    layers : list of int
         A list defining the number of nodes in each layer of the network.
     """
 
     def __init__(self, layers):
-        """
-        Initializes the SequentialModel with the specified layers, activation function,
-        loss function, and weight initialization.
-
-        Parameters
-        ----------
-        layers : list
-            A list of integers where each element defines the number of neurons
-            in the respective layer.
-        """
         super().__init__()
-
-        # LeakyReLU activation function
         self.activation = nn.LeakyReLU()
+        self.loss_function = nn.MSELoss()
+        self.linears = nn.ModuleList([nn.Linear(layers[i], layers[i + 1]) for i in range(len(layers) - 1)])
 
-        # Mean squared error (MSE) loss function
-        self.loss_function = nn.MSELoss(reduction='mean')
-
-        # L1 loss (mean absolute error) function
-        self.l1loss_function = nn.L1Loss(reduction='mean')
-
-        # Initialize the network as a list of linear layers
-        self.linears = nn.ModuleList([nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)])
-
-        # Xavier normal initialization for weights and setting biases to zero
-        for i in range(len(layers) - 1):
-            nn.init.xavier_normal_(self.linears[i].weight.data, gain=1.0)
-            nn.init.zeros_(self.linears[i].bias.data)
+        # Xavier normal initialization for weights
+        for linear in self.linears:
+            nn.init.xavier_normal_(linear.weight)
+            nn.init.zeros_(linear.bias)
 
     def forward(self, x):
         """
-        Forward pass through the network. Scales the input features and passes them through
-        the layers of the model, applying the activation function after each layer.
+        Forward pass through the network.
 
         Parameters
         ----------
-        x : torch.Tensor or numpy array
-            Input tensor or array to be processed.
+        x : torch.Tensor
+            Input tensor of shape (N, 2), where N is the number of points.
 
         Returns
         -------
         torch.Tensor
-            Output of the model.
+            Output tensor of shape (N, 1).
         """
-        # Convert numpy array to tensor if needed
-        if not torch.is_tensor(x):
-            x = torch.from_numpy(x)
+        for i, linear in enumerate(self.linears[:-1]):
+            x = self.activation(linear(x))
+        return self.linears[-1](x)
 
-        # Convert lower and upper bounds to tensors
-        u_b = torch.from_numpy(ub).float().to(device)
-        l_b = torch.from_numpy(lb).float().to(device)
-
-        # Feature scaling
-        x = (x - l_b) / (u_b - l_b)
-
-        # Convert input to float
-        a = x.float()
-
-        # Pass through each linear layer with activation
-        for i in range(len(self.linears) - 1):
-            z = self.linears[i](a)
-            a = self.activation(z)
-
-        # Final layer without activation
-        a = self.linears[-1](a)
-
-        return a
-
-    def loss_PDE(self, x_to_train_f, k):
+    def loss_pde(self, x_f, k):
         """
-        Computes the partial differential equation (PDE) loss using automatic differentiation
-        to calculate the second-order derivatives.
+        Computes the PDE loss (residual of the 2D Helmholtz equation) using automatic differentiation to calculate
+        second-order derivatives.
 
         Parameters
         ----------
-        x_to_train_f : torch.Tensor
-            Input tensor for training PDE.
-        k : int
-            Wave number of the Helmholtz equation.
+        x_f : torch.Tensor
+            Collocation points for PDE training.
+        k : float
+            Wave number for the Helmholtz equation.
 
         Returns
         -------
         torch.Tensor
-            Loss value for the PDE.
+            PDE loss.
         """
-        x_1_f = x_to_train_f[:, [0]]
-        x_2_f = x_to_train_f[:, [1]]
-
-        g = x_to_train_f.clone()
-        g.requires_grad = True
-
-        # Forward pass through the network
+        g = x_f.clone().requires_grad_(True)
         u = self.forward(g)
 
-        # Compute first-order derivatives
-        u_x = autograd.grad(u, g, torch.ones([x_to_train_f.shape[0], 1]).to(device),
-                            retain_graph=True, create_graph=True)[0]
+        u_x = grad(u, g, grad_outputs=torch.ones_like(u), create_graph=True)[0][:, 0]
+        u_y = grad(u, g, grad_outputs=torch.ones_like(u), create_graph=True)[0][:, 1]
 
-        # Compute second-order derivatives
-        u_xx = autograd.grad(u_x, g, torch.ones(x_to_train_f.shape).to(device),
-                             create_graph=True)[0]
-        u_xx_1 = u_xx[:, [0]]
-        u_xx_2 = u_xx[:, [1]]
+        u_xx = grad(u_x, g, grad_outputs=torch.ones_like(u_x), create_graph=True)[0][:, 0]
+        u_yy = grad(u_y, g, grad_outputs=torch.ones_like(u_y), create_graph=True)[0][:, 1]
+        laplacian_u = u_xx + u_yy
 
-        # Define the PDE residual
-        q = k**2 * torch.sin(n * x_1_f) * torch.sin(m * x_2_f)
-        f = u_xx_1 + u_xx_2 + k**2 * u - q
+        # PDE residual
+        q = k ** 2 * torch.sin(np.pi * g[:, [0]]) * torch.sin(np.pi * g[:, [1]])
+        f = laplacian_u + k ** 2 * u - q
 
-        # PDE loss
-        return self.loss_function(f, f_hat)
+        return self.loss_function(f, torch.zeros_like(f))
 
-    def test(self, X_test, u_true):
+    def loss_data(self, x_u, u_true):
         """
-        Test the model on the test data and computes the relative L2 norm of the error and the mean absolute error.
+        Computes the boundary data loss (MSE between true and predicted boundary values).
 
         Parameters
         ----------
-        X_test : torch.Tensor
-            Test points across the domain.
+        x_u : torch.Tensor
+            Boundary condition points.
         u_true : torch.Tensor
-            True solution values (ground truth) for comparison.
+            True solution values at boundary points.
 
         Returns
         -------
-        error_vec : torch.Tensor
-            The relative L2 norm of the error.
-        u_pred : numpy.ndarray
-            The predicted solution.
-        mae : torch.Tensor
-            Mean absolute error between the predictions and the true values.
+        torch.Tensor
+            Data loss.
         """
-        # Model prediction
-        u_pred = self.forward(X_test)
+        u_pred = self.forward(x_u)
+        return self.loss_function(u_pred, u_true)
 
-        # Compute the relative L2 norm of the error
-        error_vec = torch.linalg.norm(u_true - u_pred, 2) / torch.linalg.norm(u_true, 2)
+    def compute_loss(self, x_f, x_u, u_true, k):
+        """
+        Computes the total loss as the sum of PDE loss and data loss.
 
-        # Compute the mean absolute error (MAE)
-        mae = torch.mean(torch.abs(u_true - u_pred))
+        Parameters
+        ----------
+        x_f : torch.Tensor
+            Collocation points.
+        x_u : torch.Tensor
+            Boundary condition points.
+        u_true : torch.Tensor
+            True boundary values.
+        k : float
+            Wavenumber.
 
-        # Reshape the predicted output
-        u_pred = np.reshape(u_pred.cpu().detach().numpy(), (num_grid_pts, num_grid_pts), order='F')
+        Returns
+        -------
+        torch.Tensor
+            Total loss.
+        """
+        pde_loss = self.loss_pde(x_f, k)
+        data_loss = self.loss_data(x_u, u_true)
+        return pde_loss + data_loss
 
-        return error_vec, u_pred, mae
 
-
-
-def create_grid(num_grid_pts=256, n_dim=2):
+def create_grid(num_points=256):
     """
-    Creates an n-dimensional grid of points as a NumPy array.
+    Creates a 2D grid of points over the domain [0, pi] x [0, pi].
 
     Parameters
     ----------
-    num_grid_pts : int, optional
-        The number of grid points along each dimension (default is 256).
-    n_dim : int, optional
-        The number of dimensions (default is 2).
+    num_points : int, optional
+        Number of points along each axis (default is 256).
 
     Returns
     -------
-    grid : np.ndarray
-        n-dimensional grid points as a NumPy array.
-    axis_points : list of np.ndarray
-        List of 1D arrays of points for every dimension.
+    X : np.ndarray
+        Grid points in the x-dimension.
+    Y : np.ndarray
+        Grid points in the y-dimension.
     """
-    # Form 1D arrays for every dimension
-    axis_points = [np.linspace(0, np.pi, num_grid_pts) for _ in range(n_dim)]
-
-    # Generate a meshgrid up to n_dim
-    grids = np.meshgrid(*axis_points, indexing='ij', sparse=False)
-
-    return grids, axis_points
+    x = np.linspace(0, np.pi, num_points)
+    y = np.linspace(0, np.pi, num_points)
+    X, Y = np.meshgrid(x, y)
+    return X, Y
 
 
 def prepare_training_data(N_u, N_f, lb, ub, usol, X, Y):
     """
-    Prepare boundary condition data and collocation points for training.
+    Prepare boundary and collocation points for training.
 
     Parameters
     ----------
     N_u : int
-        Number of boundary condition points to select.
+        Number of boundary points.
     N_f : int
-        Number of collocation points for the physics-informed model.
+        Number of collocation points.
     lb : np.ndarray
-        Lower bound for the domain.
+        Lower bounds of the domain.
     ub : np.ndarray
-        Upper bound for the domain.
+        Upper bounds of the domain.
     usol : np.ndarray
-        Analytical solution of the PDE.
-    X : np.ndarray
-        X grid of points.
-    Y : np.ndarray
-        Y grid of points.
+        Analytical solution at grid points.
+    X, Y : np.ndarray
+        Grids of x and y points.
 
     Returns
     -------
     X_f_train : np.ndarray
-        Collocation points in the domain.
+        Collocation points.
     X_u_train : np.ndarray
-        Boundary condition points.
+        Boundary points.
     u_train : np.ndarray
-        Corresponding boundary condition values.
+        Boundary values.
     """
-    # Boundary points from all four edges
-    boundary_points = np.vstack((
-        np.hstack((X[:, 0][:, None], Y[:, 0][:, None])),
-        np.hstack((X[:, -1][:, None], Y[:, -1][:, None])),
-        np.hstack((X[0, :][:, None], Y[0, :][:, None])),
-        np.hstack((X[-1, :][:, None], Y[-1, :][:, None]))
-    ))
-
-    # Boundary values (analytical solution at boundary points)
-    boundary_values = np.vstack((
-        usol[:, 0][:, None],
-        usol[:, -1][:, None],
-        usol[0, :][:, None],
-        usol[-1, :][:, None]
-    ))
+    # Boundary points (4 edges of square)
+    boundary_points = np.vstack([
+        np.column_stack((X[:, 0], Y[:, 0])),
+        np.column_stack((X[:, -1], Y[:, -1])),
+        np.column_stack((X[0, :], Y[0, :])),
+        np.column_stack((X[-1, :], Y[-1, :]))
+    ])
+    boundary_values = (
+        np.vstack([ usol[:, 0], usol[:, -1],
+                    usol[0, :], usol[-1, :]]).reshape(-1, 1))
 
     # Randomly select N_u boundary points
     idx = np.random.choice(boundary_points.shape[0], N_u, replace=False)
     X_u_train = boundary_points[idx, :]
     u_train = boundary_values[idx, :]
 
-    # Generate N_f collocation points using Latin Hypercube Sampling
-    X_f_train = lb + (ub - lb) * lhs(2, N_f)  # Collocation points in [lb, ub]
+    # Collocation points using Latin Hypercube Sampling
+    X_f_train = lb + (ub - lb) * lhs(2, N_f)
 
     return X_f_train, X_u_train, u_train
 
 
-def prepare_test_data(X, Y):
+def plot_solution(u_pred, usol, X, Y, epoch, figDir):
     """
-    Prepare test data by flattening the 2D grids and stacking them column-wise.
+    Plot the predicted solution, analytical solution, and absolute error.
 
     Parameters
     ----------
-    X : np.ndarray
-        2D grid points in the x-dimension as a NumPy array.
-    Y : np.ndarray
-        2D grid points in the y-dimension as a NumPy array.
-
-    Returns
-    -------
-    X_u_test : np.ndarray
-        Test data prepared by stacking the flattened x and y grids.
-    lb : np.ndarray
-        Lower bound for the domain (boundary conditions).
-    ub : np.ndarray
-        Upper bound for the domain (boundary conditions).
+    u_pred : np.ndarray
+        Predicted solution from the model.
+    usol : np.ndarray
+        Analytical solution.
+    X, Y : np.ndarray
+        Grids of x and y points.
+    epoch : int
+        Current training epoch.
+    figDir : str
+        Directory where the figures will be saved.
     """
-    # Flatten the grids and stack them into a 2D array
-    X_u_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
+    abs_error = np.abs(usol - u_pred)
 
-    # Domain bounds as NumPy arrays
-    lb = np.array([0, 0], dtype=np.float32)
-    ub = np.array([np.pi, np.pi], dtype=np.float32)
+    plt.figure(figsize=(18, 5))
 
-    return X_u_test, lb, ub
+    # Analytical solution
+    plt.subplot(1, 3, 1)
+    plt.pcolor(X, Y, usol, cmap='jet')
+    plt.colorbar()
+    plt.title('Analytical Solution')
+
+    # Predicted solution
+    plt.subplot(1, 3, 2)
+    plt.pcolor(X, Y, u_pred, cmap='jet')
+    plt.colorbar()
+    plt.title(f'Predicted Solution at Epoch {epoch}')
+
+    # Absolute error
+    plt.subplot(1, 3, 3)
+    plt.pcolor(X, Y, abs_error, cmap='jet')
+    plt.colorbar()
+    plt.title('Absolute Error')
+
+    plt.tight_layout()
+
+    # Create the figures directory if it doesn't exist
+    os.makedirs(figures_dir, exist_ok=True)
+
+    # Save the figure in the specified directory
+    figure_path = os.path.join(figures_dir, f'Helmholtz_iter_{epoch}.png')
+    plt.savefig(figure_path, dpi=500, bbox_inches='tight')
+
+    plt.show()
+    plt.pause(0.1)
 
 
-def visualize_training_data(X_f_train, X_u_train, u_train):
+def plot_training_domain(X_f_train, X_u_train):
     """
     Visualizes the boundary points and collocation points on a π × π square domain.
 
@@ -306,10 +266,8 @@ def visualize_training_data(X_f_train, X_u_train, u_train):
         Collocation points to visualize.
     X_u_train : np.ndarray
         Boundary points to visualize.
-    u_train : np.ndarray
-        Corresponding boundary condition values.
     """
-    plt.figure(figsize=(8, 8))
+    plt.figure(figsize=(6, 6))
 
     # Plot boundary points
     plt.scatter(X_u_train[:, 0], X_u_train[:, 1], color='red', label='Boundary Points', alpha=0.6)
@@ -326,49 +284,13 @@ def visualize_training_data(X_f_train, X_u_train, u_train):
     plt.gca().set_aspect('equal', adjustable='box')
     plt.xlabel('$x_1$', fontsize=14)
     plt.ylabel('$x_2$', fontsize=14)
-    plt.title('Boundary and Collocation Points inside the π-Square')
+    plt.title('Boundary and Collocation Points for Training')
     plt.legend()
     plt.grid()
     plt.show()
 
 
-def LBFGS_training():
-    """
-    Computes the loss and its gradients for use with the LBFGS optimizer.
-
-    Necessary for optimizers which require multiple evaluations of the function. It performs the following:
-    - Resets gradients to zero.
-    - Calculates the loss using the physics-informed neural network (PINN) model.
-    - Backpropagates the gradients of the loss.
-
-    Returns
-    -------
-    loss : torch.Tensor
-        The computed loss value.
-    """
-    # Zero out the gradients of the optimizer before backpropagation
-    lbfgs_optimizer.zero_grad()
-
-    # Forward pass for boundary condition points
-    u_pred_train = PINN.forward(X_u_train)
-
-    # Data loss (MSE between predicted and true boundary condition values)
-    data_loss = PINN.loss_function(u_pred_train, u_train)
-
-    # Physics loss (PDE residuals)
-    physics_loss = PINN.loss_PDE(X_f_train, k)
-
-    # Total loss: sum of data loss and physics loss
-    total_loss = data_loss + physics_loss
-
-    # Perform backpropagation to compute the gradients of the loss
-    total_loss.backward()
-
-    # Return the total loss value to the optimizer
-    return total_loss
-
-
-def plot_training_progress(train_losses, test_losses, train_maes, test_maes, steps):
+def plot_training_progress(train_losses, test_losses, train_maes, test_maes, steps, figDir):
     """
     Plot the training and test losses, along with the train and test MAEs, over the course of training.
 
@@ -384,6 +306,8 @@ def plot_training_progress(train_losses, test_losses, train_maes, test_maes, ste
         List of test MAE values recorded during training.
     steps : list
         List of step numbers corresponding to the recorded losses and metrics.
+    figDir : str
+        Directory where the figures will be saved.
 
     Returns
     -------
@@ -410,131 +334,74 @@ def plot_training_progress(train_losses, test_losses, train_maes, test_maes, ste
 
     plt.tight_layout()
     plt.yscale('log')
+
+    # Create the directory if it doesn't exist
+    os.makedirs(figures_dir, exist_ok=True)
+
+    # Save the figure in the specified directory
+    figure_path = os.path.join(figures_dir, f'Helmholtz_Training_Progress.png')
+    plt.savefig(figure_path, dpi=500, bbox_inches='tight')
+
+    plt.savefig('training_progress.png', dpi=500, bbox_inches='tight')
     plt.show()
     plt.pause(0.1)
-    plt.savefig('training_progress.png', dpi=500, bbox_inches='tight')
 
 
-def solutionplot(u_pred, usol, x_1, x_2, index, X_f_train=None):
+def train_pinn(N_u=500, N_f=10000, layers=[2, 200, 200, 200, 1], epochs=1000, lr=0.01, figDir=os.path.join(os.getcwd(), "Helmholtz_Figures")):
     """
-    Plots the ground truth solution, predicted solution, and absolute error between them.
-    Optionally includes the collocation points.
+    Train the Physics-Informed Neural Network for the Helmholtz equation.
 
     Parameters
     ----------
-    u_pred : numpy.ndarray
-        Predicted solution values from the model.
-    usol : numpy.ndarray
-        Ground truth solution values to be plotted.
-    x_1 : numpy.ndarray
-        1D array of grid points in the x1-dimension.
-    x_2 : numpy.ndarray
-        1D array of grid points in the x2-dimension.
-    index : int
-        Current iteration of the optimizer.
-    X_f_train : torch.Tensor, optional
-        Collocation points used for PDE loss (optional, default is None).
+    N_u : int
+        Number of boundary points.
+    N_f : int
+        Number of collocation points.
+    layers : list of int
+        Network architecture.
+    epochs : int
+        Number of training epochs.
+    lr : float
+        Learning rate.
+    figDir : str
+        Directory where the figures will be saved.
+
+    Returns
+    -------
+    HelmholtzPINN
+        Trained model.
     """
-
-    plt.figure(figsize=(18, 5))
-
-    # Plot ground truth solution
-    plt.subplot(1, 3, 1)
-    plt.pcolor(x_1, x_2, usol, cmap='jet')
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title('Ground Truth $u(x_1,x_2)$', fontsize=15)
-
-    # Plot predicted solution
-    plt.subplot(1, 3, 2)
-    plt.pcolor(x_1, x_2, u_pred, cmap='jet')
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title(f'Predicted $\hat u(x_1,x_2)$ - Iteration {index}', fontsize=15)
-
-    # Optionally plot collocation points
-    if X_f_train is not None:
-        X_f_train_np = X_f_train.cpu().numpy()
-        plt.scatter(X_f_train_np[:, 0], X_f_train_np[:, 1], color='white', s=1, label="Collocation Points")
-        plt.legend()
-
-    # Plot absolute error
-    plt.subplot(1, 3, 3)
-    plt.pcolor(x_1, x_2, np.abs(usol - u_pred), cmap='jet')
-    plt.colorbar()
-    plt.xlabel(r'$x_1$', fontsize=18)
-    plt.ylabel(r'$x_2$', fontsize=18)
-    plt.title(r'Absolute error $|u(x_1,x_2)- \hat u(x_1,x_2)|$', fontsize=15)
-
-    plt.tight_layout()
-    plt.show()
-    plt.pause(0.1)
-    plt.savefig(f'Helmholtz_iter_{index}.png', dpi=500, bbox_inches='tight')
-
-
-if __name__ == "__main__":
-
-    # Specify number of grid points and number of dimensions
-    num_grid_pts = 256
-    nDim = 2
-
-    # Prepare test data
-    grids, axis_points = create_grid(num_grid_pts=num_grid_pts, n_dim=nDim)
-    X, Y = grids[0], grids[1]
-    x_1, x_2 = axis_points[0], axis_points[1]
-    X_u_test, lb, ub = prepare_test_data(X, Y)
-
-    # Analytical solution of the PDE
-    n = 1
-    m = 1
-    k = np.sqrt(np.pi ** 2 * (m ** 2 + n ** 2))
-    usol = np.sin(n * X) * np.sin(m * Y)
-
-    # Flatten the solution
+    # Generate grid and exact solution
+    X, Y = create_grid()
+    usol = np.sin(np.pi * X) * np.sin(np.pi * Y)
     u_true = usol.flatten()[:, None]
-
-    # Number of training points and collocation points
-    N_u = 500  # Total number of data points for 'u', used to train the model on boundary conditions
-    N_f = 10000  # Total number of collocation points for training the physics-informed part of the model in the domain
+    lb = np.array([0, 0], dtype=np.float32)
+    ub = np.array([np.pi, np.pi], dtype=np.float32)
 
     # Prepare training data
-    X_f_train_np_array, X_u_train_np_array, u_train_np_array = prepare_training_data(N_u, N_f, lb, ub, usol, X, Y)
+    X_f_train, X_u_train, u_train = prepare_training_data(N_u, N_f, lb, ub, usol, X, Y)
 
-    # Visualize the training data
-    visualize_training_data(X_f_train_np_array, X_u_train_np_array, u_train_np_array)
+    # Split the boundary data into 80% training and 20% testing
+    split_idx = int(0.8 * X_u_train.shape[0])
+    X_u_train_split = X_u_train[:split_idx]
+    u_train_split = u_train[:split_idx]
+    X_u_test = X_u_train[split_idx:]
+    u_test = u_train[split_idx:]
 
-    # Convert numpy arrays to PyTorch tensors and move to GPU (if available)
-    X_f_train = torch.from_numpy(X_f_train_np_array).float().to(device)  # Collocation points
-    X_u_train = torch.from_numpy(X_u_train_np_array).float().to(device)  # Boundary condition points
-    u_train = torch.from_numpy(u_train_np_array).float().to(device)  # Boundary condition values
-    X_u_test_tensor = torch.from_numpy(X_u_test).float().to(device)  # Test data for boundary conditions
-    u = torch.from_numpy(u_true).float().to(device)  # True solution values (ground truth for testing)
-    f_hat = torch.zeros(X_f_train.shape[0], 1).to(device)  # Zero tensor for the physics equation residual
+    # Convert to tensors
+    X_f_train = torch.tensor(X_f_train, dtype=torch.float32).to(device)
+    X_u_train = torch.tensor(X_u_train, dtype=torch.float32).to(device)
+    X_u_train_split = torch.tensor(X_u_train_split, dtype=torch.float32).to(device)
+    u_train_split = torch.tensor(u_train_split, dtype=torch.float32).to(device)
+    X_u_test = torch.tensor(X_u_test, dtype=torch.float32).to(device)
+    u_test = torch.tensor(u_test, dtype=torch.float32).to(device)
 
-    # Neural network architecture - Input layer with 2 nodes, 4 hidden layers with 200 nodes, and
-    # an output layer with 1 node
-    layers = np.array([2, 200, 200, 200, 200, 1])
-    PINN = HelmholtzPINN(layers)
+    # Visualize the training domain
+    plot_training_domain(X_f_train.cpu().numpy(), X_u_train.cpu().numpy())
 
-    # Move the model to the GPU (if available)
-    PINN.to(device)
-
-    # Print the neural network architecture
-    print(PINN)
-
-    # Store the neural network parameters for optimization
-    params = list(PINN.parameters())
-
-    # Optimizer setup
-    adam_optimizer = optim.Adam(PINN.parameters(), lr=0.01, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-6, amsgrad=False)
-    lbfgs_optimizer = optim.LBFGS(PINN.parameters(), max_iter=500, tolerance_grad=1e-5, tolerance_change=1e-9, history_size=100)
-
-    start_time = time.time()  # Start timer
-
-    # Number of iterations in Adam optimization loop
-    adam_iter = 250
+    # Create model
+    model = HelmholtzPINN(layers).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
     # Store training progress
     train_losses = []
@@ -543,74 +410,63 @@ if __name__ == "__main__":
     test_maes = []
     steps = []
 
-    for i in range(adam_iter):
-        # Forward pass for boundary condition points (train data)
-        u_pred_train = PINN.forward(X_u_train)
+    for epoch in range(epochs):
+        optimizer.zero_grad()
 
-        # Data loss (MSE between predicted and true boundary condition values)
-        data_loss = PINN.loss_function(u_pred_train, u_train)  # Boundary condition loss
+        # Compute train loss
+        loss = model.compute_loss(X_f_train, X_u_train_split, u_train_split, k=np.sqrt(2) * np.pi)
+        loss.backward()
+        optimizer.step()
 
-        # Physics loss (PDE residuals computed inside the domain)
-        physics_loss = PINN.loss_PDE(X_f_train, k)  # Physics loss at collocation points
+        # Record training loss and MAE
+        train_loss = loss.item()
+        u_pred_train = model(X_u_train_split)
+        train_mae = nn.L1Loss()(u_pred_train, u_train_split).item()
 
-        # Total loss: sum of data loss (boundary) and physics loss (domain)
-        train_loss = data_loss + physics_loss
+        # Test the model on test data every 10 epochs
+        if epoch % 10 == 0:
+            with torch.no_grad():
+                u_pred_test = model(X_u_test)
+                test_loss = model.loss_data(X_u_test, u_test).item()  # Test loss (MSE)
+                test_mae = nn.L1Loss()(u_pred_test, u_test).item()  # Test MAE
 
-        # Train MAE (L1 loss between predicted and true solution on boundary points)
-        train_mae = PINN.l1loss_function(u_pred_train, u_train)
+                # Store values for plotting
+                steps.append(epoch)
+                train_losses.append(train_loss)
+                test_losses.append(test_loss)
+                train_maes.append(train_mae)
+                test_maes.append(test_mae)
 
-        # Zero gradient buffers
-        adam_optimizer.zero_grad()
+        # Print every 400 epochs
+        if epoch % 400 == 0:
+            print(f'Epoch {epoch}/{epochs}, Train Loss: {train_loss:.6f}, Train MAE: {train_mae:.6f}',
+                  f'Test Loss: {test_loss:.6f}, Test MAE: {test_mae:.6f}')
 
-        # Backpropagate gradients
-        train_loss.backward()
+            # Predict solution
+            u_pred = model(torch.tensor(np.column_stack((X.flatten(), Y.flatten())), dtype=torch.float32).to(device))
+            u_pred = u_pred.cpu().detach().numpy().reshape(X.shape)
 
-        # Update model parameters
-        adam_optimizer.step()
+            # Plot analytical, predicted solution, and absolute error
+            plot_solution(u_pred, usol, X, Y, epoch, figDir)
 
-        if i % 10 == 0:
-            # Test the model on validation data
-            u_pred_test = PINN.forward(X_u_test_tensor)
+    # Plot the training/test loss and mae over time
+    plot_training_progress(train_losses, test_losses, train_maes, test_maes, steps, figDir)
 
-            # Test loss (MSE between predicted and true solution on test data)
-            test_loss = PINN.loss_function(u_pred_test, u)
+    return model
 
-            # Compute test MAE (L1 loss between predictions and true solution on test data)
-            test_mae = PINN.l1loss_function(u_pred_test, u)
 
-            # Print current iteration details
-            #print(f"Iteration {i}: Train Loss {train_loss.item()}, Test Loss {test_loss.item()}, "
-            #      f"Train MAE {train_mae.item()}, Test MAE {test_mae.item()}")
+if __name__ == "__main__":
 
-            # Append the current values to track progress
-            steps.append(i)
-            train_losses.append(train_loss.item())
-            test_losses.append(test_loss.item())
-            train_maes.append(train_mae.item())
-            test_maes.append(test_mae.item())
+    # Network Parameters
+    N_u = 500  # Number of boundary points
+    N_f = 10000  # Number of collocation points
+    layers = [2, 200, 200, 200, 1]  # Neural network architecture
+    epochs = 2001  # Number of training epochs
+    lr = 0.01 # Learning rate
 
-        if i % 50 == 0:
+    # Create figures directory if it doesn't exist
+    figures_dir = os.path.join(os.getcwd(), "Helmholtz_Figures")
+    os.makedirs(figures_dir, exist_ok=True)
 
-            # Predict the solution
-            _, u_pred, _ = PINN.test(X_u_test_tensor, u)
-
-            # Visualize the current prediction
-            solutionplot(u_pred, usol, x_1, x_2, i)
-
-    # L-BFGS optimization
-    lbfgs_optimizer.step(LBFGS_training)
-
-    # Test after L-BFGS optimization
-    error_vec, u_pred, _ = PINN.test(X_u_test_tensor, u)
-    print(f'L-BFGS Test Error: {error_vec.item()}')
-
-    # Total training time
-    elapsed = time.time() - start_time
-    print(f'Training time: {elapsed:.2f} seconds')
-
-    # Plot training progress
-    plot_training_progress(train_losses, test_losses, train_maes, test_maes, steps)
-
-    # Final test accuracy
-    error_vec, u_pred, _ = PINN.test(X_u_test_tensor, u)
-    print(f'Test Error: {error_vec:.5f}')
+    # Train the PINN
+    model = train_pinn(N_u=N_u, N_f=N_f, layers=layers, epochs=epochs, lr=lr, figDir=figures_dir)
