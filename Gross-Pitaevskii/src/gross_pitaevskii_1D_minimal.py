@@ -9,9 +9,17 @@ from torch.autograd import grad
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+class SineActivation(nn.Module):
+    """
+    Custom sine activation function for the neural network.
+    """
+    def forward(self, x):
+        return torch.sin(x)
+
+
 class GrossPitaevskiiPINN(nn.Module):
     """
-    Physics-Informed Neural Network (PINN) for solving the 2D Gross-Pitaevskii Equation.
+    Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation..
 
     Parameters
     ----------
@@ -24,7 +32,6 @@ class GrossPitaevskiiPINN(nn.Module):
     g : float, optional
         Interaction strength (default is 100.0).
     """
-
     def __init__(self, layers, hbar=1.0, m=1.0, g=100.0):
         super().__init__()
         self.layers = layers
@@ -35,7 +42,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def build_network(self):
         """
-        Build the neural network.
+        Build the neural network with sine activation functions between layers.
 
         Returns
         -------
@@ -45,7 +52,7 @@ class GrossPitaevskiiPINN(nn.Module):
         layers = []
         for i in range(len(self.layers) - 1):
             layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
-            if i < len(self.layers) - 2:  # Apply activation for hidden layers
+            if i < len(self.layers) - 2:  # Apply activation function for hidden layers
                 layers.append(nn.Tanh())
         return nn.Sequential(*layers)
 
@@ -65,14 +72,14 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         return self.network(x)
 
-    def compute_potential(self, inputs, V0=1.0, x0=np.pi / 2, sigma=0.5):
+    def compute_potential(self, x, V0=1.0, x0=np.pi / 2, sigma=0.5):
         """
-        Compute the Gaussian potential V(x, y).
+        Compute the Gaussian potential V(x).
 
         Parameters
         ----------
         inputs : torch.Tensor
-            Input tensor of spatial coordinates (x, y).
+            Input tensor of spatial coordinates x.
         V0 : float, optional
             Amplitude of the potential (default is 1.0).
         x0 : float, optional
@@ -85,7 +92,6 @@ class GrossPitaevskiiPINN(nn.Module):
         torch.Tensor
             Tensor representing the potential at the input spatial points.
         """
-        x = inputs[:, 0]
         V = V0 * torch.exp(-((x - x0) ** 2) / (2 * sigma ** 2))
         return V
 
@@ -106,10 +112,9 @@ class GrossPitaevskiiPINN(nn.Module):
             Mean squared error (MSE) at the boundary points.
         """
         u_pred = self.forward(x_bc)
-        y_bc = torch.zeros_like(u_pred)  # Ensure boundary conditions are satisfied
-        return torch.mean((u_pred - y_bc) ** 2) * 10  # Adaptive scaling for boundary loss
+        return torch.mean((u_pred - u_bc) ** 2)
 
-    def riesz_loss(self, predictions, inputs):
+    def riesz_loss(self, predictions, x):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -127,22 +132,21 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         u = predictions
 
-        if not inputs.requires_grad:
-            inputs = inputs.clone().detach().requires_grad_(True)
-        gradients = torch.autograd.grad(outputs=predictions, inputs=inputs,
-                                        grad_outputs=torch.ones_like(predictions),
-                                        create_graph=True, retain_graph=True)[0]
+        if not x.requires_grad:
+            x = x.clone().detach().requires_grad_(True)
+        u_x = torch.autograd.grad(outputs=predictions, inputs=x,
+                                  grad_outputs=torch.ones_like(predictions),
+                                  create_graph=True, retain_graph=True)[0]
 
-        laplacian_term = torch.sum(gradients ** 2)  # Kinetic term
-        V = self.compute_potential(inputs).unsqueeze(1)
-        potential_term = torch.sum(V * u ** 2)  # Potential term
+        laplacian_term = torch.sum(u_x ** 2) # Kinetic term
+        V = self.compute_potential(x)
+        potential_term = torch.sum(V * u ** 2) # Potential term
         interaction_term = 0.5 * self.g * torch.sum(u ** 4)  # Interaction term
 
         riesz_energy = 0.5 * (laplacian_term + potential_term + interaction_term)
-
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions):
+    def pde_loss(self, x, predictions):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -163,20 +167,16 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         u = predictions
 
-        # Compute first and second derivatives with respect to x and y
-        u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0][:, 0]
-        u_y = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0][:, 1]
+        # Compute first and second derivatives with respect to x
+        u_x = grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        u_xx = grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
 
-        u_xx = grad(u_x, inputs, grad_outputs=torch.ones_like(u_x), create_graph=True)[0][:, 0]
-        u_yy = grad(u_y, inputs, grad_outputs=torch.ones_like(u_y), create_graph=True)[0][:, 1]
-        laplacian_u = u_xx + u_yy
+        # Compute λ from the energy functional
+        V = self.compute_potential(x)
+        lambda_pde = torch.mean(u_x ** 2 + V * u ** 2 + self.g * u ** 4) / torch.mean(u ** 2)
 
-        # Compute λ directly from the energy functional
-        V = self.compute_potential(inputs)
-        lambda_pde = torch.mean(u_x ** 2 + u_y ** 2 + V * u ** 2 + self.g * u ** 4) / torch.mean(u ** 2)
-
-        # Residual of the PDE (Gross-Pitaevskii equation)
-        pde_residual = -laplacian_u + V * u + self.g * torch.abs(u ** 2) * u - (lambda_pde * u)
+        # Residual of the 1D Gross-Pitaevskii equation
+        pde_residual = -u_xx + V * u + self.g * torch.abs(u ** 2) * u - lambda_pde * u
 
         # Regularization: See https://arxiv.org/abs/2010.05075
 
@@ -187,17 +187,16 @@ class GrossPitaevskiiPINN(nn.Module):
         L_lambda = 1 / (lambda_pde ** 2 + 1e-6)
 
         # Term 3: L_drive = e^(-λ + c), encourages λ to grow, preventing collapse to small values
-        c = 1.0  # Tunable constant
-        L_drive = torch.exp(-lambda_pde + c)
+        L_drive = torch.exp(-lambda_pde + 1.0)
 
-        # PDE loss as the residual plus regularization terms
-        pde_loss = torch.mean(pde_residual ** 2) + L_f + L_lambda
-
+        # PDE loss (residual plus regularization terms)
+        pde_loss = torch.mean(pde_residual ** 2) + L_lambda + L_f
         return pde_loss, pde_residual, lambda_pde
 
     def total_loss(self, x, x_bc, u_bc):
         """
-        Compute the total loss combining boundary, Riesz energy, and PDE losses.
+        Compute the total loss combining boundary, Riesz energy, and PDE losses,
+        and print each component to monitor during training.
 
         Parameters
         ----------
@@ -216,10 +215,11 @@ class GrossPitaevskiiPINN(nn.Module):
         data_loss = self.boundary_loss(x_bc, u_bc)
         riesz_energy = self.riesz_loss(self.forward(x), x)
         pde_loss, _, _ = self.pde_loss(x, self.forward(x))
+
         return data_loss + riesz_energy + pde_loss
 
 
-def prepare_training_data(N_u, N_f, lb, ub, X):
+def prepare_training_data(N_u, N_f, lb, ub):
     """
     Prepare boundary and collocation points for training.
 
@@ -233,31 +233,25 @@ def prepare_training_data(N_u, N_f, lb, ub, X):
         Lower bounds of the domain.
     ub : np.ndarray
         Upper bounds of the domain.
-    X : np.ndarray
-        Grids of x points.
 
     Returns
     -------
-    X_f_train : np.ndarray
+    collocation_points : np.ndarray
         Collocation points.
-    X_u_train : np.ndarray
+    boundary_points : np.ndarray
         Boundary points.
-    u_train : np.ndarray
+    boundary_values : np.ndarray
         Boundary values.
     """
-    # Boundary points (4 edges of square)
-    interval_points = np.linspace(0, np.pi, N_f)
-    boundary_points = np.linspace(0, 0, N_u)
-    boundary_values = np.linspace(0, 0, N_u)
 
-    # Randomky select N_f collocation points
-    X_f_train = np.random.choice(interval_points, N_f)
-    # TODO: do we need this?
-    X_u_train = boundary_points
-    # TODO: do we need the boundary values?
-    u_train = boundary_values
+    # Boundary of interval
+    boundary_points = np.array([[lb], [ub]])
+    boundary_values = np.zeros((2, 1))
 
-    return X_f_train, X_u_train, u_train
+    # Dynamically sample points inside the interval
+    collocation_points = np.random.rand(N_f, 1) * (ub - lb) + lb
+
+    return collocation_points, boundary_points, boundary_values
 
 
 def initialize_weights(m):
@@ -274,27 +268,10 @@ def initialize_weights(m):
         m.bias.data.fill_(0.01)
 
 
-def create_grid(num_points=256):
+def train_pinn(N_u=500, N_f=10000, layers=[1, 100, 100, 100, 1], epochs=1000):
     """
-    Creates a 2D grid of points over the domain [0, pi].
-
-    Parameters
-    ----------
-    num_points : int, optional
-        Number of points along each axis (default is 256).
-
-    Returns
-    -------
-    X : np.ndarray
-        Grid points in the x-dimension.
-    """
-    X = np.linspace(0, np.pi, num_points)
-    return X
-
-
-def train_pinn(N_u=500, N_f=10000, layers=[2, 400, 400, 400, 1], epochs=1000):
-    """
-    Train the Physics-Informed Neural Network (PINN) for the Gross-Pitaevskii equation.
+    Train the Physics-Informed Neural Network (PINN) for the 1D Gross-Pitaevskii equation.
+    This version includes dynamic learning rate scheduling and custom weight initialization.
 
     Parameters
     ----------
@@ -303,7 +280,7 @@ def train_pinn(N_u=500, N_f=10000, layers=[2, 400, 400, 400, 1], epochs=1000):
     N_f : int, optional
         Number of collocation points (interior points) for the physics-based loss (default is 10,000).
     layers : list of int, optional
-        Architecture of the neural network (default is [2, 400, 400, 400, 1]).
+        Architecture of the neural network (default is [1, 100, 100, 100, 1]).
     epochs : int, optional
         Number of training epochs (default is 1000).
 
@@ -312,92 +289,145 @@ def train_pinn(N_u=500, N_f=10000, layers=[2, 400, 400, 400, 1], epochs=1000):
     GrossPitaevskiiPINN
         The trained model.
     """
-    model = GrossPitaevskiiPINN(layers).to(device)  # Move model to device
-    model.apply(initialize_weights)  # Apply weight initialization
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Instantiate the PINN model and initialize its weights
+    model = GrossPitaevskiiPINN(layers).to(device)
+    model.apply(initialize_weights)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    #scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=50, factor=0.5, verbose=True)
 
-    # Generate grid and exact solution
-    X = create_grid()
-    lb = np.array([0], dtype=np.float32)
-    ub = np.array([np.pi], dtype=np.float32)
+    # Generate grid of x-values
+    lb = 0
+    ub = np.pi
+    X = np.linspace(lb, ub, N_f).reshape(-1, 1)
 
-    # Prepare training data
-    X_f_train, X_u_train, u_train = prepare_training_data(N_u, N_f, lb, ub, X)
+    # Prepare training data (collocation and boundary points)
+    collocation_points, boundary_points, boundary_values = prepare_training_data(N_u, N_f, lb, ub)
+
+    # Visualize training data
+    visualize_training_data_1D(collocation_points, boundary_points, boundary_values)
+
+    # Visualize the potential
+    X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points along the 1D interval
+    potential = model.compute_potential(torch.tensor(X_test, dtype=torch.float32).to(device)).detach().cpu().numpy()
+    plot_potential_1D(X_test, potential)
 
     # Convert data to PyTorch tensors and move to device
-    X_f_train_tensor = torch.tensor(X_f_train, dtype=torch.float32, requires_grad=True).to(device)
-    X_u_train_tensor = torch.tensor(X_u_train, dtype=torch.float32).to(device)
-    u_train_tensor = torch.tensor(u_train, dtype=torch.float32).to(device)
+    collocation_points_tensor = torch.tensor(collocation_points, dtype=torch.float32, requires_grad=True).to(device)
+    boundary_points_tensor = torch.tensor(boundary_points, dtype=torch.float32).to(device)
+    boundary_values_tensor = torch.tensor(boundary_values, dtype=torch.float32).to(device)
 
+    # Training loop
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
 
-        # Calculate the total loss
-        loss = model.total_loss(X_f_train_tensor, X_u_train_tensor, u_train_tensor)
+        # Calculate the total loss (boundary, Riesz energy, and PDE losses)
+        loss = model.total_loss(collocation_points_tensor, boundary_points_tensor, boundary_values_tensor)
 
         # Backpropagation and optimization
         loss.backward()
         optimizer.step()
 
-        if epoch % 400 == 0:  # Plot every 400 epochs
+        # Adjust learning rate if the loss plateaus
+        #scheduler.step(loss)
+
+        # Every 400 epochs, print loss and plot the predicted solution
+        if epoch % 400 == 0:
             print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item():.6f}')
-            pde_loss, _, lambda_pde = model.pde_loss(X_f_train_tensor, model.forward(X_f_train_tensor))
-            plot_solution(model, num_grid_pts=100, center=(np.pi / 2, np.pi / 2), radius=np.pi / 2, epoch=epoch,
-                          lambda_pde=lambda_pde.item())
+            pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor, model.forward(collocation_points_tensor))
+            plot_solution_1D(model, X_test, epoch=epoch, lambda_pde=lambda_pde.item())
 
     return model
 
 
-def plot_solution(model, num_grid_pts=100, center=(np.pi / 2, np.pi / 2), radius=np.pi / 2, epoch=0, lambda_pde=0):
+def plot_solution_1D(model, X_test, epoch=0, lambda_pde=0):
     """
-    Plot the predicted solution of the Gross-Pitaevskii equation.
+    Plot the predicted solution of the 1D Gross-Pitaevskii equation.
 
     Parameters
     ----------
     model : GrossPitaevskiiPINN
         The trained PINN model.
-    num_grid_pts : int, optional
-        Number of grid points for plotting the solution (default is 100).
-    center : tuple of float, optional
-        Center of the circular region for plotting (default is (pi/2, pi/2)).
-    radius : float, optional
-        Radius of the circular region for plotting (default is pi/2).
+    X_test : np.ndarray
+        The test points where the predicted solution is computed.
     epoch : int, optional
         The current training epoch, used in the plot title (default is 0).
     lambda_pde : float, optional
         The smallest eigenvalue from the PDE loss, used in the plot title (default is 0).
     """
-    x_vals = np.linspace(center[0] - radius, center[0] + radius, num_grid_pts)
-    y_vals = np.linspace(center[1] - radius, center[1] + radius, num_grid_pts)
-    X, Y = np.meshgrid(x_vals, y_vals)
 
-    # Prepare test data
-    X_test = np.hstack((X.flatten()[:, None], Y.flatten()[:, None]))
+    # Predict the solution by the trained model
     X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
-
-    # Predict the solution using the trained model
-    u_pred = model(X_test_tensor).detach().cpu().numpy().reshape((num_grid_pts, num_grid_pts))
+    u_pred = model(X_test_tensor).detach().cpu().numpy()
 
     plt.figure(figsize=(8, 6))
-    plt.pcolor(X, Y, u_pred, shading='auto', cmap='viridis')
-    plt.colorbar(label='Predicted Solution $u_{pred}$')
-    plt.title(
-        f'Predicted Solution of the Gross-Pitaevskii Equation\nEpoch: {epoch}, Smallest Eigenvalue: {lambda_pde:.4f}')
+    plt.plot(X_test, u_pred / np.max(u_pred), label=f'Epoch: {epoch}, λ: {lambda_pde:.4f}', color='b')
+    plt.title(f'Predicted Solution of the 1D Gross-Pitaevskii Equation\nEpoch: {epoch}, λ: {lambda_pde:.4f}')
     plt.xlabel('$x$')
-    plt.ylabel('$y$')
-    plt.xlim([center[0] - radius, center[0] + radius])
-    plt.ylim([center[1] - radius, center[1] + radius])
-    plt.gca().set_aspect('equal', adjustable='box')
-    plt.legend(['Smallest Eigenvalue'])
+    plt.ylabel('$u_{pred}$ / max($u_{pred}$)')
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+
+def plot_potential_1D(X_test, potential):
+    """
+    Plot the 1D potential function.
+
+    Parameters
+    ----------
+    X_test : np.ndarray
+        The test points where the potential is computed.
+    potential : np.ndarray
+        The computed potential values at the test points.
+    """
+    plt.figure(figsize=(6, 5))
+
+    # X_test is the x-values (positions) of the 1D potential
+    plt.plot(X_test, potential, label='Potential $V(x)$', color='green')
+
+    plt.title('Potential $V(x)$ in 1D')
+    plt.xlabel('$x$')
+    plt.ylabel('$V(x)$')
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+
+def visualize_training_data_1D(collocation_points, boundary_points, boundary_values):
+    """
+    Visualize the boundary points and collocation points in 1D.
+
+    Parameters
+    ----------
+    collocation_points : np.ndarray
+        Collocation points to visualize.
+    boundary_points : np.ndarray
+        Boundary points to visualize.
+    boundary_values : np.ndarray
+        Corresponding boundary condition values.
+    """
+    plt.figure(figsize=(8, 5))
+
+    # Plot boundary points
+    plt.scatter(boundary_points, boundary_values, color='red', label='Boundary Points', alpha=0.6)
+
+    # Plot collocation points
+    plt.scatter(collocation_points, np.zeros_like(collocation_points), color='blue', label='Collocation Points', alpha=0.3)
+
+    plt.title('Boundary and Collocation Points in 1D')
+    plt.xlabel('$x$')
+    plt.ylabel('$u(x)$')
+    plt.grid(True)
+    plt.legend()
     plt.show()
 
 
 if __name__ == "__main__":
-    N_u = 500  # Number of boundary points
-    N_f = 10000  # Number of collocation points
-    layers = [1, 100, 100, 100, 1]  # Neural network architecture
-    epochs = 2001  # Number of training epochs
+    N_u = 20 # Number of boundary points (only needs to be 2 in this example)
+    N_f = 1000 # Number of collocation points
+    layers = [1, 200, 200, 200, 1] # Neural network architecture
+    epochs = 2001 # Number of training epochs
 
     # Train the PINN
     model = train_pinn(N_u=N_u, N_f=N_f, layers=layers, epochs=epochs)
