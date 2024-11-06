@@ -1,117 +1,264 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.special import j0, jn
+from torch.autograd import grad
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Define the neural network
 class PINN(nn.Module):
+    """
+    Physics-Informed Neural Network (PINN) for solving the 1D Gross–Pitaevskii equation.
+
+    This network consists of 3 hidden layers with 'tanh' activation and an output layer
+    that produces a single solution value `u(x)` without activation.
+
+    Attributes
+    ----------
+    hidden_layers : nn.ModuleList
+        List of three linear layers with 32 units each and 'tanh' activation.
+    output_layer : nn.Linear
+        Output layer with a single unit and no activation.
+    """
+
     def __init__(self):
         super(PINN, self).__init__()
-        self.hidden1 = nn.Linear(2, 128)
-        self.hidden2 = nn.Linear(128, 128)
-        self.hidden3 = nn.Linear(128, 128)
-        self.output = nn.Linear(128, 1)
+        self.hidden_layers = nn.ModuleList([nn.Linear(2, 32), nn.Linear(32, 32), nn.Linear(32, 32)])
+        self.output_layer = nn.Linear(32, 1)
 
     def forward(self, x):
-        x = torch.sin(self.hidden1(x))
-        x = torch.sin(self.hidden2(x))
-        x = torch.sin(self.hidden3(x))
-        return self.output(x)
+        """
+        Forward pass through the network.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor containing spatial points [x, y].
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor representing the predicted solution `u(x, y)`.
+        """
+        for layer in self.hidden_layers:
+            x = torch.tanh(layer(x))
+        return self.output_layer(x)
 
 
-# Analytical solution
-def analytical_solution(r, theta, k, n):
-    return j0(k * r) * np.cos(n * theta)
+def rayleigh_quotient(model, x, eta, u, u_x, u_y):
+    """
+    Computes the Rayleigh quotient for the given model output to estimate the eigenvalue.
+
+    Parameters
+    ----------
+    model : PINN
+        The PINN model used for approximating the solution.
+    x : torch.Tensor
+        Input tensor for which to compute the Rayleigh quotient.
+    eta : float
+        Nonlinearity parameter for the equation.
+    u : torch.Tensor
+        Model output for the given input.
+    u_x : torch.Tensor
+        First derivative of the model output with respect to the input x.
+
+   u_y : torch.Tensor
+        First derivative of the model output with respect to the input y.
+
+    Returns
+    -------
+    torch.Tensor
+        The Rayleigh quotient, an estimate of the eigenvalue.
+    """
+    numerator = torch.mean(u_x**2 + u_y**2 + 0.5 * eta * u**4)
+    denominator = torch.mean(u**2)
+    return numerator / denominator
 
 
-# Define the Helmholtz residual
-def helmholtz_residual(model, r, theta, k):
-    r.requires_grad = True
-    theta.requires_grad = True
-    u = model(torch.cat((r, theta), dim=1))
+def compute_derivatives(model, x):
+    """
+    Compute the necessary derivatives of the solution `u(x, y)` with respect to x and y.
 
-    # Calculate gradients
-    u_r = torch.autograd.grad(u, r, torch.ones_like(u), create_graph=True)[0]
-    u_rr = torch.autograd.grad(u_r, r, torch.ones_like(u_r), create_graph=True)[0]
-    u_theta = torch.autograd.grad(u, theta, torch.ones_like(u), create_graph=True)[0]
-    u_theta_theta = torch.autograd.grad(u_theta, theta, torch.ones_like(u_theta), create_graph=True)[0]
+    Parameters
+    ----------
+    model : PINN
+        The PINN model used to approximate the solution.
+    x : torch.Tensor
+        Input tensor for which to compute the derivatives.
 
-    # Laplacian in polar coordinates
-    laplacian = u_rr + (1 / r) * u_r + (1 / (r ** 2)) * u_theta_theta
+    Returns
+    -------
+    tuple of torch.Tensor
+        The first derivative `u_x`, second derivative `u_xx`,
+        first derivative `u_y`, and second derivative `u_yy`.
+    """
+    # Calculate the first and second derivatives of the solution with respect to x and y
+    u = model(x)
+    u_x = grad(u, x, torch.ones_like(u), create_graph=True)[0][:, 0]  # u_x derivative with respect to x
+    u_y = grad(u, x, torch.ones_like(u), create_graph=True)[0][:, 1]  # u_y derivative with respect to y
+    u_xx = grad(u_x, x, torch.ones_like(u_x), create_graph=True)[0][:, 0]  # u_xx second derivative with respect to x
+    u_yy = grad(u_y, x, torch.ones_like(u_y), create_graph=True)[0][:, 1]  # u_yy second derivative with respect to y
 
-    q = k ** 2 * torch.special.bessel_j0(k * r) * torch.cos(n * theta)
-
-    # Helmholtz equation residual
-    residual = laplacian + k ** 2 * u - q
-    return residual
+    return u, u_x, u_y, u_xx, u_yy
 
 
-# Define the loss function
-def loss_function(model, r, theta, k):
-    res = helmholtz_residual(model, r, theta, k)
-    return torch.mean(res ** 2)
+def compute_loss(model, x, eta, B, N):
+    """
+    Compute the total loss, including Rayleigh quotient, boundary, normalization, and PDE residual losses.
+
+    Parameters
+    ----------
+    model : PINN
+        The PINN model for solving the equation.
+    x : torch.Tensor
+        Input tensor for computing the loss.
+    eta : float
+        Nonlinearity parameter for the equation.
+    B : float
+        Weighting factor for the boundary loss.
+    N : float
+        Weighting factor for the normalization loss.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        The total loss and Rayleigh quotient loss.
+    """
+    x.requires_grad_(True)
+    u, u_x, u_y, u_xx, u_yy = compute_derivatives(model, x)
+
+    rayleigh_loss = rayleigh_quotient(model, x, eta, u, u_x, u_y)
+    boundary_loss = torch.mean((model(torch.tensor([[0.0, 0.0], [1.0, 1.0]], device=device)) - 0.0)**2)
+    norm_loss = (torch.mean(u**2) - 1.0)**2
+
+    # PDE residual: ∇²u + η * u⁴ + λu = 0
+    residual = u_xx + u_yy + eta * u**4 + rayleigh_loss * u
+    pde_loss = torch.mean(residual**2)
+
+    total_loss = rayleigh_loss + B * boundary_loss + N * norm_loss + pde_loss
+    return total_loss, rayleigh_loss
 
 
-# Enhanced training with adaptive sampling
-def train_pinn(model, k, n, num_epochs=10000, lr=0.001):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    for epoch in range(num_epochs):
-        r = torch.rand(1000, 1) * 1.0
-        theta = torch.rand(1000, 1) * 2 * np.pi
+def gaussian_potential(x, y, sigma=0.1):
+    """
+    Compute the Gaussian potential inside the unit square [0, 1] x [0, 1].
 
+    Parameters
+    ----------
+    x : numpy.ndarray
+        x coordinates of the grid.
+    y : numpy.ndarray
+        y coordinates of the grid.
+    sigma : float, optional
+        The width of the Gaussian potential (default is 0.1).
+
+    Returns
+    -------
+    numpy.ndarray
+        The Gaussian potential values at the grid points.
+    """
+    return np.exp(-((x - 0.5)**2 + (y - 0.5)**2) / (2 * sigma**2))
+
+def plot_potential(X_test, potential):
+    """
+    Plot the potential as a contour plot.
+    """
+    X = X_test[:, 0]
+    Y = X_test[:, 1]
+    potential = potential.reshape((np.size(X), np.size(Y)))
+
+    plt.figure(figsize=(6, 5))
+    plt.contourf(X, Y, potential, levels=50, cmap='viridis')
+    plt.colorbar()
+    plt.title('Potential V(x, y)')
+    plt.show()
+
+
+def train_model(model, x_train, epochs, optimizer, eta, B, N):
+    """
+    Trains the PINN model to solve the 2D Gross–Pitaevskii equation.
+
+    Parameters
+    ----------
+    model : PINN
+        The PINN model to be trained.
+    x_train : torch.Tensor
+        Training data points in the domain [0, 1] x [0, 1].
+    epochs : int
+        Number of training epochs.
+    optimizer : torch.optim.Optimizer
+        Optimizer for training the model.
+    eta : float
+        Nonlinearity parameter for the equation.
+    B : float
+        Weighting factor for the boundary loss.
+    N : float
+        Weighting factor for the normalization loss.
+    """
+
+    # Reshape x_train for grid plotting
+    num_grid_pts = int(np.sqrt(len(x_train)))  # Assuming x_train is a 2D grid
+    x_train_reshaped = x_train.detach().cpu().numpy().reshape((num_grid_pts, num_grid_pts, 2))  # Detach before converting
+
+    for epoch in range(epochs):
         optimizer.zero_grad()
-        loss = loss_function(model, r, theta, k)
+        loss, rayleigh_loss = compute_loss(model, x_train, eta, B, N)
         loss.backward()
         optimizer.step()
 
-        if epoch % 1000 == 0:
-            print(f'Epoch {epoch}, Loss: {loss.item()}')
-
-            # Visualization of predictions vs analytical solution
-            r_test = torch.linspace(0, 1, 100).view(-1, 1)
-            theta_test = torch.linspace(0, 2 * np.pi, 100).view(-1, 1)
-            r_grid, theta_grid = torch.meshgrid(r_test.squeeze(), theta_test.squeeze())
-            inputs = torch.cat((r_grid.flatten().view(-1, 1), theta_grid.flatten().view(-1, 1)), dim=1)
-
+        if epoch % 2000 == 0:
             with torch.no_grad():
-                u_pred = model(inputs).numpy().reshape(r_grid.shape)
-                u_analytical = analytical_solution(r_grid.numpy(), theta_grid.numpy(), k, n)
-                abs_error = np.abs(u_pred - u_analytical)
+                u_pred = model(x_train).cpu().numpy()
+                u_pred = np.abs(u_pred) / np.max(np.abs(u_pred))  # Normalize the prediction
 
-            # Create subplots for the predicted solution, analytical solution, and absolute error
-            plt.figure(figsize=(18, 6))
+                # Reshape u_pred to match the grid dimensions for contour plotting
+                u_pred_reshaped = u_pred.reshape((num_grid_pts, num_grid_pts))
 
-            # Predicted solution
-            plt.subplot(1, 3, 1)
-            plt.contourf(r_grid.numpy(), theta_grid.numpy(), u_pred, levels=50)
-            plt.colorbar()
-            plt.title('Predicted Solution')
-            plt.xlabel('r')
-            plt.ylabel('theta')
+                # Extract x and y coordinates from the reshaped grid
+                X_test = x_train_reshaped[:, :, 0]  # x values
+                Y_test = x_train_reshaped[:, :, 1]  # y values
+                potential = gaussian_potential(X_test, Y_test, sigma=0.1)
 
-            # Analytical solution
-            plt.subplot(1, 3, 2)
-            plt.contourf(r_grid.numpy(), theta_grid.numpy(), u_analytical, levels=50)
-            plt.colorbar()
-            plt.title('Analytical Solution')
-            plt.xlabel('r')
-            plt.ylabel('theta')
+                # Create a figure with two subplots (side by side)
+                fig, ax = plt.subplots(1, 2, figsize=(16, 6))
 
-            # Absolute error
-            plt.subplot(1, 3, 3)
-            plt.contourf(r_grid.numpy(), theta_grid.numpy(), abs_error, levels=50)
-            plt.colorbar()
-            plt.title('Absolute Error')
-            plt.xlabel('r')
-            plt.ylabel('theta')
+                # Plot predicted solution in the first subplot
+                contour1 = ax[0].contourf(X_test, Y_test, u_pred_reshaped, levels=50, cmap='viridis')
+                fig.colorbar(contour1, ax=ax[0])
+                ax[0].set_title(f'Predicted Solution at Epoch {epoch}')
+                ax[0].set_xlabel('x')
+                ax[0].set_ylabel('y')
+                ax[0].grid(True)
 
-            plt.show()
+                # Plot Gaussian potential in the second subplot
+                contour2 = ax[1].contourf(X_test, Y_test, potential, levels=50, cmap='viridis')
+                fig.colorbar(contour2, ax=ax[1])
+                ax[1].set_title('Gaussian Potential V(x, y)')
+                ax[1].set_xlabel('x')
+                ax[1].set_ylabel('y')
+                ax[1].grid(True)
+
+                plt.tight_layout()  # Adjust the layout to avoid overlap
+                plt.show()
+
+            print(f'Epoch {epoch}: Loss = {loss.item():.5e}, Rayleigh Quotient λ = {rayleigh_loss.item():.5f}')
 
 
-# Instantiate and train the model
-model = PINN()
-k = 1.0  # Example wave number
-n = 0  # Mode number
-train_pinn(model, k, n)
+if __name__ == "__main__":
+
+    # Generate 2D training data points in the domain [0, 1] x [0, 1]
+    N_train = 10000
+    x_train = torch.rand(N_train, 2).to(device)
+
+    # Initialize models, eta values, and parameters for the loss functions
+    models = [PINN().to(device) for _ in range(4)]
+    etas = [1, 10, 100, 1000]
+    Bs = [2000, 2000, 2000, 2000]
+    Ns = [1000, 1000, 1000, 1000]
+    epochs_list = [4001, 4001, 4001, 4001]
+
+    # Train the models
+    for model, eta, B, N, epochs in zip(models, etas, Bs, Ns, epochs_list):
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        train_model(model, x_train, epochs, optimizer, eta, B, N)  # Final plot of the predicted solution
