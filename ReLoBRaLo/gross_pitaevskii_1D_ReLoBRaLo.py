@@ -340,6 +340,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return total_loss, data_loss, riesz_energy, pde_loss, norm_loss
 
+
 def initialize_weights(m):
     """
     Initialize the weights of the neural network layers using Xavier uniform initialization.
@@ -388,6 +389,7 @@ def prepare_training_data(N_u, N_f, lb, ub):
 
     return collocation_points, boundary_points, boundary_values
 
+
 def train_pinn(X, N_u, N_f, layers, eta, epochs, model_save_path):
     """
     Train the Physics-Informed Neural Network (PINN) for the 1D Gross-Pitaevskii equation.
@@ -420,7 +422,7 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, model_save_path):
     model = GrossPitaevskiiPINN(layers).to(device)
     model.apply(initialize_weights)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    #scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=50, factor=0.5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
 
     # Prepare training data (collocation and boundary points)
     collocation_points, boundary_points, boundary_values = prepare_training_data(N_u, N_f, lb, ub)
@@ -442,7 +444,11 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, model_save_path):
 
         # Backpropagation and optimization
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Clip gradients
         optimizer.step()
+
+        # Scheduler step (for ReduceLROnPlateau)
+        scheduler.step(loss)
 
         # Record the total loss every 100 epochs
         if epoch % 100 == 0:
@@ -454,6 +460,7 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, model_save_path):
             pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor, model.forward(collocation_points_tensor), eta)
 
     return model, loss_history
+
 
 def normalize_wave_function(u):
     """
@@ -532,8 +539,6 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, model_save_path):
     """
     model = GrossPitaevskiiPINN(layers).to(device)
     model.apply(initialize_weights)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=50, factor=0.5, verbose=True)
 
     # Train the model
     model, loss_history = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, model_save_path=model_save_path)
@@ -593,6 +598,7 @@ def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.
     # Save the plot
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
+
 
 def plot_loss_history(loss_histories, etas, save_path='plots/loss_history.png'):
     """
