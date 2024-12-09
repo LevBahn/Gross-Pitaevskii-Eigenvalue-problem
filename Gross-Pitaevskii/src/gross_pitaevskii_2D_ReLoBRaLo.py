@@ -658,7 +658,7 @@ if __name__ == "__main__":
     # Parameters
     N_u = 500  # Number of boundary points
     N_f = 10000  # Number of collocation points
-    epochs = 10001  # Number of iterations of training
+    epochs = 20001  # Number of iterations of training
     layers = [2, 50, 50, 50, 1]  # Neural network architecture
     etas = [1, 10, 100, 1000]  # Interaction strengths
     grid_resolution = 100  # Resolution for 2D prediction grid
