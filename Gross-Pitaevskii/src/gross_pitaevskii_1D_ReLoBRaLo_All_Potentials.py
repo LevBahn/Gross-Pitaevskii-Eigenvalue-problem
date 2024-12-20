@@ -295,7 +295,80 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return sym_loss
 
-    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, potential_type):
+    def compute_dynamic_weights(self, losses, last_losses, init_losses, lambdas, call_count, alpha, rho, temperature):
+        """
+        Perform Relative Loss Balancing with Random Lookback (ReLoBRaLo) to compute dynamic weights for loss terms.
+
+        Parameters
+        ----------
+        losses : list of torch.Tensor
+            List of current loss values.
+        last_losses : list of float
+            List of loss values from the previous iteration.
+        init_losses : list of float
+            List of initial loss values from the start of training.
+        lambdas : list of float
+            Current values of the dynamic weights.
+        call_count : int
+            Number of times the loss function has been called.
+        alpha : float
+            Exponential weight decay rate. Value between 0 and 1.
+        rho : float
+            Probability of random lookback for balancing. Value between 0 and 1.
+        temperature : float
+            Softmax temperature coefficient controlling the sharpness of the softmax operation.
+
+        Returns
+        -------
+        lambdas : list of float
+            Updated dynamic weights for the loss terms.
+        last_losses : list of float
+            Updated list of loss values for the next iteration.
+
+        Notes
+        -----
+        This function implements the ReLoBRaLo method, which balances the contribution of different loss terms
+        dynamically based on their relative magnitudes and historical values. It uses random lookbacks
+        and exponential smoothing to update the weights.
+        """
+        num_terms = len(losses)
+
+        # Initialize lambdas and histories during the first call
+        if call_count == 0:
+            lambdas = [1.0] * num_terms
+            last_losses = [loss.item() for loss in losses]
+            init_losses = [loss.item() for loss in losses]
+
+        # Compute lambdas_hat (relative to the last losses)
+        lambdas_hat = [
+            losses[i].item() / (last_losses[i] * temperature + 1e-8) for i in range(num_terms)
+        ]
+        lambdas_hat = torch.softmax(torch.tensor(lambdas_hat) - max(lambdas_hat), dim=0).tolist()
+
+        # Compute init_lambdas_hat (relative to the initial losses)
+        init_lambdas_hat = [
+            losses[i].item() / (init_losses[i] * temperature + 1e-8) for i in range(num_terms)
+        ]
+        init_lambdas_hat = torch.softmax(torch.tensor(init_lambdas_hat) - max(init_lambdas_hat), dim=0).tolist()
+
+        # Random lookbacks controlled by rho
+        rho_sample = torch.bernoulli(torch.tensor(rho))
+        alpha_value = alpha if call_count > 1 else (0.0 if call_count == 1 else 1.0)
+
+        # Update lambdas
+        lambdas = [
+            float(rho_sample * alpha_value * lambdas[i] +
+                  (1 - rho_sample) * alpha_value * init_lambdas_hat[i] +
+                  (1 - alpha_value) * lambdas_hat[i])
+            for i in range(num_terms)
+        ]
+
+        # Update loss history
+        last_losses = [loss.item() for loss in losses]
+
+        return lambdas, last_losses
+
+    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type):
         """
         Compute the total loss combining boundary loss, Riesz energy loss,
         PDE loss, L^2 norm regularization loss, and symmetry loss.
@@ -314,6 +387,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Lower bound of interval.
         ub : torch.Tensor
             Upper bound of interval.
+        weights : list
+            Weights for different loss terms.
         potential_type : str
             Type of potential function to use
 
@@ -335,52 +410,35 @@ class GrossPitaevskiiPINN(nn.Module):
         #sym_loss = (sym_loss_collocation + sym_loss_boundary) / 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
-
         # Collect losses in a list
         losses = [data_loss, riesz_energy, pde_loss, norm_loss, sym_loss]
 
-        # Define manual weights for each term (adjust as needed)
-        manual_weights = [500.0, 1.0, 2.0, 100.0, 500]
-
-        # Initialize lambdas and histories
+        # Initialize dynamic weighting variables during the first call
         if self.call_count == 0:
             num_terms = len(losses)
             self.lambdas = [1.0] * num_terms
             self.last_losses = [loss.item() for loss in losses]
             self.init_losses = [loss.item() for loss in losses]
 
-        # Compute lambdas_hat (relative to the last losses)
-        lambdas_hat = [
-            losses[i].item() / (self.last_losses[i] * self.temperature + 1e-8) for i in range(len(losses))
-        ]
-        lambdas_hat = torch.softmax(torch.tensor(lambdas_hat) - max(lambdas_hat), dim=0).tolist()
+        # Use ReLoBRaLo to update dynamic weights
+        self.lambdas, self.last_losses = self.compute_dynamic_weights(
+            losses=losses,
+            last_losses=self.last_losses,
+            init_losses=self.init_losses,
+            lambdas=self.lambdas,
+            call_count=self.call_count,
+            alpha=self.alpha,
+            rho=self.rho,
+            temperature=self.temperature,
+        )
 
-        # Compute init_lambdas_hat (relative to the initial losses)
-        init_lambdas_hat = [
-            losses[i].item() / (self.init_losses[i] * self.temperature + 1e-8) for i in range(len(losses))
-        ]
-        init_lambdas_hat = torch.softmax(torch.tensor(init_lambdas_hat) - max(init_lambdas_hat), dim=0).tolist()
+        # Apply weights to dynamically computed weights
+        weighted_lambdas = [lambda_i * weight for lambda_i, weight in zip(self.lambdas, weights)]
 
-        # Random lookbacks controlled by rho
-        rho = torch.bernoulli(torch.tensor(self.rho))
-        alpha = self.alpha if self.call_count > 1 else (0.0 if self.call_count == 1 else 1.0)
-
-        # Update lambdas
-        self.lambdas = [
-            float(rho * alpha * self.lambdas[i] +
-                  (1 - rho) * alpha * init_lambdas_hat[i] +
-                  (1 - alpha) * lambdas_hat[i])
-            for i in range(len(losses))
-        ]
-
-        # Update loss history
-        self.last_losses = [loss.item() for loss in losses]
-
-        # Apply manual weights to the dynamically computed lambdas
-        weighted_lambdas = [lambda_i * weight for lambda_i, weight in zip(self.lambdas, manual_weights)]
-
-        # Compute total loss
+        # Compute the total loss as a weighted sum
         total_loss = sum(lambda_i * loss for lambda_i, loss in zip(weighted_lambdas, losses))
+
+        # Increment call count
         self.call_count += 1
 
         return total_loss, data_loss, riesz_energy, pde_loss, norm_loss
@@ -435,7 +493,7 @@ def prepare_training_data(N_u, N_f, lb, ub):
     return collocation_points, boundary_points, boundary_values
 
 
-def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potential_type):
+def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type):
     """
     Train the Physics-Informed Neural Network (PINN) for the 1D Gross-Pitaevskii equation.
 
@@ -457,6 +515,8 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potent
         Lower bound of interval.
     ub : int
         Upper bound of interval.
+    weights : list
+        Weights for different loss terms.
     model_save_path : str
         Save path for trained model
     potential_type: str
@@ -493,7 +553,12 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potent
         optimizer.zero_grad()
 
         # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
-        loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor, boundary_points_tensor, boundary_values_tensor, eta, lb_tensor, ub_tensor, potential_type)
+        loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor,
+                                                                              boundary_points_tensor,
+                                                                              boundary_values_tensor,
+                                                                              eta,
+                                                                              lb_tensor, ub_tensor,
+                                                                              weights, potential_type)
 
         # Backpropagation and optimization
         loss.backward()
@@ -556,7 +621,7 @@ def plot_potential_1D(X_test, potential):
     plt.show()
 
 
-def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potential_type):
+def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type):
     """
     Train the Physics-Informed Neural Network (PINN) model and save it.
 
@@ -584,6 +649,8 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_pat
         Lower bound of interval.
     ub : int
         Upper bound of interval.
+    weights : list
+        Weights for different loss terms.
     model_save_path : str
         File name to save the trained model weights (e.g., 'model_eta_1.pth').
     potential_type: str
@@ -600,7 +667,8 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_pat
     model.apply(initialize_weights)
 
     # Train the model
-    model, loss_history = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub, model_save_path=model_save_path, potential_type=potential_type)
+    model, loss_history = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
+                                     weights=weights, model_save_path=model_save_path, potential_type=potential_type)
 
     # Directory to save the models
     model_save_dir = 'models'
@@ -709,7 +777,7 @@ if __name__ == "__main__":
     # Parameters
     N_u = 100  # Number of boundary points
     N_f = 2000  # Number of collocation points
-    epochs = 20001 # Number of iterations of training
+    epochs = 2001 # Number of iterations of training
     layers = [1, 50, 50, 50, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
@@ -718,7 +786,11 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
     etas = [1, 10, 100, 1000]  # Interaction strengths
 
-    potential_types = ['gaussian', 'double_well', 'harmonic', 'box', 'periodic', 'linear', 'step', 'sine']
+    # Weights for loss terms
+    weights = [500.0, 1.0, 2.0, 100.0, 500.0]
+
+    #potential_types = ['gaussian', 'double_well', 'harmonic', 'box', 'periodic', 'linear', 'step', 'sine']
+    potential_types = ['gaussian', 'double_well', 'harmonic','periodic']
 
     # Loop through each potential type
     for potential_type in potential_types:
@@ -728,7 +800,8 @@ if __name__ == "__main__":
         loss_histories = []
         for eta in etas:
             model_save_path = f"trained_model_eta_{eta}.pth"
-            model, loss_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub, model_save_path=model_save_path, potential_type=potential_type)
+            model, loss_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
+                                                      weights=weights, model_save_path=model_save_path, potential_type=potential_type)
             models.append(model)
             loss_histories.append(loss_history)
 
