@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -54,8 +55,10 @@ class GrossPitaevskiiPINN(nn.Module):
         self.rho = rho
         self.call_count = 0  # Track the number of forward calls
 
-        # Initialize loss tracking variables
-        self.loss_history = {'data': [], 'riesz': [], 'pde': [], 'norm': [], 'symmetry': []}
+        # Initialize dynamic weights and loss history
+        self.lambdas = [1.0] * 5  # For boundary, PDE, riesz, symmetry, and normalization losses
+        self.last_losses = [1.0] * 5
+        self.init_losses = [1.0] * 5
 
     def build_network(self):
         """
@@ -123,7 +126,7 @@ class GrossPitaevskiiPINN(nn.Module):
             V = 0.5 * omega ** 2 * x ** 2
 
         elif potential_type == "double_well":
-            a = kwargs.get('a', 1.0)  # Quartic coefficient
+            a = kwargs.get('a', 0.5)  # Quartic coefficient
             b = kwargs.get('b', 1.0)  # Quadratic coefficient
             V = a * x ** 4 - b * x ** 2
 
@@ -154,6 +157,29 @@ class GrossPitaevskiiPINN(nn.Module):
             raise ValueError(f"Unknown potential type: {potential_type}")
 
         return V
+
+    def compute_potential_gradient(self, x, potential_type, **kwargs):
+        """
+        Compute the gradient of the potential function.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of spatial coordinates.
+        potential_type : str
+            Type of potential.
+        kwargs : dict
+            Additional parameters for the potential.
+
+        Returns
+        -------
+        torch.Tensor
+            Gradient of the potential at each point.
+        """
+        V = self.compute_potential(x, potential_type, **kwargs)
+        V_grad = torch.autograd.grad(outputs=V, inputs=x, grad_outputs=torch.ones_like(V),
+                                     create_graph=True, retain_graph=True)[0]
+        return V_grad
 
     def boundary_loss(self, boundary_points, boundary_values):
         """
@@ -282,7 +308,8 @@ class GrossPitaevskiiPINN(nn.Module):
             The mean squared error enforcing symmetry u(x) = u(1-x).
         """
         # Reflect points across the center of the domain
-        x_reflected = (lb + ub) - collocation_points
+        #x_reflected = (lb + ub) - collocation_points
+        x_reflected = -collocation_points  # Changed from 1-x to -x for even symmetry in double well
 
         # Predict u(x) and u(1-x) using the model
         u_original = self.forward(collocation_points)
@@ -293,44 +320,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return sym_loss
 
-    def compute_relo_bralo_balancing(self, loss_terms, tau=1.0, k=5):
-        """
-        Compute the ReLoBRaLo balancing scaling factors with stability improvements.
-
-        Parameters
-        ----------
-        loss_terms : list of torch.Tensor
-            List of individual loss terms (e.g., data loss, Riesz energy, PDE loss, etc.).
-        tau : float, optional
-            Temperature parameter for scaling, default is 1.0.
-        k : int, optional
-            Number of loss terms, default is 5.
-
-        Returns
-        -------
-        lambda_bal : list of torch.Tensor
-            Scaled balancing factors for each loss term.
-        """
-        loss_values = [torch.clamp(torch.mean(loss), min=1e-8) for loss in loss_terms]
-        loss_prev = [self.loss_history[key][-1] if self.loss_history[key] else None for key in
-                     ['data', 'riesz', 'pde', 'norm', 'symmetry']]
-
-        lambda_bal = []
-        for i in range(k):
-            if loss_prev[i] is None:
-                # Normalize against itself in the first iteration
-                lambda_i_bal = torch.exp(torch.clamp(loss_values[i] / (tau * loss_values[i]), max=50)) / \
-                               sum([torch.exp(torch.clamp(l / (tau * l), max=50)) for l in loss_values])
-            else:
-                # Use historical losses for balancing
-                lambda_i_bal = torch.exp(torch.clamp(loss_values[i] / (tau * loss_prev[i]), max=50)) / \
-                               sum([torch.exp(torch.clamp(l / (tau * loss_prev[i]), max=50)) for l in loss_values])
-
-            lambda_bal.append(lambda_i_bal)
-
-        return lambda_bal
-
-    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, potential_type):
+    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type):
         """
         Compute the total loss combining boundary loss, Riesz energy loss,
         PDE loss, L^2 norm regularization loss, and symmetry loss.
@@ -349,6 +339,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Lower bound of interval.
         ub : torch.Tensor
             Upper bound of interval.
+        weights : list
+            Weights for different loss terms.
         potential_type : str
             Type of potential function to use
 
@@ -363,28 +355,54 @@ class GrossPitaevskiiPINN(nn.Module):
         riesz_energy = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type)
         pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type)
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
-
-        # Symmetry loss for collocation and boundary points
-        #sym_loss_collocation = self.symmetry_loss(collocation_points)
-        #sym_loss_boundary = self.symmetry_loss(boundary_points)
-        #sym_loss = (sym_loss_collocation + sym_loss_boundary) / 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
-        # Collect all losses into a list
-        loss_terms = [data_loss, riesz_energy, pde_loss, norm_loss, sym_loss]
+        # All losses
+        losses = [data_loss, riesz_energy, pde_loss, norm_loss, sym_loss]
 
-        # Compute ReLoBRaLo scaling factors
-        lambda_bal = self.compute_relo_bralo_balancing(loss_terms)
+        # # Initialize lambdas and histories
+        # if self.call_count == 0:
+        #     num_terms = len(losses)
+        #     self.lambdas = [1.0] * num_terms
+        #     self.last_losses = [loss.item() for loss in losses]
+        #     self.init_losses = [loss.item() for loss in losses]
+        #
+        # # Compute lambdas_hat (relative to the last losses)
+        # lambdas_hat = [
+        #     losses[i].item() / (self.last_losses[i] * self.temperature + 1e-8) for i in range(len(losses))
+        # ]
+        # lambdas_hat = torch.softmax(torch.tensor(lambdas_hat) - max(lambdas_hat), dim=0).tolist()
+        #
+        # # Compute init_lambdas_hat (relative to the initial losses)
+        # init_lambdas_hat = [
+        #     losses[i].item() / (self.init_losses[i] * self.temperature + 1e-8) for i in range(len(losses))
+        # ]
+        # init_lambdas_hat = torch.softmax(torch.tensor(init_lambdas_hat) - max(init_lambdas_hat), dim=0).tolist()
+        #
+        # # Random lookbacks controlled by rho
+        # rho = torch.bernoulli(torch.tensor(self.rho))
+        # alpha = self.alpha if self.call_count > 1 else (0.0 if self.call_count == 1 else 1.0)
+        #
+        # # Update lambdas
+        # self.lambdas = [
+        #     float(rho * alpha * self.lambdas[i] +
+        #           (1 - rho) * alpha * init_lambdas_hat[i] +
+        #           (1 - alpha) * lambdas_hat[i])
+        #     for i in range(len(losses))
+        # ]
+        #
+        # # Update loss history
+        # self.last_losses = [loss.item() for loss in losses]
+        #
+        # # Apply manual weights to the dynamically computed lambdas
+        # weighted_lambdas = [lambda_i * weight for lambda_i, weight in zip(self.lambdas, weights)]
+        #
+        # # Compute total loss
+        # total_loss = sum(lambda_i * loss for lambda_i, loss in zip(weighted_lambdas, losses))
+        # self.call_count += 1
 
-        # Compute total loss with dynamic scaling
-        total_loss = sum(lambda_bal[i] * loss_terms[i] for i in range(len(loss_terms)))
-
-        # Update loss history
-        self.loss_history['data'].append(data_loss.item())
-        self.loss_history['riesz'].append(riesz_energy.item())
-        self.loss_history['pde'].append(pde_loss.item())
-        self.loss_history['norm'].append(norm_loss.item())
-        self.loss_history['symmetry'].append(sym_loss.item())
+        # Weighted total loss
+        total_loss = sum(w * loss for w, loss in zip(weights, losses))
 
         return total_loss, data_loss, riesz_energy, pde_loss, norm_loss
 
@@ -438,7 +456,57 @@ def prepare_training_data(N_u, N_f, lb, ub):
     return collocation_points, boundary_points, boundary_values
 
 
-def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potential_type):
+def prepare_training_data_adaptive(N_u, N_f, lb, ub, potential_type, model):
+    """
+    Prepare boundary and collocation points with adaptive sampling for regions with steep gradients.
+
+    Parameters
+    ----------
+    N_u : int
+        Number of boundary points.
+    N_f : int
+        Number of collocation points.
+    lb : float
+        Lower bound of the domain.
+    ub : float
+        Upper bound of the domain.
+    potential_type : str
+        Type of potential function.
+    model : GrossPitaevskiiPINN
+        Model to compute the potential.
+
+    Returns
+    -------
+    collocation_points : np.ndarray
+        Collocation points, focused on regions with steep potential gradients.
+    boundary_points : np.ndarray
+        Boundary points.
+    boundary_values : np.ndarray
+        Boundary values.
+    """
+    # Generate uniformly distributed points in the domain
+    X_uniform = np.random.rand(N_f * 10, 1) * (ub - lb) + lb
+    X_uniform_tensor = torch.tensor(X_uniform, dtype=torch.float32, requires_grad=True).to(device)
+
+    # Compute potential gradient
+    potential_grad = model.compute_potential_gradient(X_uniform_tensor, potential_type)
+    grad_magnitude = torch.abs(potential_grad).detach().cpu().numpy()
+
+    # Normalize gradient magnitude to a probability distribution
+    grad_magnitude = grad_magnitude.flatten()
+    prob_distribution = grad_magnitude / grad_magnitude.sum()
+
+    # Resample points based on the probability distribution
+    indices = np.random.choice(np.arange(len(X_uniform)), size=N_f, p=prob_distribution)
+    collocation_points = X_uniform[indices]
+
+    # Boundary points and values
+    boundary_points = np.array([[lb], [ub]])
+    boundary_values = np.zeros((2, 1))
+
+    return collocation_points, boundary_points, boundary_values
+
+def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type):
     """
     Train the Physics-Informed Neural Network (PINN) for the 1D Gross-Pitaevskii equation.
 
@@ -460,6 +528,8 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potent
         Lower bound of interval.
     ub : int
         Upper bound of interval.
+    weights : list
+        Weights for different loss terms.
     model_save_path : str
         Save path for trained model
     potential_type: str
@@ -479,7 +549,10 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potent
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
 
     # Prepare training data (collocation and boundary points)
-    collocation_points, boundary_points, boundary_values = prepare_training_data(N_u, N_f, lb, ub)
+    #collocation_points, boundary_points, boundary_values = prepare_training_data(N_u, N_f, lb, ub)
+    collocation_points, boundary_points, boundary_values = prepare_training_data_adaptive(
+        N_u, N_f, lb, ub, potential_type, model
+    )
 
     # Convert data to PyTorch tensors and move to device
     collocation_points_tensor = torch.tensor(collocation_points, dtype=torch.float32, requires_grad=True).to(device)
@@ -496,7 +569,12 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potent
         optimizer.zero_grad()
 
         # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
-        loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor, boundary_points_tensor, boundary_values_tensor, eta, lb_tensor, ub_tensor, potential_type)
+        loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor,
+                                                                              boundary_points_tensor,
+                                                                              boundary_values_tensor,
+                                                                              eta,
+                                                                              lb_tensor, ub_tensor,
+                                                                              weights, potential_type)
 
         # Backpropagation and optimization
         loss.backward()
@@ -559,7 +637,7 @@ def plot_potential_1D(X_test, potential):
     plt.show()
 
 
-def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_path, potential_type):
+def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type):
     """
     Train the Physics-Informed Neural Network (PINN) model and save it.
 
@@ -587,6 +665,8 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_pat
         Lower bound of interval.
     ub : int
         Upper bound of interval.
+    weights : list
+        Weights for different loss terms.
     model_save_path : str
         File name to save the trained model weights (e.g., 'model_eta_1.pth').
     potential_type: str
@@ -603,7 +683,8 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, model_save_pat
     model.apply(initialize_weights)
 
     # Train the model
-    model, loss_history = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub, model_save_path=model_save_path, potential_type=potential_type)
+    model, loss_history = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
+                                     weights=weights, model_save_path=model_save_path, potential_type=potential_type)
 
     # Directory to save the models
     model_save_dir = 'models'
@@ -710,10 +791,10 @@ def plot_loss_history(loss_histories, etas, save_path='plots/loss_history.png', 
 
 if __name__ == "__main__":
     # Parameters
-    N_u = 100  # Number of boundary points
-    N_f = 2000  # Number of collocation points
-    epochs = 20001 # Number of iterations of training
-    layers = [1, 50, 50, 50, 1]  # Neural network architecture
+    N_u = 400  # Number of boundary points
+    N_f = 8000  # Number of collocation points
+    epochs = 10001  # Number of iterations of training
+    layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
 
@@ -721,7 +802,11 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
     etas = [1, 10, 100, 1000]  # Interaction strengths
 
-    potential_types = ['gaussian', 'double_well', 'harmonic', 'box', 'periodic', 'linear', 'step', 'sine']
+    # Weights for loss terms
+    weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+
+    #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
+    potential_types = ['double_well']
 
     # Loop through each potential type
     for potential_type in potential_types:
@@ -731,7 +816,8 @@ if __name__ == "__main__":
         loss_histories = []
         for eta in etas:
             model_save_path = f"trained_model_eta_{eta}.pth"
-            model, loss_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub, model_save_path=model_save_path, potential_type=potential_type)
+            model, loss_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
+                                                      weights=weights, model_save_path=model_save_path, potential_type=potential_type)
             models.append(model)
             loss_histories.append(loss_history)
 
