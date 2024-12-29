@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -125,7 +126,7 @@ class GrossPitaevskiiPINN(nn.Module):
             V = 0.5 * omega ** 2 * x ** 2
 
         elif potential_type == "double_well":
-            a = kwargs.get('a', 1.0)  # Quartic coefficient
+            a = kwargs.get('a', 0.1)  # Quartic coefficient
             b = kwargs.get('b', 1.0)  # Quadratic coefficient
             V = a * x ** 4 - b * x ** 2
 
@@ -151,6 +152,14 @@ class GrossPitaevskiiPINN(nn.Module):
             a = kwargs.get('a', 0.5)  # Center of the sine potential
             l = kwargs.get('l', 1.0)  # Length scale for sine potential
             V = torch.sin(torch.pi * (x - (a - l / 2)) / l)
+
+        elif potential_type == "quasi_periodic":
+            V0 = kwargs.get('V0', 1.0)  # Amplitude of the first cosine term
+            V1 = kwargs.get('V1', 0.5)  # Amplitude of the second cosine term
+            alpha = kwargs.get('alpha', 2 * np.pi)  # Frequency of the first cosine term
+            beta = kwargs.get('beta',
+                              2 * np.pi * ((1 + np.sqrt(5)) / 2))  # Frequency of the second cosine term (golden ratio)
+            V = V0 * torch.cos(alpha * x) + V1 * torch.cos(beta * x)
 
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
@@ -375,6 +384,9 @@ class GrossPitaevskiiPINN(nn.Module):
         # Compute total loss
         total_loss = sum(lambda_i * loss for lambda_i, loss in zip(weighted_lambdas, losses))
         self.call_count += 1
+
+        # Weighted total loss
+        #total_loss = sum(w * loss for w, loss in zip(weights, losses))
 
         return total_loss, data_loss, riesz_energy, pde_loss, norm_loss
 
@@ -710,10 +722,10 @@ def plot_loss_history(loss_histories, etas, save_path='plots/loss_history.png', 
 
 if __name__ == "__main__":
     # Parameters
-    N_u = 100  # Number of boundary points
-    N_f = 2000  # Number of collocation points
-    epochs = 10001 # Number of iterations of training
-    layers = [1, 50, 50, 50, 1]  # Neural network architecture
+    N_u = 200  # Number of boundary points
+    N_f = 4000  # Number of collocation points
+    epochs = 20001  # Number of iterations of training
+    layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
 
@@ -722,9 +734,11 @@ if __name__ == "__main__":
     etas = [1, 10, 100, 1000]  # Interaction strengths
 
     # Weights for loss terms
-    weights = [500.0, 1.0, 2.0, 100.0, 500.0]
+    #weights = [50.0, 1.0, 2.0, 10.0, 50.0]
+    weights = [1.0, 1.0, 1.0, 1.0, 1.0]
 
-    potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
+    #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
+    potential_types = ['quasi_periodic']
 
     # Loop through each potential type
     for potential_type in potential_types:
