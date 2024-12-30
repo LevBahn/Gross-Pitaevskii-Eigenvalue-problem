@@ -74,6 +74,8 @@ class GrossPitaevskiiPINN(nn.Module):
             layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
             if i < len(self.layers) - 2:
                 layers.append(nn.Tanh())
+                layers.append(nn.Dropout(p=0.2))  # Dropout with 20% rate
+                layers.append(nn.BatchNorm1d(self.layers[i + 1]))  # BatchNorm
         return nn.Sequential(*layers)
 
     def forward(self, inputs):
@@ -94,7 +96,8 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def compute_potential(self, x, potential_type="gaussian", **kwargs):
         """
-        Compute a symmetric or asymmetric potential function for the 1D domain.
+        Compute a symmetric potential function for the 1D domain.
+        Enforces symmetry about x = 0 for all potential types.
 
         Parameters
         ----------
@@ -117,49 +120,50 @@ class GrossPitaevskiiPINN(nn.Module):
         ValueError
             If the potential type is not recognized.
         """
+        x_abs = torch.abs(x)  # Enforce symmetry by considering only |x|
+
         if potential_type == "gaussian":
-            a = kwargs.get('a', 0.5)  # Center of the Gaussian
-            V = torch.exp(-(x - a) ** 2)
+            a = kwargs.get('a', 0.5)  # Spread of the Gaussian
+            V = torch.exp(-x_abs ** 2 / (2 * a ** 2))
 
         elif potential_type == "harmonic":
             omega = kwargs.get('omega', 1.0)  # Frequency for harmonic potential
-            V = 0.5 * omega ** 2 * x ** 2
+            V = 0.5 * omega ** 2 * x_abs ** 2
 
         elif potential_type == "double_well":
             a = kwargs.get('a', 0.1)  # Quartic coefficient
             b = kwargs.get('b', 1.0)  # Quadratic coefficient
-            V = a * x ** 4 - b * x ** 2
+            V = a * x_abs ** 4 - b * x_abs ** 2
 
         elif potential_type == "box":
             L = kwargs.get('L', 10.0)  # Length of the box
-            V = torch.where(torch.abs(x) <= L / 2, torch.tensor(0.0), torch.tensor(float('inf')))
+            V = torch.where(x_abs <= L / 2, torch.tensor(0.0), torch.tensor(float('inf')))
 
         elif potential_type == "periodic":
             V0 = kwargs.get('V0', 1.0)  # Depth of the potential
             k = kwargs.get('k', 2 * np.pi / 5.0)  # Wave number for periodic potential
-            V = V0 * torch.cos(k * x) ** 2
+            V = V0 * torch.cos(k * x_abs) ** 2
 
         elif potential_type == "linear":
             F = kwargs.get('F', 1.0)  # Force constant for linear potential
-            V = F * x
+            V = F * x_abs
 
         elif potential_type == "step":
             V0 = kwargs.get('V0', 1.0)  # Step height
             x0 = kwargs.get('x0', 0.0)  # Position of the step
-            V = torch.where(x > x0, torch.tensor(V0), torch.tensor(0.0))
+            V = torch.where(x_abs > x0, torch.tensor(V0), torch.tensor(0.0))
 
         elif potential_type == "sine":
-            a = kwargs.get('a', 0.5)  # Center of the sine potential
             l = kwargs.get('l', 1.0)  # Length scale for sine potential
-            V = torch.sin(torch.pi * (x - (a - l / 2)) / l)
+            V = torch.sin(torch.pi * x_abs / l)
 
         elif potential_type == "quasi_periodic":
             V0 = kwargs.get('V0', 1.0)  # Amplitude of the first cosine term
             V1 = kwargs.get('V1', 0.5)  # Amplitude of the second cosine term
             alpha = kwargs.get('alpha', 2 * np.pi)  # Frequency of the first cosine term
             beta = kwargs.get('beta',
-                              2 * np.pi * ((1 + np.sqrt(5)) / 2))  # Frequency of the second cosine term (golden ratio)
-            V = V0 * torch.cos(alpha * x) + V1 * torch.cos(beta * x)
+                              2 * np.pi * ((1 + np.sqrt(5)) / 2))  # Frequency of the second cosine term
+            V = V0 * torch.cos(alpha * x_abs) + V1 * torch.cos(beta * x_abs)
 
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
@@ -276,7 +280,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def symmetry_loss(self, collocation_points, lb, ub):
         """
-        Compute the symmetry loss to enforce u(x) = u(1-x).
+        Compute the symmetry loss to enforce u(x) = u((a+b)-x).
 
         Parameters
         ----------
@@ -290,18 +294,17 @@ class GrossPitaevskiiPINN(nn.Module):
         Returns
         -------
         sym_loss : torch.Tensor
-            The mean squared error enforcing symmetry u(x) = u(1-x).
+            The mean squared error enforcing symmetry u(x) = u((a+b)-x).
         """
         # Reflect points across the center of the domain
         x_reflected = (lb + ub) - collocation_points
 
-        # Predict u(x) and u(1-x) using the model
+        # Evaluate u(x) and u((a+b)-x)
         u_original = self.forward(collocation_points)
         u_reflected = self.forward(x_reflected)
 
-        # Compute mean squared difference to enforce symmetry
+        # Compute MSE to enforce symmetry
         sym_loss = torch.mean((u_original - u_reflected) ** 2)
-
         return sym_loss
 
     def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type):
@@ -341,8 +344,11 @@ class GrossPitaevskiiPINN(nn.Module):
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
-        # All losses
-        losses = [data_loss, riesz_energy, pde_loss, norm_loss, sym_loss]
+        # Scaling factor for pde loss and riesz energy loss
+        domain_length = ub - lb
+
+        # All losses with sacling factor
+        losses = [data_loss, riesz_energy / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
 
         # Initialize lambdas and histories
         if self.call_count == 0:
@@ -722,9 +728,9 @@ def plot_loss_history(loss_histories, etas, save_path='plots/loss_history.png', 
 
 if __name__ == "__main__":
     # Parameters
-    N_u = 200  # Number of boundary points
+    N_u = 400  # Number of boundary points
     N_f = 4000  # Number of collocation points
-    epochs = 20001  # Number of iterations of training
+    epochs = 2001  # Number of iterations of training
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
@@ -737,8 +743,8 @@ if __name__ == "__main__":
     #weights = [50.0, 1.0, 2.0, 10.0, 50.0]
     weights = [1.0, 1.0, 1.0, 1.0, 1.0]
 
-    #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
-    potential_types = ['quasi_periodic']
+    potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
+    #potential_types = ['quasi_periodic']
 
     # Loop through each potential type
     for potential_type in potential_types:
