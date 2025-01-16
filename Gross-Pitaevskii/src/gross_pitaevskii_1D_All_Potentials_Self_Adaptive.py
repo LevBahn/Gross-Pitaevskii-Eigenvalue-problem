@@ -151,8 +151,8 @@ class GrossPitaevskiiPINN(nn.Module):
             V = 0.5 * omega ** 2 * x_abs ** 2
 
         elif potential_type == "double_well":
-            a = kwargs.get('a', 0.1)  # Quartic coefficient
-            b = kwargs.get('b', 1.0)  # Quadratic coefficient
+            a = kwargs.get('a', 1.0)  # Quartic coefficient
+            b = kwargs.get('b', 0.5)  # Quadratic coefficient
             V = a * x_abs ** 4 - b * x_abs ** 2
 
         elif potential_type == "periodic":
@@ -721,6 +721,24 @@ if __name__ == "__main__":
     weights = [1.0, 1.0, 1.0, 1.0, 1.0]
 
     potential_types = ['double_well', 'harmonic']
+
+    # Plot double well
+
+    # Generate test points
+    X_test = np.linspace(lb, ub, 500).reshape(-1, 1)  # Test points for potential
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)  # Convert to tensor
+
+    # Parameters for double-well potential
+    a = 1  # Quartic coefficient
+    b = 0.5 # Quadratic coefficient
+
+    # Compute the double-well potential
+    model = GrossPitaevskiiPINN([1, 100, 100, 100, 1])  # Placeholder model
+    potential_tensor = model.compute_potential(X_test_tensor, potential_type="quasi_periodic", a=a, b=b)
+    potential = -potential_tensor.detach().numpy()  # Convert to NumPy for plotting
+
+    # Plot the potential
+    plot_potential_1D(X_test, potential)
 
     # Loop through each potential type
     for potential_type in potential_types:
