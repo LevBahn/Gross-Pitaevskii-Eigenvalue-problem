@@ -12,7 +12,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class GrossPitaevskiiPINN(nn.Module):
     """
-    Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
+    Physics-Informed Neural Network (PINN) for solving the 2D Gross-Pitaevskii Equation.
     """
 
     def __init__(self, layers, hbar=1.0, m=1.0, g=100.0, alpha=0.999, temperature=1., rho=0.9999):
