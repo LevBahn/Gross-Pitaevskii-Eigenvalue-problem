@@ -279,7 +279,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def symmetry_loss(self, collocation_points, lb, ub):
         """
-        Compute the symmetry loss to enforce u(x) = u(1-x).
+        Compute the symmetry loss to enforce u(x) = u((a+b)-x).
 
         Parameters
         ----------
@@ -293,18 +293,17 @@ class GrossPitaevskiiPINN(nn.Module):
         Returns
         -------
         sym_loss : torch.Tensor
-            The mean squared error enforcing symmetry u(x) = u(1-x).
+            The mean squared error enforcing symmetry u(x) = u((a+b)-x).
         """
         # Reflect points across the center of the domain
         x_reflected = (lb + ub) - collocation_points
 
-        # Predict u(x) and u(1-x) using the model
+        # Evaluate u(x) and u((a+b)-x)
         u_original = self.forward(collocation_points)
         u_reflected = self.forward(x_reflected)
 
-        # Compute mean squared difference to enforce symmetry
+        # Compute MSE to enforce symmetry
         sym_loss = torch.mean((u_original - u_reflected) ** 2)
-
         return sym_loss
 
     def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
