@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -16,7 +15,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, g=100.0, alpha=0.999, temperature=1., rho=0.9999):
+    def __init__(self, layers, hbar=1.0, m=1.0, g=100.0):
         """
         Parameters
         ----------
@@ -116,8 +115,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def compute_potential(self, x, potential_type="gaussian", **kwargs):
         """
-        Compute a symmetric potential function for the 1D domain.
-        Enforces symmetry about x = 0 for all potential types.
+        Compute a symmetric or asymmetric potential function for the 1D domain.
 
         Parameters
         ----------
@@ -140,42 +138,68 @@ class GrossPitaevskiiPINN(nn.Module):
         ValueError
             If the potential type is not recognized.
         """
-        x_abs = torch.abs(x)  # Enforce symmetry by considering only |x|
-
         if potential_type == "gaussian":
-            a = kwargs.get('a', 0)  # Spread of the Gaussian
-            V = torch.exp(-x_abs ** 2 / (2 * a ** 2))
+            a = kwargs.get('a', 0.0)  # Center of the Gaussian
+            V = torch.exp(-(x - a) ** 2)
 
         elif potential_type == "harmonic":
             omega = kwargs.get('omega', 1.0)  # Frequency for harmonic potential
-            V = 0.5 * omega ** 2 * x_abs ** 2
+            V = 0.5 * omega ** 2 * x ** 2
 
         elif potential_type == "double_well":
             a = kwargs.get('a', 1.0)  # Quartic coefficient
-            b = kwargs.get('b', 0.5)  # Quadratic coefficient
-            V = a * x_abs ** 4 - b * x_abs ** 2
+            b = kwargs.get('b', 1.0)  # Quadratic coefficient
+            V = a * x ** 4 - b * x ** 2
+
+        elif potential_type == "box":
+            L = kwargs.get('L', 10.0)  # Length of the box
+            V = torch.where(torch.abs(x) <= L / 2, torch.tensor(0.0), torch.tensor(float('inf')))
 
         elif potential_type == "periodic":
             V0 = kwargs.get('V0', 1.0)  # Depth of the potential
             k = kwargs.get('k', 2 * np.pi / 5.0)  # Wave number for periodic potential
-            V = V0 * torch.cos(k * x_abs) ** 2
+            V = V0 * torch.cos(k * x) ** 2
+
+        elif potential_type == "linear":
+            F = kwargs.get('F', 1.0)  # Force constant for linear potential
+            V = F * x
+
+        elif potential_type == "step":
+            V0 = kwargs.get('V0', 1.0)  # Step height
+            x0 = kwargs.get('x0', 0.0)  # Position of the step
+            V = torch.where(x > x0, torch.tensor(V0), torch.tensor(0.0))
 
         elif potential_type == "sine":
+            a = kwargs.get('a', 0.5)  # Center of the sine potential
             l = kwargs.get('l', 1.0)  # Length scale for sine potential
-            V = torch.sin(torch.pi * x_abs / l)
-
-        elif potential_type == "quasi_periodic":
-            V0 = kwargs.get('V0', 1.0)  # Amplitude of the first cosine term
-            V1 = kwargs.get('V1', 0.5)  # Amplitude of the second cosine term
-            alpha = kwargs.get('alpha', 2 * np.pi)  # Frequency of the first cosine term
-            beta = kwargs.get('beta',
-                              2 * np.pi * ((1 + np.sqrt(5)) / 2))  # Frequency of the second cosine term
-            V = V0 * torch.cos(alpha * x_abs) + V1 * torch.cos(beta * x_abs)
+            V = torch.sin(torch.pi * (x - (a - l / 2)) / l)
 
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
 
         return V
+
+    def compute_thomas_fermi_approx(self, inputs, potential, eta):
+        """
+        Calculate the Thomas–Fermi approximation for the given potential.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            Spatial coordinates.
+        potential : torch.Tensor
+            Potential values corresponding to the spatial coordinates.
+        eta : float
+            Interaction strength.
+
+        Returns
+        -------
+        torch.Tensor
+            Thomas–Fermi approximation of the wave function.
+        """
+        epsilon = torch.max(potential) + eta
+        tf_approx = torch.sqrt(torch.relu((epsilon - potential) / eta))
+        return tf_approx
 
     def boundary_loss(self, boundary_points, boundary_values):
         """
@@ -196,7 +220,7 @@ class GrossPitaevskiiPINN(nn.Module):
         u_pred = self.forward(boundary_points)
         return torch.mean((u_pred - boundary_values) ** 2)
 
-    def riesz_loss(self, predictions, inputs, eta, potential_type):
+    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -210,6 +234,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
+        V : torch.Tensor
+            Precomputed potential. Default is None.
 
         Returns
         -------
@@ -225,7 +251,10 @@ class GrossPitaevskiiPINN(nn.Module):
                                   create_graph=True, retain_graph=True)[0]
 
         laplacian_term = torch.mean(u_x ** 2)  # Kinetic term
-        V = self.compute_potential(inputs, potential_type)
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
         potential_term = torch.mean(V * u ** 2)  # Potential term
         interaction_term = 0.5 * eta * torch.mean(u ** 4)  # Interaction term
 
@@ -233,7 +262,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions, eta, potential_type):
+    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -247,6 +276,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
 
         Returns
         -------
@@ -263,10 +294,17 @@ class GrossPitaevskiiPINN(nn.Module):
         u_xx = grad(u_x, inputs, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
 
         # Compute λ from the energy functional
-        V = self.compute_potential(inputs, potential_type)
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
         lambda_pde = torch.mean(u_x ** 2 + V * u ** 2 + eta * u ** 4) / torch.mean(u ** 2)
 
         # Residual of the 1D Gross-Pitaevskii equation
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
         pde_residual = -u_xx + V * u + eta * torch.abs(u ** 2) * u - lambda_pde * u
 
         # Regularization: See https://arxiv.org/abs/2010.05075
@@ -314,7 +352,8 @@ class GrossPitaevskiiPINN(nn.Module):
         sym_loss = torch.mean((u_original - u_reflected) ** 2)
         return sym_loss
 
-    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type):
+    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
+                   precomputed_potential=None):
         """
         Compute the total loss combining boundary loss, Riesz energy loss,
         PDE loss, L^2 norm regularization loss, and symmetry loss.
@@ -337,6 +376,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Weights for different loss terms.
         potential_type : str
             Type of potential function to use
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
 
         Returns
         -------
@@ -350,22 +391,28 @@ class GrossPitaevskiiPINN(nn.Module):
         boundary_points = boundary_points.to(device)
         boundary_values = boundary_values.to(device)
 
+        # Use precomputed potential if provided
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(collocation_points, potential_type)
+
         # Compute individual loss components
         data_loss = self.boundary_loss(boundary_points, boundary_values)
-        riesz_energy = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type)
-        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type)
+        riesz_energy = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type, V)
+        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V)
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
         # Scaling factor for pde loss and riesz energy loss
         domain_length = ub - lb
 
-        # Apply self-adaptive weights to individual points
+        # Apply self-adaptive weights to individual points - mean of boundary loss, pde loss, riesz loss, and symmetry loss?
         weighted_data_loss = torch.mean(self.mask_function(self.lambda_points_b) * data_loss)
         weighted_riesz_energy = torch.mean(self.mask_function(self.lambda_points_r) * (riesz_energy / domain_length))
-        weighted_pde_loss = self.mask_function(self.lambda_pde) * (pde_loss / domain_length)
+        weighted_pde_loss = torch.mean(self.mask_function(self.lambda_pde) * (pde_loss / domain_length))
         weighted_norm_loss = self.mask_function(self.lambda_norm) * norm_loss
-        weighted_sym_loss = self.mask_function(self.lambda_s) * sym_loss
+        weighted_sym_loss = torch.mean(self.mask_function(self.lambda_s) * sym_loss)
 
         # Total loss
         total_loss = (weighted_data_loss + weighted_riesz_energy +
@@ -476,6 +523,14 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
     lb_tensor = torch.tensor(lb, dtype=torch.float32).to(device)
     ub_tensor = torch.tensor(ub, dtype=torch.float32).to(device)
 
+    # Precompute potential
+    V = model.compute_potential(collocation_points_tensor, potential_type).detach()
+    V.requires_grad = False
+
+    # Precompute Thomas-Fermi approximation
+    # tf_approx = model.compute_thomas_fermi_approx(collocation_points_tensor, V, eta).detach()
+    # tf_approx.requires_grad = False
+
     loss_history = []
 
     # Training loop
@@ -489,7 +544,7 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
                                                                               boundary_values_tensor,
                                                                               eta,
                                                                               lb_tensor, ub_tensor,
-                                                                              weights, potential_type)
+                                                                              weights, potential_type, V)
 
         # Backpropagation, adaptive weight update, and optimization
         loss.backward()
@@ -641,14 +696,31 @@ def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.
     for model, eta in zip(models, etas):
         model.eval()  # Set the model to evaluation mode
 
+        # Prepare test data
         X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
         u_pred = model(X_test_tensor).detach().cpu().numpy()
         u_pred_normalized = normalize_wave_function(u_pred)
-        plt.plot(X_test, u_pred_normalized, label=f'Predicted Solution ($\\eta$ ≈ {eta})')
 
-    plt.title(f'Ground State Solution by PINN {potential_type.capitalize()} Potential', fontsize="xx-large")
-    plt.xlabel('x', fontsize="xx-large")
-    plt.ylabel('u(x)', fontsize="xx-large")
+        # Calculate the potential
+        potential = model.compute_potential(torch.tensor(X_test, dtype=torch.float32).to(device), potential_type)
+
+        # Calculate Thomas-Fermi approximation
+        tf_approx = model.compute_thomas_fermi_approx(torch.tensor(X_test, dtype=torch.float32).to(device), potential,
+                                                      eta)
+        tf_approx = tf_approx.detach().cpu().numpy()
+
+        # Plot the predicted solution and TF approximation
+        plt.plot(X_test, u_pred_normalized, label=f'Predicted Solution ($\\eta$ ≈ {eta})')
+        plt.plot(X_test, tf_approx, linestyle='--', label=f'TF Approximation ($\\eta$ ≈ {eta})')
+
+    eta_range = f"({min(etas):.1f}, {max(etas):.1f})" if len(etas) > 1 else f"{etas[0]:.1f}"
+    plt.title(
+        f'PINN Ground State Solution and Thomas-Fermi Approximation\n'
+        f'Potential Type: {potential_type.capitalize()}, Interaction Strengths: {eta_range}',
+        fontsize="xx-large"
+    )
+    plt.xlabel('$x$', fontsize="xx-large")
+    plt.ylabel('Normalized $u(x)$', fontsize="xx-large")
     plt.grid(True)
     plt.legend(fontsize="large")
 
@@ -716,29 +788,11 @@ if __name__ == "__main__":
 
     # Test points
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
-    etas = [1, 10, 100, 500, 1000]  # Interaction strengths
+    etas = [1, 10]  # Interaction strengths
 
     weights = [1.0, 1.0, 1.0, 1.0, 1.0]
 
-    potential_types = ['double_well', 'harmonic']
-
-    # Plot double well
-
-    # Generate test points
-    X_test = np.linspace(lb, ub, 500).reshape(-1, 1)  # Test points for potential
-    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)  # Convert to tensor
-
-    # Parameters for double-well potential
-    a = 1  # Quartic coefficient
-    b = 0.5 # Quadratic coefficient
-
-    # Compute the double-well potential
-    model = GrossPitaevskiiPINN([1, 100, 100, 100, 1])  # Placeholder model
-    potential_tensor = model.compute_potential(X_test_tensor, potential_type="quasi_periodic", a=a, b=b)
-    potential = -potential_tensor.detach().numpy()  # Convert to NumPy for plotting
-
-    # Plot the potential
-    plot_potential_1D(X_test, potential)
+    potential_types = ['harmonic']
 
     # Loop through each potential type
     for potential_type in potential_types:

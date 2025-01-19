@@ -27,20 +27,6 @@ class GrossPitaevskiiPINN(nn.Module):
             Mass of the particle (default is 1.0).
         g : float, optional
             Interaction strength (default is 100.0).
-        alpha, optional : float
-                Controls the exponential weight decay rate.
-                Value between 0 and 1. The smaller, the more stochasticity.
-                0 means no historical information is transmitted to the next iteration.
-                1 means only first calculation is retained. Defaults to 0.999.
-        temperature, optional : float
-                Softmax temperature coefficient. Controlls the "sharpness" of the softmax operation.
-                Defaults to 1.
-        rho, optional : float
-                Probability of the Bernoulli random variable controlling the frequency of random lookbacks.
-                Value berween 0 and 1. The smaller, the fewer lookbacks happen.
-                0 means lambdas are always calculated w.r.t. the initial loss values.
-                1 means lambdas are always calculated w.r.t. the loss values in the previous training iteration.
-                Defaults to 0.9999.
         """
         super().__init__()
         self.layers = layers
@@ -48,16 +34,6 @@ class GrossPitaevskiiPINN(nn.Module):
         self.g = g  # Interaction strength
         self.hbar = hbar  # Planck's constant, fixed
         self.m = m  # Particle mass, fixed
-
-        self.alpha = alpha
-        self.temperature = temperature
-        self.rho = rho
-        self.call_count = 0  # Track the number of forward calls
-
-        # Initialize dynamic weights and loss history
-        self.lambdas = [1.0] * 5  # For boundary, PDE, riesz, symmetry, and normalization losses
-        self.last_losses = [1.0] * 5
-        self.init_losses = [1.0] * 5
 
     def build_network(self):
         """
@@ -157,6 +133,28 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return V
 
+    def compute_thomas_fermi_approx(self, inputs, potential, eta):
+        """
+        Calculate the Thomas–Fermi approximation for the given potential.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            Spatial coordinates.
+        potential : torch.Tensor
+            Potential values corresponding to the spatial coordinates.
+        eta : float
+            Interaction strength.
+
+        Returns
+        -------
+        torch.Tensor
+            Thomas–Fermi approximation of the wave function.
+        """
+        epsilon = torch.max(potential) + eta
+        tf_approx = torch.sqrt(torch.relu((epsilon - potential) / eta))
+        return tf_approx
+
     def boundary_loss(self, boundary_points, boundary_values):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
@@ -176,7 +174,7 @@ class GrossPitaevskiiPINN(nn.Module):
         u_pred = self.forward(boundary_points)
         return torch.mean((u_pred - boundary_values) ** 2)
 
-    def riesz_loss(self, predictions, inputs, eta, potential_type):
+    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -190,6 +188,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
+        V : torch.Tensor
+            Precomputed potential. Default is None.
 
         Returns
         -------
@@ -205,7 +205,10 @@ class GrossPitaevskiiPINN(nn.Module):
                                   create_graph=True, retain_graph=True)[0]
 
         laplacian_term = torch.mean(u_x ** 2)  # Kinetic term
-        V = self.compute_potential(inputs, potential_type)
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
         potential_term = torch.mean(V * u ** 2)  # Potential term
         interaction_term = 0.5 * eta * torch.mean(u ** 4)  # Interaction term
 
@@ -213,7 +216,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions, eta, potential_type):
+    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -227,6 +230,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
 
         Returns
         -------
@@ -243,10 +248,17 @@ class GrossPitaevskiiPINN(nn.Module):
         u_xx = grad(u_x, inputs, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
 
         # Compute λ from the energy functional
-        V = self.compute_potential(inputs, potential_type)
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
         lambda_pde = torch.mean(u_x ** 2 + V * u ** 2 + eta * u ** 4) / torch.mean(u ** 2)
 
         # Residual of the 1D Gross-Pitaevskii equation
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
         pde_residual = -u_xx + V * u + eta * torch.abs(u ** 2) * u - lambda_pde * u
 
         # Regularization: See https://arxiv.org/abs/2010.05075
@@ -267,7 +279,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def symmetry_loss(self, collocation_points, lb, ub):
         """
-        Compute the symmetry loss to enforce u(x) = u(1-x).
+        Compute the symmetry loss to enforce u(x) = u((a+b)-x).
 
         Parameters
         ----------
@@ -281,21 +293,21 @@ class GrossPitaevskiiPINN(nn.Module):
         Returns
         -------
         sym_loss : torch.Tensor
-            The mean squared error enforcing symmetry u(x) = u(1-x).
+            The mean squared error enforcing symmetry u(x) = u((a+b)-x).
         """
         # Reflect points across the center of the domain
         x_reflected = (lb + ub) - collocation_points
 
-        # Predict u(x) and u(1-x) using the model
+        # Evaluate u(x) and u((a+b)-x)
         u_original = self.forward(collocation_points)
         u_reflected = self.forward(x_reflected)
 
-        # Compute mean squared difference to enforce symmetry
+        # Compute MSE to enforce symmetry
         sym_loss = torch.mean((u_original - u_reflected) ** 2)
-
         return sym_loss
 
-    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type):
+    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
+                   precomputed_potential=None):
         """
         Compute the total loss combining boundary loss, Riesz energy loss,
         PDE loss, L^2 norm regularization loss, and symmetry loss.
@@ -318,6 +330,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Weights for different loss terms.
         potential_type : str
             Type of potential function to use
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
 
         Returns
         -------
@@ -325,10 +339,16 @@ class GrossPitaevskiiPINN(nn.Module):
             Total loss value.
         """
 
+        # Use precomputed potential if provided
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(collocation_points, potential_type)
+
         # Compute individual loss components
         data_loss = self.boundary_loss(boundary_points, boundary_values)
-        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type)
-        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type)
+        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type,V)
+        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V)
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
@@ -355,7 +375,6 @@ def initialize_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.xavier_uniform_(m.weight)
         m.bias.data.fill_(0.01)
-
 
 def prepare_training_data(N_u, N_f, lb, ub):
     """
@@ -444,6 +463,14 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
     lb_tensor = torch.tensor(lb, dtype=torch.float32).to(device)
     ub_tensor = torch.tensor(ub, dtype=torch.float32).to(device)
 
+    # Precompute potential
+    V = model.compute_potential(collocation_points_tensor, potential_type).detach()
+    V.requires_grad = False
+
+    # Precompute Thomas-Fermi approximation
+    #tf_approx = model.compute_thomas_fermi_approx(collocation_points_tensor, V, eta).detach()
+    #tf_approx.requires_grad = False
+
     loss_history = []
 
     # Training loop
@@ -452,12 +479,13 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
         optimizer.zero_grad()
 
         # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
+        # with precomputed potential and Thomas-Fermi approximation
         loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor,
                                                                               boundary_points_tensor,
                                                                               boundary_values_tensor,
                                                                               eta,
                                                                               lb_tensor, ub_tensor,
-                                                                              weights, potential_type)
+                                                                              weights, potential_type, V)
 
         # Backpropagation and optimization
         loss.backward()
@@ -608,14 +636,30 @@ def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.
     for model, eta in zip(models, etas):
         model.eval()  # Set the model to evaluation mode
 
+        # Prepare test data
         X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
         u_pred = model(X_test_tensor).detach().cpu().numpy()
         u_pred_normalized = normalize_wave_function(u_pred)
-        plt.plot(X_test, u_pred_normalized, label=f'Predicted Solution ($\\eta$ ≈ {eta})')
 
-    plt.title(f'Ground State Solution by PINN {potential_type.capitalize()} Potential', fontsize="xx-large")
-    plt.xlabel('x', fontsize="xx-large")
-    plt.ylabel('u(x)', fontsize="xx-large")
+        # Calculate the potential
+        potential = model.compute_potential(torch.tensor(X_test, dtype=torch.float32).to(device), potential_type)
+
+        # Calculate Thomas-Fermi approximation
+        tf_approx = model.compute_thomas_fermi_approx(torch.tensor(X_test, dtype=torch.float32).to(device), potential, eta)
+        tf_approx = tf_approx.detach().cpu().numpy()
+
+        # Plot the predicted solution and TF approximation
+        plt.plot(X_test, u_pred_normalized, label=f'Predicted Solution ($\\eta$ ≈ {eta})')
+        plt.plot(X_test, tf_approx, linestyle='--', label=f'TF Approximation ($\\eta$ ≈ {eta})')
+
+    eta_range = f"({min(etas):.1f}, {max(etas):.1f})" if len(etas) > 1 else f"{etas[0]:.1f}"
+    plt.title(
+        f'PINN Ground State Solution and Thomas-Fermi Approximation\n'
+        f'Potential Type: {potential_type.capitalize()}, Interaction Strengths: {eta_range}',
+        fontsize="xx-large"
+    )
+    plt.xlabel('$x$', fontsize="xx-large")
+    plt.ylabel('Normalized $u(x)$', fontsize="xx-large")
     plt.grid(True)
     plt.legend(fontsize="large")
 
@@ -683,7 +727,7 @@ if __name__ == "__main__":
 
     # Test points
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
-    etas = [1, 10, 100, 500, 1000]  # Interaction strengths
+    etas = [1, 10]  # Interaction strengths
 
     # Weights for loss terms
     weights = [50.0, 1.0, 2.0, 10.0, 50.0]
