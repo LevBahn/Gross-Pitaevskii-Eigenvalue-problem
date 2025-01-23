@@ -133,14 +133,14 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return V
 
-    def compute_thomas_fermi_approx(self, inputs, potential, eta):
+    def compute_thomas_fermi_approx(self, lambda_pde, potential, eta):
         """
         Calculate the Thomas–Fermi approximation for the given potential.
 
         Parameters
         ----------
-        inputs : torch.Tensor
-            Spatial coordinates.
+        lambda_pde : float
+            Eigenvalue from lowest enegry ground state.
         potential : torch.Tensor
             Potential values corresponding to the spatial coordinates.
         eta : float
@@ -151,8 +151,7 @@ class GrossPitaevskiiPINN(nn.Module):
         torch.Tensor
             Thomas–Fermi approximation of the wave function.
         """
-        epsilon = torch.max(potential) + eta
-        tf_approx = torch.sqrt(torch.relu((epsilon - potential) / eta))
+        tf_approx = torch.sqrt((lambda_pde - potential) / eta)
         return tf_approx
 
     def boundary_loss(self, boundary_points, boundary_values):
@@ -637,16 +636,18 @@ def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.
         model.eval()  # Set the model to evaluation mode
 
         # Prepare test data
-        X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+        X_test_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
         u_pred = model(X_test_tensor).detach().cpu().numpy()
         u_pred_normalized = normalize_wave_function(u_pred)
 
         # Calculate the potential
-        potential = model.compute_potential(torch.tensor(X_test, dtype=torch.float32).to(device), potential_type)
+        potential = model.compute_potential(X_test_tensor, potential_type)
 
         # Calculate Thomas-Fermi approximation
-        tf_approx = model.compute_thomas_fermi_approx(torch.tensor(X_test, dtype=torch.float32).to(device), potential, eta)
-        tf_approx = tf_approx.detach().cpu().numpy()
+        _, _, lambda_pde = model.pde_loss(X_test_tensor,
+                                          model.forward(X_test_tensor), eta,
+                                          potential_type, potential)
+        tf_approx = model.compute_thomas_fermi_approx(X_test_tensor, potential, eta).detach().cpu().numpy()
 
         # Plot the predicted solution and TF approximation
         plt.plot(X_test, u_pred_normalized, label=f'Predicted Solution ($\\eta$ ≈ {eta})')
@@ -720,7 +721,7 @@ if __name__ == "__main__":
     # Parameters
     N_u = 200  # Number of boundary points
     N_f = 4000  # Number of collocation points
-    epochs = 20001 # Number of iterations of training
+    epochs = 10001 # Number of iterations of training
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
