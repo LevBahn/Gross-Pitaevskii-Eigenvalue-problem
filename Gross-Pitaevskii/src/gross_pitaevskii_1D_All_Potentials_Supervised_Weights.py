@@ -151,7 +151,7 @@ class GrossPitaevskiiPINN(nn.Module):
         torch.Tensor
             Thomas–Fermi approximation of the wave function.
         """
-        tf_approx = torch.sqrt((lambda_pde - potential) / eta)
+        tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
         return tf_approx
 
     def boundary_loss(self, boundary_points, boundary_values):
@@ -648,10 +648,11 @@ def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.
                                           model.forward(X_test_tensor), eta,
                                           potential_type, potential)
         tf_approx = model.compute_thomas_fermi_approx(X_test_tensor, potential, eta).detach().cpu().numpy()
+        tf_approx_normalized = normalize_wave_function(tf_approx)
 
         # Plot the predicted solution and TF approximation
-        plt.plot(X_test, u_pred_normalized, label=f'Predicted Solution ($\\eta$ ≈ {eta})')
-        plt.plot(X_test, tf_approx, linestyle='--', label=f'TF Approximation ($\\eta$ ≈ {eta})')
+        plt.plot(X_test, u_pred_normalized, label=f'Normalized Predicted Solution ($\\eta$ ≈ {eta})')
+        plt.plot(X_test, tf_approx_normalized, linestyle='--', label=f'Normalized Thomas-Fermi Approximation ($\\eta$ ≈ {eta})')
 
     eta_range = f"({min(etas):.1f}, {max(etas):.1f})" if len(etas) > 1 else f"{etas[0]:.1f}"
     plt.title(
