@@ -19,8 +19,10 @@ class HarmonicPotentialNN(nn.Module):
     URL: https://www.sciencedirect.com/science/article/abs/pii/S0010465513001318
     """
 
-    def __init__(self, hbar=1.0, m=1.0, gamma=1.0, mode=0):
+    def __init__(self, layers, hbar=1.0, m=1.0, gamma=1.0, mode=0):
         super().__init__()
+        self.layers = layers
+        self.network = self.build_network()
         self.hbar = hbar  # Planck's constant
         self.m = m  # Mass of the particle
         self.gamma = gamma  # Nonlinearity parameter
@@ -45,10 +47,27 @@ class HarmonicPotentialNN(nn.Module):
     def weighted_hermite(self, x, n):
         """
         Compute the weighted Hermite polynomial solution for the linear case (gamma = 0).
+        Equation (34) in https://www.sciencedirect.com/science/article/abs/pii/S0010465513001318.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of spatial coordinates (collocation points).
+        n : int
+            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
+
+        Returns
+        -------
+        torch.Tensor
+            The weighted Hermite polynomial solution for the linear case (gamma = 0).
         """
         H_n = hermite(n)(x.cpu().numpy())  # Hermite polynomial evaluated at x
         norm_factor = (2**n * np.math.factorial(n) * np.sqrt(np.pi))**(-0.5)
-        return norm_factor * torch.exp(-x**2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
+        weighted_hermite = norm_factor * torch.exp(-x**2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
+
+        # TODO: Shift and scale the weighted Hermited polyonimal to be zero at the interval [a,b] = [-10,10]?
+
+        return weighted_hermite
 
     def compute_thomas_fermi_approx(self, lambda_pde, potential, eta):
         """
@@ -69,7 +88,7 @@ class HarmonicPotentialNN(nn.Module):
         else:
             raise NotImplementedError("Higher modes with nonlinearity are not implemented.")
 
-    def boundary_loss(self, boundary_points, boundary_values):
+    def boundary_loss(self, inputs, boundary_points, mode):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
 
@@ -77,18 +96,21 @@ class HarmonicPotentialNN(nn.Module):
         ----------
         boundary_points : torch.Tensor
             Input tensor of boundary spatial points.
-        boundary_values : torch.Tensor
-            Tensor of boundary values (for Dirichlet conditions).
+        inputs : torch.Tensor
+            Input tensor of spatial coordinates (collocation points).
+        mode : int
+            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
 
         Returns
         -------
         torch.Tensor
             Mean squared error (MSE) at the boundary points.
         """
-        u_pred = self.forward(boundary_points)
-        return torch.mean((u_pred - boundary_values) ** 2)
+        # u = u_0 + N
+        u_pred = self.weighted_hermite(self, inputs, mode) + self.forward(boundary_points)
+        return torch.mean((u_pred) ** 2)
 
-    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
+    def riesz_loss(self, predictions, inputs, eta, mode, potential_type, precomputed_potential=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -100,6 +122,8 @@ class HarmonicPotentialNN(nn.Module):
             Input tensor of spatial coordinates (collocation points).
         eta : float
             Interaction strength.
+        mode : int
+            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
         potential_type : str
             Type of potential function to use.
         V : torch.Tensor
@@ -110,8 +134,8 @@ class HarmonicPotentialNN(nn.Module):
         torch.Tensor
             Riesz energy loss value.
         """
-        u = predictions
-        # TODO: this should be f = u_0 + N where N is the solution from the neural network. How is the trained NN passed into this?
+        # u = u_0 + N where N is the solution from the neural network.
+        u = self.weighted_hermite(self, inputs, mode) + predictions
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
@@ -131,7 +155,7 @@ class HarmonicPotentialNN(nn.Module):
 
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, eta, mode, potential_type, precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -143,6 +167,8 @@ class HarmonicPotentialNN(nn.Module):
             Predicted solution from the network.
         eta : float
             Interaction strength.
+        mode : int
+            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
         potential_type : str
             Type of potential function to use.
         precomputed_potential : torch.Tensor
@@ -156,7 +182,8 @@ class HarmonicPotentialNN(nn.Module):
                 - torch.Tensor: PDE residual.
                 - torch.Tensor: Smallest eigenvalue (lambda).
         """
-        u = predictions
+        # u = u_0 + N where N is the solution from the neural network.
+        u = self.weighted_hermite(self, inputs, mode) + predictions
 
         # Compute first and second derivatives with respect to x
         u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -210,6 +237,7 @@ class HarmonicPotentialNN(nn.Module):
         sym_loss : torch.Tensor
             The mean squared error enforcing symmetry u(x) = u((a+b)-x).
         """
+
         # Reflect points across the center of the domain
         x_reflected = (lb + ub) - collocation_points
 
@@ -221,7 +249,7 @@ class HarmonicPotentialNN(nn.Module):
         sym_loss = torch.mean((u_original - u_reflected) ** 2)
         return sym_loss
 
-    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
+    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, mode, lb, ub, weights, potential_type,
                    precomputed_potential=None):
         """
         Compute the total loss combining boundary loss, Riesz energy loss,
@@ -237,6 +265,8 @@ class HarmonicPotentialNN(nn.Module):
             Tensor of boundary values (for Dirichlet conditions).
         eta : float
             Interaction strength.
+        mode : int
+            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
         lb : torch.Tensor
             Lower bound of interval.
         ub : torch.Tensor
@@ -254,42 +284,55 @@ class HarmonicPotentialNN(nn.Module):
             Total loss value.
         """
 
-        # Use precomputed potential if provided
-        if precomputed_potential is not None:
-            V = precomputed_potential
-        else:
-            V = self.compute_potential(collocation_points, potential_type)
+        # # Use precomputed potential if provided
+        # if precomputed_potential is not None:
+        #     V = precomputed_potential
+        # else:
+        #     V = self.compute_potential(collocation_points, potential_type)
 
         # Compute λ_pde for harmonic predictions
-        _, _, lambda_pde = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type,V)
-
-        # Use HarmonicPotentialNN to replace collocation points
         V = 0.5 * collocation_points ** 2  # Harmonic potential
-        harmonic_predictions = self.compute_harmonic_solution(collocation_points, lambda_pde, V)
+        _, _, lambda_pde = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V)
 
-        # Use harmonic_predictions as the new inputs to the PINN
-        pinn_inputs = self.forward(harmonic_predictions)
+        # # Use HarmonicPotentialNN to replace collocation points
+        # harmonic_predictions = self.compute_harmonic_solution(collocation_points, lambda_pde, V)
+        #
+        # # Use harmonic_predictions as the new inputs to the PINN
+        # pinn_inputs = self.forward(harmonic_predictions)
+        #
+        # # Compute individual loss components
+        # data_loss = self.boundary_loss(boundary_points, boundary_values)
+        # riesz_energy_loss = self.riesz_loss(self.forward(pinn_inputs), pinn_inputs, eta, potential_type,V)
+        # pde_loss, _, _ = self.pde_loss(pinn_inputs, self.forward(pinn_inputs), eta, potential_type, V)
+        # norm_loss = (torch.norm(self.forward(pinn_inputs), p=2) - 1) ** 2
+        # sym_loss = self.symmetry_loss(pinn_inputs, lb, ub)
+        #
+        # # Scaling factor for pde loss and riesz energy loss
+        # domain_length = ub - lb
+        #
+        # # Compute weighted losses and total loss
+        # losses = [data_loss, riesz_energy_loss  / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
+        # weighted_losses = [weights[i] * loss for i, loss in enumerate(losses)]
+        # total_loss = sum(weighted_losses)
+        #
+        # return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss, harmonic_predictions
 
         # Compute individual loss components
-        data_loss = self.boundary_loss(boundary_points, boundary_values)
-        riesz_energy_loss = self.riesz_loss(self.forward(pinn_inputs), pinn_inputs, eta, potential_type,V)
-        pde_loss, _, _ = self.pde_loss(pinn_inputs, self.forward(pinn_inputs), eta, potential_type, V)
-        norm_loss = (torch.norm(self.forward(pinn_inputs), p=2) - 1) ** 2
-        sym_loss = self.symmetry_loss(pinn_inputs, lb, ub)
+        data_loss = self.boundary_loss(boundary_points, boundary_values, mode)
+        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, mode, potential_type, V)
+        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, mode, potential_type, V)
+        norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
+        sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
         # Scaling factor for pde loss and riesz energy loss
         domain_length = ub - lb
 
         # Compute weighted losses and total loss
-        losses = [data_loss, riesz_energy_loss  / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
+        losses = [data_loss, riesz_energy_loss / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
         weighted_losses = [weights[i] * loss for i, loss in enumerate(losses)]
         total_loss = sum(weighted_losses)
 
-        return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss, harmonic_predictions
-
-
-
-
+        return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss
 
 
 class GrossPitaevskiiPINN(nn.Module):
@@ -746,7 +789,7 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
         List of loss values recorded during training
     """
     # Instantiate the PINN model and initialize its weights
-    model = GrossPitaevskiiPINN(layers).to(device)
+    model = HarmonicPotentialNN(layers).to(device)
     model.apply(initialize_weights)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
