@@ -26,12 +26,28 @@ class HarmonicPotentialNN(nn.Module):
         self.gamma = gamma  # Nonlinearity parameter
         self.mode = mode  # Mode number (n)
 
+    def build_network(self):
+        """
+        Build the neural network with sine activation functions between layers.
+
+        Returns
+        -------
+        nn.Sequential
+            A PyTorch sequential model representing the neural network architecture.
+        """
+        layers = []
+        for i in range(len(self.layers) - 1):
+            layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
+            if i < len(self.layers) - 2:
+                layers.append(nn.Tanh())
+        return nn.Sequential(*layers)
+
     def weighted_hermite(self, x, n):
         """
         Compute the weighted Hermite polynomial solution for the linear case (gamma = 0).
         """
         H_n = hermite(n)(x.cpu().numpy())  # Hermite polynomial evaluated at x
-        norm_factor = (2**n * np.math.factorial(n) * np.sqrt(np.pi))**-0.5
+        norm_factor = (2**n * np.math.factorial(n) * np.sqrt(np.pi))**(-0.5)
         return norm_factor * torch.exp(-x**2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
 
     def compute_thomas_fermi_approx(self, lambda_pde, potential, eta):
@@ -52,6 +68,228 @@ class HarmonicPotentialNN(nn.Module):
             return self.compute_thomas_fermi_approx(lambda_pde, potential, self.gamma)
         else:
             raise NotImplementedError("Higher modes with nonlinearity are not implemented.")
+
+    def boundary_loss(self, boundary_points, boundary_values):
+        """
+        Compute the boundary loss (MSE) for the boundary conditions.
+
+        Parameters
+        ----------
+        boundary_points : torch.Tensor
+            Input tensor of boundary spatial points.
+        boundary_values : torch.Tensor
+            Tensor of boundary values (for Dirichlet conditions).
+
+        Returns
+        -------
+        torch.Tensor
+            Mean squared error (MSE) at the boundary points.
+        """
+        u_pred = self.forward(boundary_points)
+        return torch.mean((u_pred - boundary_values) ** 2)
+
+    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
+        """
+        Compute the Riesz energy loss for the Gross-Pitaevskii equation.
+
+        Parameters
+        ----------
+        predictions : torch.Tensor
+            Predicted solution from the network.
+        inputs : torch.Tensor
+            Input tensor of spatial coordinates (collocation points).
+        eta : float
+            Interaction strength.
+        potential_type : str
+            Type of potential function to use.
+        V : torch.Tensor
+            Precomputed potential. Default is None.
+
+        Returns
+        -------
+        torch.Tensor
+            Riesz energy loss value.
+        """
+        u = predictions
+        # TODO: this should be f = u_0 + N where N is the solution from the neural network. How is the trained NN passed into this?
+
+        if not inputs.requires_grad:
+            inputs = inputs.clone().detach().requires_grad_(True)
+        u_x = torch.autograd.grad(outputs=predictions, inputs=inputs,
+                                  grad_outputs=torch.ones_like(predictions),
+                                  create_graph=True, retain_graph=True)[0]
+
+        laplacian_term = torch.mean(u_x ** 2)  # Kinetic term
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
+        potential_term = torch.mean(V * u ** 2)  # Potential term
+        interaction_term = 0.5 * eta * torch.mean(u ** 4)  # Interaction term
+
+        riesz_energy = 0.5 * (laplacian_term + potential_term + interaction_term)
+
+        return riesz_energy
+
+    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None):
+        """
+        Compute the PDE loss for the Gross-Pitaevskii equation.
+
+        Parameters
+        ----------
+        inputs : torch.Tensor
+            Input tensor of spatial coordinates (collocation points).
+        predictions : torch.Tensor
+            Predicted solution from the network.
+        eta : float
+            Interaction strength.
+        potential_type : str
+            Type of potential function to use.
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
+
+        Returns
+        -------
+        tuple
+            Tuple containing:
+                - torch.Tensor: PDE loss value.
+                - torch.Tensor: PDE residual.
+                - torch.Tensor: Smallest eigenvalue (lambda).
+        """
+        u = predictions
+
+        # Compute first and second derivatives with respect to x
+        u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        u_xx = grad(u_x, inputs, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+
+        # Compute λ from the energy functional
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
+        lambda_pde = torch.mean(u_x ** 2 + V * u ** 2 + eta * u ** 4) / torch.mean(u ** 2)
+
+        # Residual of the 1D Gross-Pitaevskii equation
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
+        pde_residual = -u_xx + V * u + eta * torch.abs(u ** 2) * u - lambda_pde * u
+
+        # Regularization: See https://arxiv.org/abs/2010.05075
+
+        # Term 1: L_f = 1 / (f(x, λ))^2, penalizes the network if the PDE residual is close to zero to avoid trivial eigenfunctions
+        L_f = 1 / (torch.mean(u ** 2) + 1e-2)
+
+        # Term 2: L_λ = 1 / λ^2, penalizes small eigenvalues λ, ensuring non-trivial eigenvalues
+        L_lambda = 1 / (lambda_pde ** 2 + 1e-6)
+
+        # Term 3: L_drive = e^(-λ + c), encourages λ to grow, preventing collapse to small values
+        L_drive = torch.exp(-lambda_pde + 1.0)
+
+        # PDE loss (residual plus regularization terms)
+        pde_loss = torch.mean(pde_residual ** 2)  # + L_lambda + L_f
+
+        return pde_loss, pde_residual, lambda_pde
+
+    def symmetry_loss(self, collocation_points, lb, ub):
+        """
+        Compute the symmetry loss to enforce u(x) = u((a+b)-x).
+
+        Parameters
+        ----------
+        collocation_points : torch.Tensor
+            Tensor of interior spatial points.
+        lb : torch.Tensor
+            Lower bound of interval.
+        ub: torch.Tensor
+            Upper bound of interval.
+
+        Returns
+        -------
+        sym_loss : torch.Tensor
+            The mean squared error enforcing symmetry u(x) = u((a+b)-x).
+        """
+        # Reflect points across the center of the domain
+        x_reflected = (lb + ub) - collocation_points
+
+        # Evaluate u(x) and u((a+b)-x)
+        u_original = self.forward(collocation_points)
+        u_reflected = self.forward(x_reflected)
+
+        # Compute MSE to enforce symmetry
+        sym_loss = torch.mean((u_original - u_reflected) ** 2)
+        return sym_loss
+
+    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
+                   precomputed_potential=None):
+        """
+        Compute the total loss combining boundary loss, Riesz energy loss,
+        PDE loss, L^2 norm regularization loss, and symmetry loss.
+
+        Parameters
+        ----------
+        collocation_points : torch.Tensor
+            Input tensor of spatial coordinates for the interior points.
+        boundary_points : torch.Tensor
+            Input tensor of boundary spatial points.
+        boundary_values : torch.Tensor
+            Tensor of boundary values (for Dirichlet conditions).
+        eta : float
+            Interaction strength.
+        lb : torch.Tensor
+            Lower bound of interval.
+        ub : torch.Tensor
+            Upper bound of interval.
+        weights : list
+            Weights for different loss terms.
+        potential_type : str
+            Type of potential function to use
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
+
+        Returns
+        -------
+        total_loss : torch.Tensor
+            Total loss value.
+        """
+
+        # Use precomputed potential if provided
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(collocation_points, potential_type)
+
+        # Compute λ_pde for harmonic predictions
+        _, _, lambda_pde = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type,V)
+
+        # Use HarmonicPotentialNN to replace collocation points
+        V = 0.5 * collocation_points ** 2  # Harmonic potential
+        harmonic_predictions = self.compute_harmonic_solution(collocation_points, lambda_pde, V)
+
+        # Use harmonic_predictions as the new inputs to the PINN
+        pinn_inputs = self.forward(harmonic_predictions)
+
+        # Compute individual loss components
+        data_loss = self.boundary_loss(boundary_points, boundary_values)
+        riesz_energy_loss = self.riesz_loss(self.forward(pinn_inputs), pinn_inputs, eta, potential_type,V)
+        pde_loss, _, _ = self.pde_loss(pinn_inputs, self.forward(pinn_inputs), eta, potential_type, V)
+        norm_loss = (torch.norm(self.forward(pinn_inputs), p=2) - 1) ** 2
+        sym_loss = self.symmetry_loss(pinn_inputs, lb, ub)
+
+        # Scaling factor for pde loss and riesz energy loss
+        domain_length = ub - lb
+
+        # Compute weighted losses and total loss
+        losses = [data_loss, riesz_energy_loss  / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
+        weighted_losses = [weights[i] * loss for i, loss in enumerate(losses)]
+        total_loss = sum(weighted_losses)
+
+        return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss, harmonic_predictions
+
+
+
+
 
 
 class GrossPitaevskiiPINN(nn.Module):
