@@ -64,7 +64,7 @@ class GrossPitaevskiiPINN(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input tensor of spatial coordinates (collocation points).
+            Input tensor of spatial coordinates (collocation points) or boundary points.
         n : int
             Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
 
@@ -148,7 +148,7 @@ class GrossPitaevskiiPINN(nn.Module):
         tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
         return tf_approx
 
-    def boundary_loss(self, boundary_points, boundary_values):
+    def boundary_loss(self, boundary_points, boundary_values, base_function):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
 
@@ -158,6 +158,7 @@ class GrossPitaevskiiPINN(nn.Module):
             Input tensor of boundary spatial points.
         boundary_values : torch.Tensor
             Tensor of boundary values (for Dirichlet conditions).
+        base_function :
 
         Returns
         -------
@@ -165,9 +166,10 @@ class GrossPitaevskiiPINN(nn.Module):
             Mean squared error (MSE) at the boundary points.
         """
         u_pred = self.forward(boundary_points)
+        u = self.weighted_hermite(boundary_points, self.mode) + u_pred
         return torch.mean((u_pred - boundary_values) ** 2)
 
-    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
+    def riesz_loss(self, predictions, inputs, eta, potential_type, base_function, precomputed_potential=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -181,6 +183,7 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
+        base_function :
         V : torch.Tensor
             Precomputed potential. Default is None.
 
@@ -209,7 +212,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, eta, potential_type, base_function, precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -223,6 +226,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
+        base_function :
+        
         precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
 
