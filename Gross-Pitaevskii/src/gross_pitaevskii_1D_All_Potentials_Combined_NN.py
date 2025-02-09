@@ -17,7 +17,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, g=100.0, mode=0):
+    def __init__(self, layers, hbar=1.0, m=1.0, g=100.0, mode=0, prev_prediction=None):
         """
         Parameters
         ----------
@@ -31,6 +31,9 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength (default is 100.0).
         mode : int, optional
             Mode number (default is 0).
+        prev_prediction : callable, optional
+            A function representing the previous model's forward pass, used to incorporate past solutions
+            when computing the current solution (default is None).
         """
         super().__init__()
         self.layers = layers
@@ -39,6 +42,7 @@ class GrossPitaevskiiPINN(nn.Module):
         self.hbar = hbar  # Planck's constant, fixed
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
+        self.prev_prediction = prev_prediction  # Store previous predictions
 
     def build_network(self):
         """
@@ -148,7 +152,7 @@ class GrossPitaevskiiPINN(nn.Module):
         tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
         return tf_approx
 
-    def boundary_loss(self, boundary_points, boundary_values, base_function):
+    def boundary_loss(self, boundary_points, boundary_values):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
 
@@ -158,7 +162,6 @@ class GrossPitaevskiiPINN(nn.Module):
             Input tensor of boundary spatial points.
         boundary_values : torch.Tensor
             Tensor of boundary values (for Dirichlet conditions).
-        base_function :
 
         Returns
         -------
@@ -166,10 +169,15 @@ class GrossPitaevskiiPINN(nn.Module):
             Mean squared error (MSE) at the boundary points.
         """
         u_pred = self.forward(boundary_points)
-        u = self.weighted_hermite(boundary_points, self.mode) + u_pred
-        return torch.mean((u_pred - boundary_values) ** 2)
 
-    def riesz_loss(self, predictions, inputs, eta, potential_type, base_function, precomputed_potential=None):
+        if self.prev_prediction is None:
+            u = self.weighted_hermite(boundary_points, self.mode) + u_pred
+        else:
+            u = self.prev_prediction(boundary_points) + u_pred  # Use model’s output from previous eta
+
+        return torch.mean((u - boundary_values) ** 2)
+
+    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -183,7 +191,6 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
-        base_function :
         V : torch.Tensor
             Precomputed potential. Default is None.
 
@@ -192,11 +199,14 @@ class GrossPitaevskiiPINN(nn.Module):
         torch.Tensor
             Riesz energy loss value.
         """
-        u = self.weighted_hermite(inputs, self.mode) + predictions
+        if self.prev_prediction is None:
+            u = self.weighted_hermite(inputs, self.mode) + predictions
+        else:
+            u = self.prev_prediction(inputs) + predictions  # Use model’s output from previous eta
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
-        u_x = torch.autograd.grad(outputs=predictions, inputs=inputs,
+        u_x = torch.autograd.grad(outputs=u, inputs=inputs,
                                   grad_outputs=torch.ones_like(predictions),
                                   create_graph=True, retain_graph=True)[0]
 
@@ -212,7 +222,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions, eta, potential_type, base_function, precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -226,8 +236,6 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
-        base_function :
-        
         precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
 
@@ -239,7 +247,10 @@ class GrossPitaevskiiPINN(nn.Module):
                 - torch.Tensor: PDE residual.
                 - torch.Tensor: Smallest eigenvalue (lambda).
         """
-        u = self.weighted_hermite(inputs, self.mode) + predictions
+        if self.prev_prediction is None:
+            u = self.weighted_hermite(inputs, self.mode) + predictions
+        else:
+            u = self.prev_prediction(inputs) + predictions  # Use model’s output from previous eta
 
         # Compute first and second derivatives with respect to x
         u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -546,7 +557,7 @@ def plot_potential_1D(X_test, potential):
     plt.show()
 
 
-def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type):
+def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type, prev_model):
     """
     Train the Physics-Informed Neural Network (PINN) model and save it.
 
@@ -580,6 +591,9 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
         File name to save the trained model weights (e.g., 'model_eta_1.pth').
     potential_type: str
         Type of potential function to use
+    prev_model : GrossPitaevskiiPINN or None
+        Previously trained model whose predictions are used as part of the training process.
+        If None, the model starts training from scratch.
 
     Returns
     -------
@@ -588,7 +602,12 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
     loss_history : list of float
         A list of loss values recorded during training for each epoch
     """
-    model = GrossPitaevskiiPINN(layers).to(device)
+
+    # Create a new model, passing the previous model's forward function if available
+    prev_prediction = prev_model.forward if prev_model is not None else None
+    if prev_model is not None:
+        prev_model.eval()
+    model = GrossPitaevskiiPINN(layers, prev_prediction=prev_prediction).to(device)
     model.apply(initialize_weights)
 
     # Train the model
@@ -651,8 +670,8 @@ def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.
 
         # Plot the predicted solution and TF approximation
         plt.plot(X_test, u_pred_normalized, label=f'Normalized Predicted Solution ($\\eta$ ≈ {eta})')
-        plt.plot(X_test, tf_approx_normalized, linestyle='--',
-                 label=f'Normalized Thomas-Fermi Approximation ($\\eta$ ≈ {eta})')
+        # plt.plot(X_test, tf_approx_normalized, linestyle='--',
+        #          label=f'Normalized Thomas-Fermi Approximation ($\\eta$ ≈ {eta})')
 
     # Calculate the weighted hermite approximation
     wh_approx = model.weighted_hermite(X_test_tensor, 0).detach().cpu().numpy()
@@ -661,10 +680,9 @@ def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.
     plt.plot(X_test, wh_approx_normalized, linestyle='-.',
              label=f'Normalized Weighted Hermite Approximation ($\\eta$ = 0)')
 
-    eta_range = f"({min(etas):.1f}, {max(etas):.1f})" if len(etas) > 1 else f"{etas[0]:.1f}"
     plt.title(
         f'PINN Ground State Solution, Thomas-Fermi Approximation, and Weighted Hermite Approximation\n'
-        f'Potential Type: {potential_type.capitalize()}, Interaction Strengths: {eta_range}',
+        f'Potential Type: {potential_type.capitalize()}, Interaction Strengths: {etas}',
         fontsize="xx-large"
     )
     plt.xlabel('$x$', fontsize="xx-large")
@@ -736,7 +754,7 @@ if __name__ == "__main__":
 
     # Test points
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
-    etas = [1, 10]  # Interaction strengths
+    etas = [1, 10, 50, 100]  # Interaction strengths
 
     # Weights for loss terms
     weights = [50.0, 1.0, 2.0, 10.0, 50.0]
@@ -748,12 +766,15 @@ if __name__ == "__main__":
     for potential_type in potential_types:
 
         # Train and save models and loss history for different interaction strengths
-        models = []
+        models = [] # Store all trained models
+        prev_model = None  # For eta = 1, use the weighted hermite approximation
         loss_histories = []
         for eta in etas:
             model_save_path = f"trained_model_eta_{eta}.pth"
             model, loss_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
-                                                      weights=weights, model_save_path=model_save_path, potential_type=potential_type)
+                                                      weights=weights, model_save_path=model_save_path,
+                                                      potential_type=potential_type, prev_model=prev_model)
+            prev_model = model  # Store the trained model for the next iteration
             models.append(model)
             loss_histories.append(loss_history)
 
