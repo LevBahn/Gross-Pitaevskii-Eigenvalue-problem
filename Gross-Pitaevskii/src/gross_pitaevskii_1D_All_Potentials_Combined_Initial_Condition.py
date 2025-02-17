@@ -152,7 +152,7 @@ class GrossPitaevskiiPINN(nn.Module):
         tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
         return tf_approx
 
-    def boundary_loss(self, boundary_points, boundary_values):
+    def boundary_loss(self, boundary_points, boundary_values, precomputed_potential=None):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
 
@@ -162,6 +162,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Input tensor of boundary spatial points.
         boundary_values : torch.Tensor
             Tensor of boundary values (for Dirichlet conditions).
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
 
         Returns
         -------
@@ -175,7 +177,7 @@ class GrossPitaevskiiPINN(nn.Module):
         else:
             u = self.prev_prediction(boundary_points) + u_pred  # Use model’s output from previous eta
 
-        return torch.mean((u - boundary_values) ** 2)
+        return torch.mean((u_pred - boundary_values) ** 2)
 
     def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
         """
@@ -191,7 +193,7 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
-        V : torch.Tensor
+        precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
 
         Returns
@@ -355,7 +357,7 @@ class GrossPitaevskiiPINN(nn.Module):
             V = self.compute_potential(collocation_points, potential_type)
 
         # Compute individual loss components
-        data_loss = self.boundary_loss(boundary_points, boundary_values)
+        data_loss = self.boundary_loss(boundary_points, boundary_values, V)
         riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type,V)
         pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V)
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
@@ -747,7 +749,7 @@ if __name__ == "__main__":
     # Parameters
     N_u = 200  # Number of boundary points
     N_f = 4000  # Number of collocation points
-    epochs = 2001 # Number of iterations of training
+    epochs = 10001 # Number of iterations of training
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
