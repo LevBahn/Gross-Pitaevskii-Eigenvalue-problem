@@ -4,9 +4,16 @@ import torch.optim as optim
 import math
 import numpy as np
 import os
-import matplotlib.pyplot as plt
 from torch.autograd import grad
 from scipy.special import hermite
+
+import matplotlib
+try:
+    matplotlib.use('Qt5Agg')
+except:
+    pass
+
+import matplotlib.pyplot as plt
 
 # Check if GPU is available, else use CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -152,7 +159,7 @@ class GrossPitaevskiiPINN(nn.Module):
         tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
         return tf_approx
 
-    def boundary_loss(self, boundary_points, boundary_values, precomputed_potential=None):
+    def boundary_loss(self, boundary_points, boundary_values, precomputed_potential=None, prev_predicition=None):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
 
@@ -164,6 +171,9 @@ class GrossPitaevskiiPINN(nn.Module):
             Tensor of boundary values (for Dirichlet conditions).
         precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
+        prev_predicition : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch.
 
         Returns
         -------
@@ -172,14 +182,14 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         u_pred = self.forward(boundary_points)
 
-        if self.prev_prediction is None:
+        if prev_predicition is None:
             u = self.weighted_hermite(boundary_points, self.mode) + u_pred
         else:
-            u = self.prev_prediction(boundary_points) + u_pred  # Use model’s output from previous eta
+            u = prev_predicition(boundary_points) + u_pred  # Use model’s output from previous eta
 
         return torch.mean((u - boundary_values) ** 2)
 
-    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
+    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None, prev_predicition=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -195,17 +205,20 @@ class GrossPitaevskiiPINN(nn.Module):
             Type of potential function to use.
         precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
+        prev_predicition : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch.
 
         Returns
         -------
         torch.Tensor
             Riesz energy loss value.
         """
-        if self.prev_prediction is None:
+        if prev_predicition is None:
             u = self.weighted_hermite(inputs, self.mode) + predictions
         else:
             scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
-            u = self.prev_prediction(inputs) + predictions  # Use model’s output from previous eta
+            u = prev_predicition(inputs) + predictions  # Use model’s output from previous eta
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
@@ -225,7 +238,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None, prev_predicition=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -241,6 +254,9 @@ class GrossPitaevskiiPINN(nn.Module):
             Type of potential function to use.
         precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
+        prev_predicition : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch.
 
         Returns
         -------
@@ -250,11 +266,11 @@ class GrossPitaevskiiPINN(nn.Module):
                 - torch.Tensor: PDE residual.
                 - torch.Tensor: Smallest eigenvalue (lambda).
         """
-        if self.prev_prediction is None:
+        if prev_predicition is None:
             u = self.weighted_hermite(inputs, self.mode) + predictions
         else:
             scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
-            u = self.prev_prediction(inputs) + predictions # Use model’s output from previous eta
+            u = prev_predicition(inputs) + predictions # Use model’s output from previous eta
 
         # Compute first and second derivatives with respect to x
         u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -320,7 +336,7 @@ class GrossPitaevskiiPINN(nn.Module):
         return sym_loss
 
     def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
-                   precomputed_potential=None):
+                   precomputed_potential=None, prev_predicition=None):
         """
         Compute the total loss combining boundary loss, Riesz energy loss,
         PDE loss, L^2 norm regularization loss, and symmetry loss.
@@ -345,6 +361,9 @@ class GrossPitaevskiiPINN(nn.Module):
             Type of potential function to use
         precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
+        prev_predicition : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch.
 
         Returns
         -------
@@ -359,9 +378,9 @@ class GrossPitaevskiiPINN(nn.Module):
             V = self.compute_potential(collocation_points, potential_type)
 
         # Compute individual loss components
-        data_loss = self.boundary_loss(boundary_points, boundary_values, V)
-        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type,V)
-        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V)
+        data_loss = self.boundary_loss(boundary_points, boundary_values, V, prev_predicition)
+        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type,V, prev_predicition)
+        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V, prev_predicition)
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
@@ -424,7 +443,7 @@ def prepare_training_data(N_u, N_f, lb, ub):
     return collocation_points, boundary_points, boundary_values
 
 
-def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type):
+def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type, prev_prediction):
     """
     Train the Physics-Informed Neural Network (PINN) for the 1D Gross-Pitaevskii equation.
 
@@ -452,6 +471,9 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
         Save path for trained model
     potential_type: str
         Type of potential function to use
+    prev_predicition : GrossPitaevskiiPINN or None
+        Previously trained model whose predictions are used as part of the training process.
+        If None, the model starts training from scratch.
 
     Returns
     -------
@@ -498,7 +520,7 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
                                                                               boundary_values_tensor,
                                                                               eta,
                                                                               lb_tensor, ub_tensor,
-                                                                              weights, potential_type, V)
+                                                                              weights, potential_type, V, prev_prediction)
 
         # Backpropagation and optimization
         loss.backward()
@@ -515,10 +537,10 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
         # Record the pde loss and lambda every 10000 epochs
         if epoch % 10000 == 0:
             print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item():.6f}')
-            pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor, model.forward(collocation_points_tensor), eta, potential_type)
+            pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor, model.forward(collocation_points_tensor), eta, potential_type, V, prev_prediction)
 
         if epoch % 1000 == 0:
-            print(f"Epoch {epoch}: λ_PDE = {lambda_pde.item():.6f}, η = {eta}")
+            print(f"Epoch {epoch}: λ_PDE = {lambda_pde.item():.6f}, η = {eta}, Loss: {loss.item():.6f}")
 
     return model, loss_history
 
@@ -619,7 +641,8 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
 
     # Train the model
     model, loss_history = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
-                                     weights=weights, model_save_path=model_save_path, potential_type=potential_type)
+                                     weights=weights, model_save_path=model_save_path, potential_type=potential_type,
+                                     prev_prediction=prev_prediction)
 
     # Directory to save the models
     model_save_dir = 'models'
@@ -632,7 +655,7 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
     return model, loss_history
 
 
-def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.png', potential_type='gaussian'):
+def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.png', potential_type='gaussian', previous_prediction=None):
     """
     Predict and plot the solutions for all models and save the plot.
 
@@ -671,7 +694,7 @@ def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.
         # Calculate Thomas-Fermi approximation
         _, _, lambda_pde = model.pde_loss(X_test_tensor,
                                           model.forward(X_test_tensor), eta,
-                                          potential_type, potential)
+                                          potential_type, potential, previous_prediction)
         tf_approx = model.compute_thomas_fermi_approx(X_test_tensor, potential, eta).detach().cpu().numpy()
         tf_approx_normalized = normalize_wave_function(tf_approx)
 
@@ -764,7 +787,7 @@ if __name__ == "__main__":
     etas = [1, 10, 50, 100]  # Interaction strengths
 
     # Weights for loss terms
-    weights = [500.0, 1.0, 2.0, 10.0, 50.0]
+    weights = [50.0, 1.0, 2.0, 10.0, 50.0]
 
     #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
     potential_types = ['harmonic']
@@ -786,7 +809,7 @@ if __name__ == "__main__":
             loss_histories.append(loss_history)
 
         # Predict and plot the solutions for all models
-        predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions_{potential_type}.png', potential_type=potential_type)
+        predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions_{potential_type}.png', potential_type=potential_type, previous_prediction=prev_model)
 
         # Plot the loss history for all etas
         plot_loss_history(loss_histories, etas, save_path='plots/loss_history_{potential_type}.png', potential_type=potential_type)
