@@ -152,7 +152,7 @@ class GrossPitaevskiiPINN(nn.Module):
         tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
         return tf_approx
 
-    def boundary_loss(self, boundary_points, boundary_values):
+    def boundary_loss(self, boundary_points, boundary_values, precomputed_potential=None):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
 
@@ -162,6 +162,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Input tensor of boundary spatial points.
         boundary_values : torch.Tensor
             Tensor of boundary values (for Dirichlet conditions).
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
 
         Returns
         -------
@@ -191,7 +193,7 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength.
         potential_type : str
             Type of potential function to use.
-        V : torch.Tensor
+        precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
 
         Returns
@@ -202,6 +204,7 @@ class GrossPitaevskiiPINN(nn.Module):
         if self.prev_prediction is None:
             u = self.weighted_hermite(inputs, self.mode) + predictions
         else:
+            scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
             u = self.prev_prediction(inputs) + predictions  # Use model’s output from previous eta
 
         if not inputs.requires_grad:
@@ -250,7 +253,8 @@ class GrossPitaevskiiPINN(nn.Module):
         if self.prev_prediction is None:
             u = self.weighted_hermite(inputs, self.mode) + predictions
         else:
-            u = self.prev_prediction(inputs) + predictions  # Use model’s output from previous eta
+            scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
+            u = self.prev_prediction(inputs) + predictions # Use model’s output from previous eta
 
         # Compute first and second derivatives with respect to x
         u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -282,7 +286,7 @@ class GrossPitaevskiiPINN(nn.Module):
         L_drive = torch.exp(-lambda_pde + 1.0)
 
         # PDE loss (residual plus regularization terms)
-        pde_loss = torch.mean(pde_residual ** 2)  # + L_lambda + L_f
+        pde_loss = torch.mean(pde_residual ** 2)  #+ L_lambda + L_f
 
         return pde_loss, pde_residual, lambda_pde
 
@@ -355,7 +359,7 @@ class GrossPitaevskiiPINN(nn.Module):
             V = self.compute_potential(collocation_points, potential_type)
 
         # Compute individual loss components
-        data_loss = self.boundary_loss(boundary_points, boundary_values)
+        data_loss = self.boundary_loss(boundary_points, boundary_values, V)
         riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type,V)
         pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V)
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
@@ -512,6 +516,9 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
         if epoch % 10000 == 0:
             print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item():.6f}')
             pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor, model.forward(collocation_points_tensor), eta, potential_type)
+
+        if epoch % 1000 == 0:
+            print(f"Epoch {epoch}: λ_PDE = {lambda_pde.item():.6f}, η = {eta}")
 
     return model, loss_history
 
@@ -757,7 +764,7 @@ if __name__ == "__main__":
     etas = [1, 10, 50, 100]  # Interaction strengths
 
     # Weights for loss terms
-    weights = [50.0, 1.0, 2.0, 10.0, 50.0]
+    weights = [500.0, 1.0, 2.0, 10.0, 50.0]
 
     #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
     potential_types = ['harmonic']
