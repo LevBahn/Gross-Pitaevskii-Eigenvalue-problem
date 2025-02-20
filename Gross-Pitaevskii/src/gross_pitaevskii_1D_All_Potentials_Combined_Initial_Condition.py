@@ -177,7 +177,7 @@ class GrossPitaevskiiPINN(nn.Module):
         else:
             u = self.prev_prediction(boundary_points) + u_pred  # Use model’s output from previous eta
 
-        return torch.mean((u_pred - boundary_values) ** 2)
+        return torch.mean((u - boundary_values) ** 2)
 
     def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None):
         """
@@ -204,6 +204,7 @@ class GrossPitaevskiiPINN(nn.Module):
         if self.prev_prediction is None:
             u = self.weighted_hermite(inputs, self.mode) + predictions
         else:
+            scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
             u = self.prev_prediction(inputs) + predictions  # Use model’s output from previous eta
 
         if not inputs.requires_grad:
@@ -252,7 +253,8 @@ class GrossPitaevskiiPINN(nn.Module):
         if self.prev_prediction is None:
             u = self.weighted_hermite(inputs, self.mode) + predictions
         else:
-            u = self.prev_prediction(inputs) + predictions  # Use model’s output from previous eta
+            scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
+            u = self.prev_prediction(inputs) + predictions # Use model’s output from previous eta
 
         # Compute first and second derivatives with respect to x
         u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -284,7 +286,7 @@ class GrossPitaevskiiPINN(nn.Module):
         L_drive = torch.exp(-lambda_pde + 1.0)
 
         # PDE loss (residual plus regularization terms)
-        pde_loss = torch.mean(pde_residual ** 2)  # + L_lambda + L_f
+        pde_loss = torch.mean(pde_residual ** 2)  #+ L_lambda + L_f
 
         return pde_loss, pde_residual, lambda_pde
 
@@ -514,6 +516,9 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
         if epoch % 10000 == 0:
             print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item():.6f}')
             pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor, model.forward(collocation_points_tensor), eta, potential_type)
+
+        if epoch % 1000 == 0:
+            print(f"Epoch {epoch}: λ_PDE = {lambda_pde.item():.6f}, η = {eta}")
 
     return model, loss_history
 
@@ -749,7 +754,7 @@ if __name__ == "__main__":
     # Parameters
     N_u = 200  # Number of boundary points
     N_f = 4000  # Number of collocation points
-    epochs = 10001 # Number of iterations of training
+    epochs = 2001 # Number of iterations of training
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
@@ -759,7 +764,7 @@ if __name__ == "__main__":
     etas = [1, 10, 50, 100]  # Interaction strengths
 
     # Weights for loss terms
-    weights = [50.0, 1.0, 2.0, 10.0, 50.0]
+    weights = [500.0, 1.0, 2.0, 10.0, 50.0]
 
     #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
     potential_types = ['harmonic']
