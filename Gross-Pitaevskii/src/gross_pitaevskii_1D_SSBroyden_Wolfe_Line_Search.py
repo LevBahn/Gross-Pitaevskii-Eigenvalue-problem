@@ -1,43 +1,145 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim import Optimizer
+import math
 import numpy as np
 import os
-import matplotlib.pyplot as plt
 from torch.autograd import grad
 from scipy.special import hermite
+
+# import matplotlib
+# try:
+#     matplotlib.use('Qt5Agg')
+# except:
+#     pass
+
+import matplotlib.pyplot as plt
 
 # Check if GPU is available, else use CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class HarmonicPotentialNN(nn.Module):
+class SSBroyden(Optimizer):
     """
-    Neural network for predicting solutions to the harmonic potential using
-    equations (32)-(36) from Energy eigenfunctions of the 1D Gross–Pitaevskii equation.
-
-    URL: https://www.sciencedirect.com/science/article/abs/pii/S0010465513001318
+    Self-Scaled Broyden (SSBroyden) optimizer with Strong Wolfe line search.
     """
 
-    def __init__(self, layers, eta=1.0, hbar=1.0, m=1.0, mode=0):
+    def __init__(self, params, lr=1.0, c1=1e-4, c2=0.9, max_iter=10):
+        """
+        Parameters
+        ----------
+        params : iterable
+            Model parameters to optimize.
+        lr : float, optional
+            Initial learning rate (default is 1.0).
+        c1 : float, optional
+            Armijo condition parameter (default is 1e-4).
+        c2 : float, optional
+            Wolfe condition parameter (default is 0.9).
+        max_iter : int, optional
+            Maximum number of iterations for line search (default is 10).
+        """
+        defaults = dict(lr=lr, c1=c1, c2=c2, max_iter=max_iter)
+        super(SSBroyden, self).__init__(params, defaults)
+
+    def step(self, closure):
+        """
+        Performs a single optimization step.
+        """
+        loss = closure()
+        for group in self.param_groups:
+            lr = group['lr']
+            c1, c2, max_iter = group['c1'], group['c2'], group['max_iter']
+
+            params = []
+            grads = []
+            for p in group['params']:
+                if p.grad is not None:
+                    params.append(p)
+                    grads.append(p.grad)
+
+            # Convert gradients to a single vector
+            g = torch.cat([g.view(-1) for g in grads])
+
+            if not hasattr(self, 'H'):
+                self.H = torch.eye(len(g)).to(g.device)  # Initialize Hessian inverse
+
+            # Compute search direction: p_k = - H_k * g_k
+            p = -self.H @ g
+
+            # Line search: Strong Wolfe conditions
+            alpha = self.strong_wolfe_line_search(params, p, loss, closure, c1, c2, max_iter)
+
+            # Update parameters
+            for p_, dp in zip(params, p.split([p_.numel() for p_ in params])):
+                p_.add_(alpha * dp.view(p_.shape))
+
+            # Update Hessian inverse (Broyden update)
+            sk = alpha * p  # Step taken
+            new_loss = closure()
+            new_g = torch.cat([p_.grad.view(-1) for p_ in params])  # New gradient
+            yk = new_g - g  # Gradient difference
+
+            rho = 1.0 / (yk @ sk)
+            I = torch.eye(len(sk)).to(sk.device)
+            self.H = (I - rho * sk[:, None] @ yk[None, :]) @ self.H @ (I - rho * yk[:, None] @ sk[None, :]) + rho * sk[:, None] @ sk[None, :]
+
+        return loss
+
+    def strong_wolfe_line_search(self, params, p, old_loss, closure, c1, c2, max_iter):
+        """
+        Strong Wolfe line search to find step size alpha.
+        """
+        alpha = 1.0
+        beta = 0.5
+        for _ in range(max_iter):
+            # Compute new loss
+            for p_, dp in zip(params, p.split([p_.numel() for p_ in params])):
+                p_.add_(alpha * dp.view(p_.shape))
+            new_loss = closure()
+
+            # Compute new gradient
+            grads = [p_.grad.view(-1) for p_ in params]
+            new_g = torch.cat(grads)
+
+            # Check Armijo condition
+            if new_loss <= old_loss + c1 * alpha * (new_g @ p):
+                # Check Wolfe curvature condition
+                if abs(new_g @ p) <= c2 * abs((torch.cat([p_.grad.view(-1) for p_ in params]) @ p)):
+                    return alpha
+            alpha *= beta  # Reduce step size
+
+        return alpha  # If no valid step found, return reduced step size
+
+
+class GrossPitaevskiiPINN(nn.Module):
+    """
+    Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
+    """
+
+    def __init__(self, layers, hbar=1.0, m=1.0, g=100.0, mode=0, prev_prediction=None):
         """
         Parameters
         ----------
         layers : list of int
             Neural network architecture, each entry defines the number of neurons in that layer.
-        eta : float, optional
-            Interaction strength (default is 1.0).
         hbar : float, optional
             Reduced Planck's constant (default is 1.0).
         m : float, optional
             Mass of the particle (default is 1.0).
+        g : float, optional
+            Interaction strength (default is 100.0).
         mode : int, optional
             Mode number (default is 0).
+        prev_prediction : callable, optional
+            A function representing the previous model's forward pass, used to incorporate past solutions
+            when computing the current solution (default is None).
         """
         super().__init__()
         self.layers = layers
         self.network = self.build_network()
-        self.eta = eta  # Interaction strength
+        self.g = g  # Interaction strength
         self.hbar = hbar  # Planck's constant, fixed
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
@@ -66,7 +168,7 @@ class HarmonicPotentialNN(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input tensor of spatial coordinates (collocation points).
+            Input tensor of spatial coordinates (collocation points) or boundary points.
         n : int
             Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
 
@@ -75,32 +177,11 @@ class HarmonicPotentialNN(nn.Module):
         torch.Tensor
             The weighted Hermite polynomial solution for the linear case (gamma = 0).
         """
-        H_n = hermite(n)(x.cpu().numpy())  # Hermite polynomial evaluated at x
-        norm_factor = (2**n * np.math.factorial(n) * np.sqrt(np.pi))**(-0.5)
+        H_n = hermite(n)(x.cpu().detach().numpy())  # Hermite polynomial evaluated at x
+        norm_factor = (2**n * math.factorial(n) * np.sqrt(np.pi))**(-0.5)
         weighted_hermite = norm_factor * torch.exp(-x**2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
 
-        # TODO: Shift and scale the weighted Hermited polyonimal to be zero at the interval [a,b] = [-10,10]?
-
         return weighted_hermite
-
-    def compute_thomas_fermi_approx(self, lambda_pde, potential, eta):
-        """
-        Compute the Thomas-Fermi approximation for the ground state.
-        """
-        return torch.sqrt(torch.relu((lambda_pde - potential) / eta))
-
-    def forward(self, collocation_points, lambda_pde, potential, eta):
-        """
-        Predict the solution based on the mode and nonlinearity.
-        For mode = 0 and large gamma, use the Thomas-Fermi approximation.
-        For gamma = 0, use the weighted Hermite polynomial solution.
-        """
-        if self.gamma == 0:
-            return self.weighted_hermite(collocation_points, self.mode)
-        elif self.mode == 0:
-            return self.compute_thomas_fermi_approx(lambda_pde, potential, eta)
-        else:
-            raise NotImplementedError("Higher modes with nonlinearity are not implemented.")
 
     def forward(self, inputs):
         """
@@ -127,9 +208,7 @@ class HarmonicPotentialNN(nn.Module):
         x : torch.Tensor
             Input tensor of spatial coordinates.
         potential_type : str, optional
-            Type of potential. Options are:
-            "gaussian", "harmonic", "double_well", "box", "periodic", "linear", "step", "sine".
-            By default "harmonic".
+            Type of potential. Options are: "harmonic".
         kwargs : dict
             Additional parameters specific to each potential type.
 
@@ -146,13 +225,40 @@ class HarmonicPotentialNN(nn.Module):
         if potential_type == "harmonic":
             omega = kwargs.get('omega', 1.0)  # Frequency for harmonic potential
             V = 0.5 * omega ** 2 * x ** 2
-
+        elif potential_type == "gaussian":
+            a = kwargs.get('a', 0.0)  # Center of the Gaussian
+            V = torch.exp(-(x - a) ** 2)
+        elif potential_type == "periodic":
+            V0 = kwargs.get('V0', 1.0)  # Depth of the potential
+            k = kwargs.get('k', 2 * np.pi / 5.0)  # Wave number for periodic potential
+            V = V0 * torch.cos(k * x) ** 2
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
 
         return V
 
-    def boundary_loss(self, collocation_points, boundary_points, mode):
+    def compute_thomas_fermi_approx(self, lambda_pde, potential, eta):
+        """
+        Calculate the Thomas–Fermi approximation for the given potential.
+
+        Parameters
+        ----------
+        lambda_pde : float
+            Eigenvalue from lowest enegry ground state.
+        potential : torch.Tensor
+            Potential values corresponding to the spatial coordinates.
+        eta : float
+            Interaction strength.
+
+        Returns
+        -------
+        torch.Tensor
+            Thomas–Fermi approximation of the wave function.
+        """
+        tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
+        return tf_approx
+
+    def boundary_loss(self, boundary_points, boundary_values, prev_prediction=None):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
 
@@ -160,21 +266,27 @@ class HarmonicPotentialNN(nn.Module):
         ----------
         boundary_points : torch.Tensor
             Input tensor of boundary spatial points.
-        collocation_points : torch.Tensor
-            Input tensor of spatial coordinates (collocation points).
-        mode : int
-            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
+        boundary_values : torch.Tensor
+            Tensor of boundary values (for Dirichlet conditions).
+        prev_prediction : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch.
 
         Returns
         -------
         torch.Tensor
             Mean squared error (MSE) at the boundary points.
         """
-        # u = u_0 + N
-        u_pred = self.weighted_hermite(collocation_points, mode) + self.forward(boundary_points)
-        return torch.mean((u_pred) ** 2)
+        u_pred = self.forward(boundary_points)
 
-    def riesz_loss(self, predictions, inputs, eta, mode, potential_type, precomputed_potential=None):
+        if prev_prediction is None:
+            u = self.weighted_hermite(boundary_points, self.mode) + u_pred
+        else:
+            u = prev_prediction(boundary_points) + u_pred  # Use model’s output from previous eta
+
+        return torch.mean((u - boundary_values) ** 2)
+
+    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None, prev_prediction=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -186,24 +298,28 @@ class HarmonicPotentialNN(nn.Module):
             Input tensor of spatial coordinates (collocation points).
         eta : float
             Interaction strength.
-        mode : int
-            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
         potential_type : str
             Type of potential function to use.
-        V : torch.Tensor
+        precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
+        prev_prediction : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch.
 
         Returns
         -------
         torch.Tensor
             Riesz energy loss value.
         """
-        # u = u_0 + N where N is the solution from the neural network.
-        u = self.weighted_hermite(inputs, mode) + predictions
+        if prev_prediction is None:
+            u = self.weighted_hermite(inputs, self.mode) + predictions
+        else:
+            scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
+            u = prev_prediction(inputs) + predictions  # Use model’s output from previous eta
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
-        u_x = torch.autograd.grad(outputs=predictions, inputs=inputs,
+        u_x = torch.autograd.grad(outputs=u, inputs=inputs,
                                   grad_outputs=torch.ones_like(predictions),
                                   create_graph=True, retain_graph=True)[0]
 
@@ -219,7 +335,7 @@ class HarmonicPotentialNN(nn.Module):
 
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions, eta, mode, potential_type, precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None, prev_prediction=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -231,12 +347,13 @@ class HarmonicPotentialNN(nn.Module):
             Predicted solution from the network.
         eta : float
             Interaction strength.
-        mode : int
-            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
         potential_type : str
             Type of potential function to use.
         precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
+        prev_prediction : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch.
 
         Returns
         -------
@@ -246,8 +363,11 @@ class HarmonicPotentialNN(nn.Module):
                 - torch.Tensor: PDE residual.
                 - torch.Tensor: Smallest eigenvalue (lambda).
         """
-        # u = u_0 + N where N is the solution from the neural network.
-        u = self.weighted_hermite(inputs, mode) + predictions
+        if prev_prediction is None:
+            u = self.weighted_hermite(inputs, self.mode) + predictions
+        else:
+            scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
+            u = prev_prediction(inputs) + predictions # Use model’s output from previous eta
 
         # Compute first and second derivatives with respect to x
         u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -279,7 +399,7 @@ class HarmonicPotentialNN(nn.Module):
         L_drive = torch.exp(-lambda_pde + 1.0)
 
         # PDE loss (residual plus regularization terms)
-        pde_loss = torch.mean(pde_residual ** 2)  # + L_lambda + L_f
+        pde_loss = torch.mean(pde_residual ** 2)  #+ L_lambda + L_f
 
         return pde_loss, pde_residual, lambda_pde
 
@@ -301,7 +421,6 @@ class HarmonicPotentialNN(nn.Module):
         sym_loss : torch.Tensor
             The mean squared error enforcing symmetry u(x) = u((a+b)-x).
         """
-
         # Reflect points across the center of the domain
         x_reflected = (lb + ub) - collocation_points
 
@@ -313,8 +432,8 @@ class HarmonicPotentialNN(nn.Module):
         sym_loss = torch.mean((u_original - u_reflected) ** 2)
         return sym_loss
 
-    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, mode, lb, ub, weights, potential_type,
-                   precomputed_potential=None):
+    def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
+                   precomputed_potential=None, prev_prediction=None):
         """
         Compute the total loss combining boundary loss, Riesz energy loss,
         PDE loss, L^2 norm regularization loss, and symmetry loss.
@@ -329,8 +448,6 @@ class HarmonicPotentialNN(nn.Module):
             Tensor of boundary values (for Dirichlet conditions).
         eta : float
             Interaction strength.
-        mode : int
-            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
         lb : torch.Tensor
             Lower bound of interval.
         ub : torch.Tensor
@@ -341,6 +458,9 @@ class HarmonicPotentialNN(nn.Module):
             Type of potential function to use
         precomputed_potential : torch.Tensor
             Precomputed potential. Default is None.
+        prev_prediction : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch.
 
         Returns
         -------
@@ -354,13 +474,10 @@ class HarmonicPotentialNN(nn.Module):
         else:
             V = self.compute_potential(collocation_points, potential_type)
 
-        # Compute lambda from the lowest energy ground state
-        _, _, lambda_pde = self.pde_loss(collocation_points, self.forward(collocation_points), eta, mode, potential_type, V)
-
         # Compute individual loss components
-        data_loss = self.boundary_loss(boundary_points, boundary_values, mode)
-        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, mode, potential_type, V)
-        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, mode, potential_type, V)
+        data_loss = self.boundary_loss(boundary_points, boundary_values, prev_prediction)
+        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type,V, prev_prediction)
+        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V, prev_prediction)
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
@@ -368,7 +485,7 @@ class HarmonicPotentialNN(nn.Module):
         domain_length = ub - lb
 
         # Compute weighted losses and total loss
-        losses = [data_loss, riesz_energy_loss / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
+        losses = [data_loss, riesz_energy_loss  / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
         weighted_losses = [weights[i] * loss for i, loss in enumerate(losses)]
         total_loss = sum(weighted_losses)
 
@@ -423,7 +540,7 @@ def prepare_training_data(N_u, N_f, lb, ub):
     return collocation_points, boundary_points, boundary_values
 
 
-def train_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights, model_save_path, potential_type):
+def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type, prev_prediction):
     """
     Train the Physics-Informed Neural Network (PINN) for the 1D Gross-Pitaevskii equation.
 
@@ -439,8 +556,6 @@ def train_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights, model_sa
         Architecture of the neural network
     eta : float
         Interaction strength
-    mode : int
-            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
     epochs: int
         Number of epochs
     lb : int
@@ -453,6 +568,9 @@ def train_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights, model_sa
         Save path for trained model
     potential_type: str
         Type of potential function to use
+    prev_prediction : GrossPitaevskiiPINN or None
+        Previously trained model whose predictions are used as part of the training process.
+        If None, the model starts training from scratch.
 
     Returns
     -------
@@ -462,9 +580,10 @@ def train_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights, model_sa
         List of loss values recorded during training
     """
     # Instantiate the PINN model and initialize its weights
-    model = HarmonicPotentialNN(layers).to(device)
+    model = GrossPitaevskiiPINN(layers).to(device)
     model.apply(initialize_weights)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    # optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.LBFGS(model.parameters(), lr=1e-3, max_iter=20, line_search_fn="strong_wolfe")
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
 
     # Prepare training data (collocation and boundary points)
@@ -490,36 +609,47 @@ def train_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights, model_sa
     # Training loop
     for epoch in range(epochs):
         model.train()
-        optimizer.zero_grad()
 
-        # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
-        # with precomputed potential and Thomas-Fermi approximation
-        loss, data_loss, riesz_energy, pde_loss, norm_loss, harmonic_predictions = (
-                                                                              model.total_loss(collocation_points_tensor,
-                                                                              boundary_points_tensor,
-                                                                              boundary_values_tensor,
-                                                                              eta, mode,
-                                                                              lb_tensor, ub_tensor,
-                                                                              weights, potential_type, V))
+        def closure():
+            optimizer.zero_grad()
 
-        # Backpropagation and optimization
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Clip gradients
-        optimizer.step()
+            # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
+            # with precomputed potential and Thomas-Fermi approximation
+            loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor,
+                                                                                  boundary_points_tensor,
+                                                                                  boundary_values_tensor,
+                                                                                  eta,
+                                                                                  lb_tensor, ub_tensor,
+                                                                                  weights, potential_type, V, prev_prediction)
 
-        # Scheduler step (for ReduceLROnPlateau)
-        scheduler.step(loss)
+            # Backpropagation
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Clip gradients
+            return loss
+
+        # Perform an optimization step using line search
+        loss = optimizer.step(closure)
+
+        # Scheduler step (for ReduceLROnPlateau) - avoids redundant `closure()` calls
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(loss)
 
         # Record the total loss every 100 epochs
         if epoch % 100 == 0:
             loss_history.append(loss.item())
 
-        # Record the pde loss and lambda every 10000 epochs
+        # Compute λ_PDE every 1,000 epochs
+        if epoch % 1000 == 0:
+            pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor,
+                                                     model.forward(collocation_points_tensor), eta, potential_type, V,
+                                                     prev_prediction)
+            print(f"Epoch {epoch}: λ_PDE = {lambda_pde.item():.6f}, η = {eta}, Loss: {loss.item():.6f}")
+
+        # Record the loss every 10,000 epochs
         if epoch % 10000 == 0:
             print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item():.6f}')
-            pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor, model.forward(collocation_points_tensor), eta, potential_type)
 
-    return model, loss_history, harmonic_predictions
+    return model, loss_history
 
 
 def normalize_wave_function(u):
@@ -563,7 +693,7 @@ def plot_potential_1D(X_test, potential):
     plt.show()
 
 
-def train_and_save_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights, model_save_path, potential_type):
+def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type, prev_model):
     """
     Train the Physics-Informed Neural Network (PINN) model and save it.
 
@@ -585,8 +715,6 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights,
         three hidden layers with 20 neurons each, and an output layer with 1 neuron.
     eta : float
         Interaction strength parameter for the Gross-Pitaevskii equation.
-    mode : int
-            Mode of ground state solution to Gross-Pitavskii equation (0 for base ground state)
     epochs : int
         Number of training epochs.
     lb : int
@@ -599,21 +727,29 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights,
         File name to save the trained model weights (e.g., 'model_eta_1.pth').
     potential_type: str
         Type of potential function to use
+    prev_model : GrossPitaevskiiPINN or None
+        Previously trained model whose predictions are used as part of the training process.
+        If None, the model starts training from scratch.
 
     Returns
     -------
-    model : HarmonicPotentialNN
+    model : GrossPitaevskiiPINN
         The trained PINN model.
     loss_history : list of float
         A list of loss values recorded during training for each epoch
     """
-    model = HarmonicPotentialNN(layers).to(device)
+
+    # Create a new model, passing the previous model's forward function if available
+    prev_prediction = prev_model.forward if prev_model is not None else None
+    if prev_model is not None:
+        prev_model.eval()
+    model = GrossPitaevskiiPINN(layers, prev_prediction=prev_prediction).to(device)
     model.apply(initialize_weights)
 
     # Train the model
-    model, loss_history, harmonic_predictions = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, mode=mode,
-                                                           epochs=epochs, lb=lb, ub=ub, weights=weights,
-                                                           model_save_path=model_save_path, potential_type=potential_type)
+    model, loss_history = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
+                                     weights=weights, model_save_path=model_save_path, potential_type=potential_type,
+                                     prev_prediction=prev_prediction)
 
     # Directory to save the models
     model_save_dir = 'models'
@@ -623,11 +759,10 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, mode, epochs, lb, ub, weights,
     save_model_path = os.path.join(model_save_dir, model_save_path)
     torch.save(model.state_dict(), save_model_path)  # Save model weights
 
-    return model, loss_history, harmonic_predictions
+    return model, loss_history
 
 
-def predict_and_plot(models, etas, X_test, harmonic_preds, save_path='plots/predicted_solutions.png',
-                     potential_type='gaussian'):
+def predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions.png', potential_type='gaussian', prev_prediction=None):
     """
     Predict and plot the solutions for all models and save the plot.
 
@@ -666,19 +801,25 @@ def predict_and_plot(models, etas, X_test, harmonic_preds, save_path='plots/pred
         # Calculate Thomas-Fermi approximation
         _, _, lambda_pde = model.pde_loss(X_test_tensor,
                                           model.forward(X_test_tensor), eta,
-                                          potential_type, potential)
+                                          potential_type, potential, prev_prediction)
         tf_approx = model.compute_thomas_fermi_approx(X_test_tensor, potential, eta).detach().cpu().numpy()
         tf_approx_normalized = normalize_wave_function(tf_approx)
 
         # Plot the predicted solution and TF approximation
         plt.plot(X_test, u_pred_normalized, label=f'Normalized Predicted Solution ($\\eta$ ≈ {eta})')
-        plt.plot(X_test, tf_approx_normalized, linestyle='--',
-                 label=f'Normalized Thomas-Fermi Approximation ($\\eta$ ≈ {eta})')
+        # plt.plot(X_test, tf_approx_normalized, linestyle='--',
+        #          label=f'Normalized Thomas-Fermi Approximation ($\\eta$ ≈ {eta})')
 
-    eta_range = f"({min(etas):.1f}, {max(etas):.1f})" if len(etas) > 1 else f"{etas[0]:.1f}"
+    # Calculate the weighted hermite approximation
+    wh_approx = model.weighted_hermite(X_test_tensor, 0).detach().cpu().numpy()
+    wh_approx_normalized = normalize_wave_function(wh_approx)
+
+    plt.plot(X_test, wh_approx_normalized, linestyle='-.',
+             label=f'Normalized Weighted Hermite Approximation ($\\eta$ = 0)')
+
     plt.title(
-        f'PINN Ground State Solution and Thomas-Fermi Approximation\n'
-        f'Potential Type: {potential_type.capitalize()}, Interaction Strengths: {eta_range}',
+        f'PINN Ground State Solution, Thomas-Fermi Approximation, and Weighted Hermite Approximation\n'
+        f'Potential Type: {potential_type.capitalize()}, Interaction Strengths: {etas}',
         fontsize="xx-large"
     )
     plt.xlabel('$x$', fontsize="xx-large")
@@ -750,13 +891,10 @@ if __name__ == "__main__":
 
     # Test points
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
-    etas = [1, 10]  # Interaction strengths
+    etas = [1, 10, 50, 100]  # Interaction strengths
 
     # Weights for loss terms
     weights = [50.0, 1.0, 2.0, 10.0, 50.0]
-
-    # Mode
-    mode = 0
 
     #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
     potential_types = ['harmonic']
@@ -765,23 +903,20 @@ if __name__ == "__main__":
     for potential_type in potential_types:
 
         # Train and save models and loss history for different interaction strengths
-        models = []
+        models = [] # Store all trained models
+        prev_model = None  # For eta = 1, use the weighted hermite approximation
         loss_histories = []
-        harmonic_preds = []
         for eta in etas:
             model_save_path = f"trained_model_eta_{eta}.pth"
-            model, loss_history, harmonic_predictions = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
-                                                                            mode = mode, epochs=epochs, lb=lb, ub=ub,
-                                                                            weights=weights,
-                                                                            model_save_path=model_save_path,
-                                                                            potential_type=potential_type)
+            model, loss_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
+                                                      weights=weights, model_save_path=model_save_path,
+                                                      potential_type=potential_type, prev_model=prev_model)
+            prev_model = model  # Store the trained model for the next iteration
             models.append(model)
             loss_histories.append(loss_history)
-            harmonic_preds.append(harmonic_predictions)
 
         # Predict and plot the solutions for all models
-        predict_and_plot(models, etas, X_test, harmonic_preds, save_path='plots/predicted_solutions_{potential_type}.png',
-                         potential_type=potential_type)
+        predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions_{potential_type}.png', potential_type=potential_type, prev_prediction=prev_model)
 
         # Plot the loss history for all etas
         plot_loss_history(loss_histories, etas, save_path='plots/loss_history_{potential_type}.png', potential_type=potential_type)
