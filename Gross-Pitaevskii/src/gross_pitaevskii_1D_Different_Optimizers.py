@@ -1,12 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim import Optimizer
 import math
 import numpy as np
 import os
 from torch.autograd import grad
 from scipy.special import hermite
+from adabelief_pytorch import AdaBelief
+from pytorch_optimizer import QHAdam, AdaHessian, Ranger21, SophiaH, Shampoo
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.nn.utils
 
 # import matplotlib
 # try:
@@ -18,99 +21,6 @@ import matplotlib.pyplot as plt
 
 # Check if GPU is available, else use CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-class SSBroyden(Optimizer):
-    """
-    Self-Scaled Broyden (SSBroyden) optimizer with Strong Wolfe line search.
-    """
-
-    def __init__(self, params, lr=1.0, c1=1e-4, c2=0.9, max_iter=10):
-        """
-        Parameters
-        ----------
-        params : iterable
-            Model parameters to optimize.
-        lr : float, optional
-            Initial learning rate (default is 1.0).
-        c1 : float, optional
-            Armijo condition parameter (default is 1e-4).
-        c2 : float, optional
-            Wolfe condition parameter (default is 0.9).
-        max_iter : int, optional
-            Maximum number of iterations for line search (default is 10).
-        """
-        defaults = dict(lr=lr, c1=c1, c2=c2, max_iter=max_iter)
-        super(SSBroyden, self).__init__(params, defaults)
-
-    def step(self, closure):
-        """
-        Performs a single optimization step.
-        """
-        loss = closure()
-        for group in self.param_groups:
-            lr = group['lr']
-            c1, c2, max_iter = group['c1'], group['c2'], group['max_iter']
-
-            params = []
-            grads = []
-            for p in group['params']:
-                if p.grad is not None:
-                    params.append(p)
-                    grads.append(p.grad)
-
-            # Convert gradients to a single vector
-            g = torch.cat([g.view(-1) for g in grads])
-
-            if not hasattr(self, 'H'):
-                self.H = torch.eye(len(g)).to(g.device)  # Initialize Hessian inverse
-
-            # Compute search direction: p_k = - H_k * g_k
-            p = -self.H @ g
-
-            # Line search: Strong Wolfe conditions
-            alpha = self.strong_wolfe_line_search(params, p, loss, closure, c1, c2, max_iter)
-
-            # Update parameters
-            for p_, dp in zip(params, p.split([p_.numel() for p_ in params])):
-                p_.add_(alpha * dp.view(p_.shape))
-
-            # Update Hessian inverse (Broyden update)
-            sk = alpha * p  # Step taken
-            new_loss = closure()
-            new_g = torch.cat([p_.grad.view(-1) for p_ in params])  # New gradient
-            yk = new_g - g  # Gradient difference
-
-            rho = 1.0 / (yk @ sk)
-            I = torch.eye(len(sk)).to(sk.device)
-            self.H = (I - rho * sk[:, None] @ yk[None, :]) @ self.H @ (I - rho * yk[:, None] @ sk[None, :]) + rho * sk[:, None] @ sk[None, :]
-
-        return loss
-
-    def strong_wolfe_line_search(self, params, p, old_loss, closure, c1, c2, max_iter):
-        """
-        Strong Wolfe line search to find step size alpha.
-        """
-        alpha = 1.0
-        beta = 0.5
-        for _ in range(max_iter):
-            # Compute new loss
-            for p_, dp in zip(params, p.split([p_.numel() for p_ in params])):
-                p_.add_(alpha * dp.view(p_.shape))
-            new_loss = closure()
-
-            # Compute new gradient
-            grads = [p_.grad.view(-1) for p_ in params]
-            new_g = torch.cat(grads)
-
-            # Check Armijo condition
-            if new_loss <= old_loss + c1 * alpha * (new_g @ p):
-                # Check Wolfe curvature condition
-                if abs(new_g @ p) <= c2 * abs((torch.cat([p_.grad.view(-1) for p_ in params]) @ p)):
-                    return alpha
-            alpha *= beta  # Reduce step size
-
-        return alpha  # If no valid step found, return reduced step size
 
 
 class GrossPitaevskiiPINN(nn.Module):
@@ -582,8 +492,7 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
     # Instantiate the PINN model and initialize its weights
     model = GrossPitaevskiiPINN(layers).to(device)
     model.apply(initialize_weights)
-    # optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    optimizer = torch.optim.LBFGS(model.parameters(), lr=1e-3, max_iter=20, line_search_fn="strong_wolfe")
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
 
     # Prepare training data (collocation and boundary points)
@@ -604,13 +513,19 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
     #tf_approx = model.compute_thomas_fermi_approx(collocation_points_tensor, V, eta).detach()
     #tf_approx.requires_grad = False
 
-    loss_history = []
+    # Define optimizers
+    optimizer_names = {
+        "Adam": optim.Adam(model.parameters(), lr=1e-3),
+        "Shampoo": Shampoo(model.parameters(),lr=1e-3)
+        }
 
-    # Training loop
-    for epoch in range(epochs):
-        model.train()
+    # Store loss histories for each optimizer
+    loss_histories = {name: [] for name in optimizer_names}
 
-        def closure():
+    for optimizer_name, optimizer in optimizer_names.items():
+        for epoch in range(epochs):
+
+            model.train()
             optimizer.zero_grad()
 
             # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
@@ -620,36 +535,31 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
                                                                                   boundary_values_tensor,
                                                                                   eta,
                                                                                   lb_tensor, ub_tensor,
-                                                                                  weights, potential_type, V, prev_prediction)
+                                                                                  weights, potential_type, V,
+                                                                                  prev_prediction)
 
-            # Backpropagation
+            # Backpropagation and optimization
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Clip gradients
-            return loss
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Clip gradients
+            optimizer.step()
 
-        # Perform an optimization step using line search
-        loss = optimizer.step(closure)
-
-        # Scheduler step (for ReduceLROnPlateau) - avoids redundant `closure()` calls
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            # Scheduler step (for ReduceLROnPlateau)
             scheduler.step(loss)
 
-        # Record the total loss every 100 epochs
-        if epoch % 100 == 0:
-            loss_history.append(loss.item())
+            # Record the total loss every 100 epochs
+            if epoch % 100 == 0:
+                loss_histories[optimizer_name].append(loss.item())
 
-        # Compute λ_PDE every 1,000 epochs
-        if epoch % 1000 == 0:
-            pde_loss, _, lambda_pde = model.pde_loss(collocation_points_tensor,
-                                                     model.forward(collocation_points_tensor), eta, potential_type, V,
-                                                     prev_prediction)
-            print(f"Epoch {epoch}: λ_PDE = {lambda_pde.item():.6f}, η = {eta}, Loss: {loss.item():.6f}")
+            # Compute λ_PDE every 1,000 epochs
+            if epoch % 1000 == 0:
+                pde_loss, _, lambda_pde = model.pde_loss(
+                    collocation_points_tensor, model.forward(collocation_points_tensor),
+                    eta, potential_type, V, prev_prediction
+                )
+                print(f"[{optimizer_name}] Epoch [{epoch}/{epochs}]: η = {eta}, λ_PDE = {lambda_pde.item():.6f}, Loss: {loss.item():.6f}")
 
-        # Record the loss every 10,000 epochs
-        if epoch % 10000 == 0:
-            print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item():.6f}')
-
-    return model, loss_history
+    # Return both trained model and loss histories
+    return model, loss_histories
 
 
 def normalize_wave_function(u):
@@ -843,9 +753,9 @@ def plot_loss_history(loss_histories, etas, save_path='plots/loss_history.png', 
 
     Parameters
     ----------
-    loss_histories : list of lists
-        A list where each element is a list of loss values recorded during training
-        for a specific eta.
+    loss_histories : dict of str -> list of float
+        A dictionary where each key is an optimizer name (e.g., "Adam", "LBFGS"),
+        and the corresponding value is a list of loss values recorded during training.
     etas : list of float
         A list of eta values corresponding to each loss history.
     save_path : str, optional
@@ -861,8 +771,8 @@ def plot_loss_history(loss_histories, etas, save_path='plots/loss_history.png', 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     plt.figure(figsize=(10, 6))
-    for loss_history, eta in zip(loss_histories, etas):
-        plt.plot(loss_history, label=f'Loss ($\\eta$ ≈ {eta})')
+    for optimizer_name, loss_history in loss_histories.items():
+        plt.plot(loss_history, label=f'Loss ({optimizer_name})')
 
     plt.xlabel('Training step (x 100)', fontsize="xx-large")
     plt.ylabel('Total Loss', fontsize="xx-large")
@@ -884,14 +794,14 @@ if __name__ == "__main__":
     # Parameters
     N_u = 200  # Number of boundary points
     N_f = 4000  # Number of collocation points
-    epochs = 2001 # Number of iterations of training
+    epochs = 10001 # Number of iterations of training
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
 
     # Test points
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
-    etas = [1, 10, 50, 100]  # Interaction strengths
+    etas = [1, 10]  # Interaction strengths
 
     # Weights for loss terms
     weights = [50.0, 1.0, 2.0, 10.0, 50.0]
@@ -905,7 +815,7 @@ if __name__ == "__main__":
         # Train and save models and loss history for different interaction strengths
         models = [] # Store all trained models
         prev_model = None  # For eta = 1, use the weighted hermite approximation
-        loss_histories = []
+        loss_histories = { "Adam": [], "Shampoo": [] }
         for eta in etas:
             model_save_path = f"trained_model_eta_{eta}.pth"
             model, loss_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
@@ -913,7 +823,8 @@ if __name__ == "__main__":
                                                       potential_type=potential_type, prev_model=prev_model)
             prev_model = model  # Store the trained model for the next iteration
             models.append(model)
-            loss_histories.append(loss_history)
+            for optimizer_name in loss_histories:
+                loss_histories[optimizer_name].extend(loss_history[optimizer_name])
 
         # Predict and plot the solutions for all models
         predict_and_plot(models, etas, X_test, save_path='plots/predicted_solutions_{potential_type}.png', potential_type=potential_type, prev_prediction=prev_model)
