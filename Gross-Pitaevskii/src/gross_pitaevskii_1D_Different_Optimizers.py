@@ -518,7 +518,8 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
     # Define optimizers
     optimizer_names = {
         "Adam": optim.Adam(model.parameters(), lr=1e-3),
-        "Shampoo": Shampoo(model.parameters(),lr=1e-3)
+        "AdamW": optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.99), weight_decay=1e-4),
+        "Shampoo": Shampoo(model.parameters(), lr=5e-4, precondition_freq=10)
         }
 
     loss_histories = {} # Store loss histories for each optimizer and different etas
@@ -527,7 +528,8 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
 
     for optimizer_name, optimizer in optimizer_names.items():
         model.apply(initialize_weights)  # Reinitialize weights before each optimizer
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
+        # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
+        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=epochs // 10, epochs=epochs)
         for epoch in range(epochs):
 
             model.train()
@@ -545,11 +547,15 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
 
             # Backpropagation and optimization
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Clip gradients
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2)
 
-            # Scheduler step (for ReduceLROnPlateau)
-            scheduler.step(loss)
+            # Add gradient noise for stability
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad += 0.01 * torch.randn_like(p.grad)
+
+            optimizer.step()
+            scheduler.step()
 
             # Record the total loss and lambda_pde every 100 epochs
             if epoch % 100 == 0:
