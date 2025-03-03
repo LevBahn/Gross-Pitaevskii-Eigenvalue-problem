@@ -536,7 +536,8 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
     }
 
     optimizer = optimizers[optimizer_name]
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=epochs // 10, epochs=epochs)
+    # scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=epochs // 10, epochs=epochs)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
 
     # Prepare training data (collocation and boundary points)
     collocation_points, boundary_points, boundary_values = prepare_training_data(N_u, N_f, lb, ub)
@@ -578,7 +579,7 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2)
         optimizer.step()
-        scheduler.step()
+        scheduler.step(loss)
 
         # Record the total loss and lambda_pde every 100 epochs
         if epoch % 100 == 0:
