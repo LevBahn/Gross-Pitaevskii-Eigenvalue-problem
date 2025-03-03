@@ -518,7 +518,8 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
     }
 
     optimizer = optimizers[optimizer_name]
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=epochs // 10, epochs=epochs)
+    # scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=epochs // 10, epochs=epochs)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
 
     # Prepare training data (collocation and boundary points)
     collocation_points, boundary_points, boundary_values = prepare_training_data(N_u, N_f, lb, ub)
@@ -560,7 +561,7 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2)
         optimizer.step()
-        scheduler.step()
+        scheduler.step(loss)
 
         # Record the total loss and lambda_pde every 100 epochs
         if epoch % 100 == 0:
@@ -907,46 +908,46 @@ if __name__ == "__main__":
     all_lambda_pde_histories = {}
     models = {eta: {} for eta in etas}  # Store models for all η and optimizers
 
-    # Loop through each potential type
-    for potential_type in potential_types:
+# Loop through each potential type
+for potential_type in potential_types:
 
-        for optimizer_name in optimizer_names:
-            print(f"Training with {optimizer_name} optimizer...")
+    for optimizer_name in optimizer_names:
+        print(f"Training with {optimizer_name} optimizer...")
 
-            # Store results for each optimizer separately
-            prev_model = None
-            loss_histories = {}
-            lambda_pde_histories = {}
+        # Store results for each optimizer separately
+        prev_model = None
+        loss_histories = {}
+        lambda_pde_histories = {}
 
-            for eta in etas:
-                model_save_path = f"trained_model_eta_{eta}_{optimizer_name}.pth"
-                model, loss_history, lambda_pde_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
-                                                                              epochs=epochs, lb=lb, ub=ub,
-                                                                              weights=weights, model_save_path=model_save_path,
-                                                                              potential_type=potential_type, prev_model=prev_model,
-                                                                              optimizer_name=optimizer_name)
-                prev_model = model  # Store the trained model for the next iteration
+        for eta in etas:
+            model_save_path = f"trained_model_eta_{eta}_{optimizer_name}.pth"
+            model, loss_history, lambda_pde_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
+                                                                          epochs=epochs, lb=lb, ub=ub,
+                                                                          weights=weights, model_save_path=model_save_path,
+                                                                          potential_type=potential_type, prev_model=prev_model,
+                                                                          optimizer_name=optimizer_name)
+            prev_model = model  # Store the trained model for the next iteration
 
-                # Store models by eta and optimizer
-                models[eta][optimizer_name] = model
+            # Store models by eta and optimizer
+            models[eta][optimizer_name] = model
 
-                # Store loss and λ_PDE history under each eta for this optimizer
-                if potential_type not in all_loss_histories:
-                    all_loss_histories[potential_type] = {}
-                if potential_type not in all_lambda_pde_histories:
-                    all_lambda_pde_histories[potential_type] = {}
+            # Store loss and λ_PDE history under each eta for this optimizer
+            if potential_type not in all_loss_histories:
+                all_loss_histories[potential_type] = {}
+            if potential_type not in all_lambda_pde_histories:
+                all_lambda_pde_histories[potential_type] = {}
 
-                all_loss_histories[potential_type].setdefault(eta, {})[optimizer_name] = loss_history
-                all_lambda_pde_histories[potential_type].setdefault(eta, {})[optimizer_name] = lambda_pde_history
+            all_loss_histories[potential_type].setdefault(eta, {})[optimizer_name] = loss_history
+            all_lambda_pde_histories[potential_type].setdefault(eta, {})[optimizer_name] = lambda_pde_history
 
-        # Predict and plot the solutions for each optimizer separately
-        predict_and_plot(models, etas, optimizer_names, X_test, save_path='plots/predicted_solutions_{potential_type}.png',
-                         potential_type=potential_type, prev_prediction=prev_model)
+    # Predict and plot the solutions for each optimizer separately
+    predict_and_plot(models, etas, optimizer_names, X_test, save_path='plots/predicted_solutions_{potential_type}.png',
+                     potential_type=potential_type, prev_prediction=prev_model)
 
-        # Plot the loss history for all etas
-        plot_loss_history(all_loss_histories[potential_type], etas, optimizer_names,
-                          save_path='plots/loss_history_{potential_type}.png', potential_type=potential_type)
+    # Plot the loss history for all etas
+    plot_loss_history(all_loss_histories[potential_type], etas, optimizer_names,
+                      save_path='plots/loss_history_{potential_type}.png', potential_type=potential_type)
 
-        # Plot lambda_pde history for all etas
-        plot_lambda_pde(all_lambda_pde_histories[potential_type], etas, optimizer_names,
-                        save_path=f'plots/lambda_pde_{potential_type}.png', potential_type=potential_type)
+    # Plot lambda_pde history for all etas
+    plot_lambda_pde(all_lambda_pde_histories[potential_type], etas, optimizer_names,
+                    save_path=f'plots/lambda_pde_{potential_type}.png', potential_type=potential_type)
