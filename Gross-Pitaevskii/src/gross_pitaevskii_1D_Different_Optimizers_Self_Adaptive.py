@@ -55,6 +55,9 @@ class GrossPitaevskiiPINN(nn.Module):
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
 
+        # Trainable log-scale weights for adaptive balancing
+        self.log_alpha = nn.Parameter(torch.zeros(5, dtype=torch.float32))
+
     def build_network(self):
         """
         Build the neural network with sine activation functions between layers.
@@ -346,37 +349,45 @@ class GrossPitaevskiiPINN(nn.Module):
     def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
                    precomputed_potential=None, prev_prediction=None):
         """
-        Compute the total loss combining boundary loss, Riesz energy loss,
-        PDE loss, L^2 norm regularization loss, and symmetry loss.
+        Compute the total loss combining multiple loss terms with self-adaptive weight balancing.
 
         Parameters
         ----------
         collocation_points : torch.Tensor
-            Input tensor of spatial coordinates for the interior points.
+            Tensor of spatial coordinates for interior points.
         boundary_points : torch.Tensor
-            Input tensor of boundary spatial points.
+            Tensor of spatial coordinates at domain boundaries.
         boundary_values : torch.Tensor
-            Tensor of boundary values (for Dirichlet conditions).
+            Expected function values at boundary points (Dirichlet conditions).
         eta : float
-            Interaction strength.
+            Interaction strength parameter.
         lb : torch.Tensor
-            Lower bound of interval.
+            Lower bound of the spatial domain.
         ub : torch.Tensor
-            Upper bound of interval.
-        weights : list
-            Weights for different loss terms.
+            Upper bound of the spatial domain.
         potential_type : str
-            Type of potential function to use
-        precomputed_potential : torch.Tensor
-            Precomputed potential. Default is None.
-        prev_prediction : GrossPitaevskiiPINN or None
-            Previously trained model whose predictions are used as part of the training process.
-            If None, the model starts training from scratch.
+            Type of potential function used in the PDE.
+        precomputed_potential : torch.Tensor, optional
+            Precomputed potential values for efficiency (default: None, computed dynamically).
+        prev_prediction : GrossPitaevskiiPINN, optional
+            A previously trained model to incorporate past solutions (default: None).
 
         Returns
         -------
         total_loss : torch.Tensor
-            Total loss value.
+            Combined loss value weighted by dynamically learned coefficients.
+        data_loss : torch.Tensor
+            Loss enforcing boundary conditions.
+        riesz_energy_loss : torch.Tensor
+            Loss based on the Riesz energy formulation.
+        pde_loss : torch.Tensor
+            Loss from the PDE residual enforcement.
+        norm_loss : torch.Tensor
+            Regularization loss ensuring wave function normalization.
+        sym_loss : torch.Tensor
+            Loss enforcing domain symmetry.
+        alpha : torch.Tensor
+            Adaptive weights for balancing individual loss terms.
         """
 
         # Use precomputed potential if provided
@@ -392,15 +403,23 @@ class GrossPitaevskiiPINN(nn.Module):
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
 
+        # Compute self-adaptive weights
+        alpha = torch.exp(self.log_alpha)
+
+        # Normalize weights for self-adaptation
+        # weights = torch.tensor(weights, device=collocation_points.device)
+        # weights = weights / weights.max()
+
         # Scaling factor for pde loss and riesz energy loss
         domain_length = ub - lb
 
         # Compute weighted losses and total loss
         losses = [data_loss, riesz_energy_loss  / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
-        weighted_losses = [weights[i] * loss for i, loss in enumerate(losses)]
+        weighted_losses = [alpha[i] * weights[i] * loss for i, loss in enumerate(losses)]
+        #weighted_losses = [alpha[i] * losses[i] for i in range(len(losses))]
         total_loss = sum(weighted_losses)
 
-        return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss
+        return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss, sym_loss, alpha
 
 
 def initialize_weights(m):
@@ -548,7 +567,7 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
 
         # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
         # with precomputed potential and Thomas-Fermi approximation
-        loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor,
+        loss, data_loss, riesz_energy_loss, pde_loss, norm_loss, sym_loss, alpha = model.total_loss(collocation_points_tensor,
                                                                               boundary_points_tensor,
                                                                               boundary_values_tensor,
                                                                               eta,
@@ -578,7 +597,10 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
                 collocation_points_tensor, model.forward(collocation_points_tensor),
                 eta, potential_type, V, prev_prediction
             )
-            print(f"[{optimizer_name}] Epoch [{epoch}/{epochs}]: η = {eta}, λ_PDE = {lambda_pde.item():.6f}, Loss: {loss.item():.6f}")
+            print(f"[{optimizer_name}] Epoch [{epoch}/{epochs}]: η = {eta}, λ_PDE = {lambda_pde.item():.6f},  Loss: {loss.item():.6f}, "
+                  f"Data Loss = {data_loss.item():.6f}, Riesz Loss = {riesz_energy_loss.item():.6f}, "
+                  f"PDE Loss = {pde_loss.item():.6f}, Norm Loss = {norm_loss.item():.6f}, "
+                  f"Sym Loss = {sym_loss.item():.6f}, Adaptive Weights: {alpha.tolist()}")
 
     return model, loss_history, lambda_pde_history
 
@@ -892,13 +914,14 @@ if __name__ == "__main__":
 
     # Test points
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
-    etas = [1, 10]  # Interaction strengths
+    etas = [1, 10, 50, 100]  # Interaction strengths
 
     # Weights for loss terms
-    weights = [50.0, 1.0, 2.0, 10.0, 50.0]
+    # weights = [50.0, 1.0, 2.0, 10.0, 50.0]
+    weights = [10.0, 1.0, 2.0, 10.0, 10.0]
 
-    #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
-    potential_types = ['harmonic']
+    potential_types = ['gaussian', 'harmonic', 'periodic']
+    #potential_types = ['harmonic']
 
     # Optimizers to compare
     optimizer_names = ["Adam", "AdamW", "Shampoo"]
