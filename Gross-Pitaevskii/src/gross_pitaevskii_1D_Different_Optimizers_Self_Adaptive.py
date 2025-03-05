@@ -406,9 +406,9 @@ class GrossPitaevskiiPINN(nn.Module):
         # Compute self-adaptive weights
         alpha = torch.exp(self.log_alpha)
 
-        # Normalize manual weights to prevent overwhelming adaptation
-        weights = torch.tensor(weights, device=collocation_points.device)
-        weights = weights / weights.max()
+        # Normalize weights for self-adaptation
+        # weights = torch.tensor(weights, device=collocation_points.device)
+        # weights = weights / weights.max()
 
         # Scaling factor for pde loss and riesz energy loss
         domain_length = ub - lb
@@ -418,9 +418,6 @@ class GrossPitaevskiiPINN(nn.Module):
         weighted_losses = [alpha[i] * weights[i] * loss for i, loss in enumerate(losses)]
         #weighted_losses = [alpha[i] * losses[i] for i in range(len(losses))]
         total_loss = sum(weighted_losses)
-
-        # Regularization to prevent extreme weight dominance
-        #total_loss += 0.01 * torch.sum(alpha * torch.log(alpha + 1e-8))
 
         return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss, sym_loss, alpha
 
@@ -923,8 +920,8 @@ if __name__ == "__main__":
     # weights = [50.0, 1.0, 2.0, 10.0, 50.0]
     weights = [10.0, 1.0, 2.0, 10.0, 10.0]
 
-    #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
-    potential_types = ['harmonic']
+    potential_types = ['gaussian', 'harmonic', 'periodic']
+    #potential_types = ['harmonic']
 
     # Optimizers to compare
     optimizer_names = ["Adam", "AdamW", "Shampoo"]

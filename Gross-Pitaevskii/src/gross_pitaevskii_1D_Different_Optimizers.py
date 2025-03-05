@@ -9,6 +9,7 @@ from scipy.special import hermite
 from adabelief_pytorch import AdaBelief
 from pytorch_optimizer import QHAdam, AdaHessian, Ranger21, SophiaH, Shampoo
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from distributed_shampoo import AdamGraftingConfig, DistributedShampoo
 import torch.nn.utils
 
 # import matplotlib
@@ -450,7 +451,8 @@ def prepare_training_data(N_u, N_f, lb, ub):
     return collocation_points, boundary_points, boundary_values
 
 
-def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type, prev_prediction):
+def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type,
+                              prev_prediction, optimizer_name):
     """
     Train the Physics-Informed Neural Network (PINN) for the 1D Gross-Pitaevskii equation.
 
@@ -481,21 +483,43 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
     prev_prediction : GrossPitaevskiiPINN or None
         Previously trained model whose predictions are used as part of the training process.
         If None, the model starts training from scratch.
+    optimizer_name : str
+        Name of optimizer to train.
 
     Returns
     -------
     model : GrossPitaevskiiPINN
         The trained model
-    loss_histories : dict of (eta, optimizer) -> list of float
-        A dictionary where each key is a tuple (eta, optimizer name) and
-        the corresponding value is a list of loss values recorded during training.
-    lambda_pde_histories : dict of (eta, optimizer) -> list of float
-        A dictionary where each key is a tuple (eta, optimizer name) and
-        the corresponding value is a list of λ_PDE values recorded during training.
+    loss_history : list of float
+        List of loss values recorded during training for the specific optimizer.
+    lambda_pde_history : list of float
+        List of λ_PDE values recorded during training for the specific optimizer.
     """
-    # Instantiate the PINN model and initialize its weights
+    # Instantiate the PINN model for each optimizer and initialize its weights
     model = GrossPitaevskiiPINN(layers).to(device)
     model.apply(initialize_weights)
+
+    # Select the optimizer
+    optimizers = {
+        "Adam": optim.Adam(model.parameters(), lr=1e-3),
+        "AdamW": optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.99)),
+        "Shampoo": DistributedShampoo( model.parameters(),
+                                       lr=0.001,
+                                       betas=(0.9, 0.999),
+                                       epsilon=1e-12,
+                                       weight_decay=1e-05,
+                                       max_preconditioner_dim=8192,
+                                       start_preconditioning_step=100,
+                                       precondition_frequency=100,
+                                       use_decoupled_weight_decay=False,
+                                       grafting_config=AdamGraftingConfig(beta2=0.999,epsilon=1e-08),
+                                       )
+
+    }
+
+    optimizer = optimizers[optimizer_name]
+    # scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=epochs // 10, epochs=epochs)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
 
     # Prepare training data (collocation and boundary points)
     collocation_points, boundary_points, boundary_values = prepare_training_data(N_u, N_f, lb, ub)
@@ -515,67 +539,48 @@ def train_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_pat
     #tf_approx = model.compute_thomas_fermi_approx(collocation_points_tensor, V, eta).detach()
     #tf_approx.requires_grad = False
 
-    # Define optimizers
-    optimizer_names = {
-        "Adam": optim.Adam(model.parameters(), lr=1e-3),
-        "AdamW": optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.99), weight_decay=1e-4),
-        "Shampoo": Shampoo(model.parameters(), lr=5e-4, precondition_freq=10)
-        }
+    loss_history = []
+    lambda_pde_history = []
 
-    loss_histories = {} # Store loss histories for each optimizer and different etas
-    lambda_pde_histories = {}  # Track λ_PDE for each optimizer and different etas
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
 
+        # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
+        # with precomputed potential and Thomas-Fermi approximation
+        loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor,
+                                                                              boundary_points_tensor,
+                                                                              boundary_values_tensor,
+                                                                              eta,
+                                                                              lb_tensor, ub_tensor,
+                                                                              weights, potential_type, V,
+                                                                              prev_prediction)
 
-    for optimizer_name, optimizer in optimizer_names.items():
-        model.apply(initialize_weights)  # Reinitialize weights before each optimizer
-        # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
-        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=epochs // 10, epochs=epochs)
-        for epoch in range(epochs):
+        # Backpropagation and optimization
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2)
+        optimizer.step()
+        scheduler.step(loss)
 
-            model.train()
-            optimizer.zero_grad()
+        # Record the total loss and lambda_pde every 100 epochs
+        if epoch % 100 == 0:
+            _, _, lambda_pde = model.pde_loss(
+                collocation_points_tensor, model.forward(collocation_points_tensor),
+                eta, potential_type, V, prev_prediction
+            )
+            loss_history.append(loss.item())
+            lambda_pde_history.append(lambda_pde.detach().cpu().item())
 
-            # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
-            # with precomputed potential and Thomas-Fermi approximation
-            loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor,
-                                                                                  boundary_points_tensor,
-                                                                                  boundary_values_tensor,
-                                                                                  eta,
-                                                                                  lb_tensor, ub_tensor,
-                                                                                  weights, potential_type, V,
-                                                                                  prev_prediction)
+        # Compute λ_PDE, η, and loss every 1,000 epochs
+        if epoch % 1000 == 0:
+            _, _, lambda_pde = model.pde_loss(
+                collocation_points_tensor, model.forward(collocation_points_tensor),
+                eta, potential_type, V, prev_prediction
+            )
+            print(f"[{optimizer_name}] Epoch [{epoch}/{epochs}]: η = {eta}, λ_PDE = {lambda_pde.item():.6f}, Loss: {loss.item():.6f}")
 
-            # Backpropagation and optimization
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0, norm_type=2)
-
-            # Add gradient noise for stability
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad += 0.01 * torch.randn_like(p.grad)
-
-            optimizer.step()
-            scheduler.step()
-
-            # Record the total loss and lambda_pde every 100 epochs
-            if epoch % 100 == 0:
-                _, _, lambda_pde = model.pde_loss(
-                    collocation_points_tensor, model.forward(collocation_points_tensor),
-                    eta, potential_type, V, prev_prediction
-                )
-                key = (eta, optimizer_name)
-                loss_histories.setdefault(key, []).append(loss.item())
-                lambda_pde_histories.setdefault(key, []).append(lambda_pde.detach().cpu().item())
-
-            # Compute λ_PDE, η, and loss every 1,000 epochs
-            if epoch % 1000 == 0:
-                pde_loss, _, lambda_pde = model.pde_loss(
-                    collocation_points_tensor, model.forward(collocation_points_tensor),
-                    eta, potential_type, V, prev_prediction
-                )
-                print(f"[{optimizer_name}] Epoch [{epoch}/{epochs}]: η = {eta}, λ_PDE = {lambda_pde.item():.6f}, Loss: {loss.item():.6f}")
-
-    return model, loss_histories, lambda_pde_histories
+    return model, loss_history, lambda_pde_history
 
 
 def normalize_wave_function(u):
@@ -619,7 +624,8 @@ def plot_potential_1D(X_test, potential):
     plt.show()
 
 
-def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type, prev_model):
+def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type,
+                        prev_model, optimizer_name):
     """
     Train the Physics-Informed Neural Network (PINN) model and save it.
 
@@ -656,6 +662,8 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
     prev_model : GrossPitaevskiiPINN or None
         Previously trained model whose predictions are used as part of the training process.
         If None, the model starts training from scratch.
+    optimizer_name : str
+        Name of optimizer.
 
     Returns
     -------
@@ -677,9 +685,10 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
     model.apply(initialize_weights)
 
     # Train the model
-    model, loss_history, lambda_pde_history = train_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta, epochs=epochs, lb=lb, ub=ub,
-                                     weights=weights, model_save_path=model_save_path, potential_type=potential_type,
-                                     prev_prediction=prev_prediction)
+    model, loss_history, lambda_pde_history = train_pinn_with_optimizer(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
+                                      epochs=epochs, lb=lb, ub=ub, weights=weights, model_save_path=model_save_path,
+                                      potential_type=potential_type, prev_prediction=prev_prediction,
+                                      optimizer_name=optimizer_name)
 
     # Directory to save the models
     model_save_dir = 'models'
@@ -692,23 +701,25 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
     return model, loss_history, lambda_pde_history
 
 
-def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicted_solutions.png', potential_type='gaussian', prev_prediction=None):
+def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicted_solutions.png',
+                     potential_type='gaussian', prev_prediction=None):
     """
-    Predict and plot the solutions for all models and save the plot.
+    Predict and plot the solutions for all models, making separate plots for each optimizer.
 
     Parameters
     ----------
     models : dict
-        A dictionary where keys are optimizer names and values are lists of trained models.
+        A dictionary where keys are η values, and values are dictionaries mapping optimizer names to trained models.
+        Example: models[eta][optimizer_name] -> model
     etas : list of float
-        A list of eta values corresponding to each model.
+        A list of η values used during training.
     optimizers : list of str
         A list of optimizer names used during training.
     X_test : np.ndarray
         Test points along the 1D interval.
     save_path : str, optional
-        The path to save the plot image (default is 'plots/predicted_solutions.png').
-    potential_type  : str, optional
+        The path template to save the plot image (default is 'plots/predicted_solutions_{optimizer}.png').
+    potential_type : str, optional
         Type of potential function to use. Default is 'gaussian'.
     prev_prediction : callable, optional
         A function representing the previous model's forward pass.
@@ -723,85 +734,89 @@ def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicte
     for optimizer_name in optimizers:
         plt.figure(figsize=(10, 6))
 
-        for model, eta in zip(models[optimizer_name], etas):
-            model.eval()  # Set the model to evaluation mode
+        for eta in etas:
+            if eta in models and optimizer_name in models[eta]:
+                model = models[eta][optimizer_name]  # Retrieve model for optimizer and eta
+                model.eval()
 
-            # Prepare test data
-            X_test_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
-            u_pred = model(X_test_tensor).detach().cpu().numpy()
-            u_pred_normalized = normalize_wave_function(u_pred)
+                # Prepare test data
+                X_test_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
+                u_pred = model(X_test_tensor).detach().cpu().numpy()
+                u_pred_normalized = normalize_wave_function(u_pred)
 
-            # Calculate the potential
-            potential = model.compute_potential(X_test_tensor, potential_type)
+                # Calculate the potential
+                potential = model.compute_potential(X_test_tensor, potential_type)
 
-            # Calculate Thomas-Fermi approximation
-            _, _, lambda_pde = model.pde_loss(X_test_tensor,
-                                              model.forward(X_test_tensor), eta,
-                                              potential_type, potential, prev_prediction)
-            tf_approx = model.compute_thomas_fermi_approx(X_test_tensor, potential, eta).detach().cpu().numpy()
-            tf_approx_normalized = normalize_wave_function(tf_approx)
+                # Calculate λ_PDE and the Thomas-Fermi approximation
+                _, _, lambda_pde = model.pde_loss(X_test_tensor,
+                                                  model.forward(X_test_tensor), eta,
+                                                  potential_type, potential, prev_prediction)
+                tf_approx = model.compute_thomas_fermi_approx(X_test_tensor, potential, eta).detach().cpu().numpy()
+                tf_approx_normalized = normalize_wave_function(tf_approx)
 
-            # Plot the predicted solution and TF approximation
-            plt.plot(X_test, u_pred_normalized, label=f'Predicted Solution ($\\eta$ ≈ {eta})')
+                # Plot predicted solution for this optimizer
+                plt.plot(X_test, u_pred_normalized, label=f"η={eta}", linestyle="-")
 
-        # Calculate the weighted hermite approximation
+        # Plot Weighted Hermite Approximation (η=0)
         wh_approx = model.weighted_hermite(X_test_tensor, 0).detach().cpu().numpy()
         wh_approx_normalized = normalize_wave_function(wh_approx)
+        plt.plot(X_test, wh_approx_normalized, linestyle="--", color="black",
+                 label="Weighted Hermite (η=0)")
 
-        plt.plot(X_test, wh_approx_normalized, linestyle='-.',
-                 label=f'Weighted Hermite Approximation ($\\eta$ = 0)')
-
-        plt.title(
-            f'PINN Solution, Thomas-Fermi Approximation, Weighted Hermite Approximation\n'
-            f'Potential: {potential_type.capitalize()}, Optimizer: {optimizer_name}',
-            fontsize="xx-large"
-        )
-        plt.xlabel('$x$', fontsize="xx-large")
-        plt.ylabel('Normalized $u(x)$', fontsize="xx-large")
+        plt.title(f"PINN Solutions - {potential_type.capitalize()} - {optimizer_name}", fontsize="xx-large")
+        plt.xlabel("$x$", fontsize="xx-large")
+        plt.ylabel("Normalized $u(x)$", fontsize="xx-large")
         plt.grid(True)
         plt.legend(fontsize="large")
 
-        # Set larger tick sizes
+        # Set tick sizes
         plt.xticks(fontsize="x-large")
         plt.yticks(fontsize="x-large")
 
-        # Save the plot
-        save_path = save_path.format(potential_type=potential_type)
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        # Save the plot for this optimizer
+        optimizer_plot_path = save_path.format(optimizer=optimizer_name, potential_type=potential_type)
+        plt.savefig(optimizer_plot_path, dpi=300, bbox_inches='tight')
         plt.show()
 
 
-def plot_loss_history(loss_histories, etas, save_path='plots/loss_history.png', potential_type='gaussian'):
+def plot_loss_history(loss_histories, etas, optimizer_names, save_path='plots/loss_history.png', potential_type='gaussian'):
     """
-    Plot the training loss history for different values of eta and save the plot.
+    Plot the training loss history for all optimizers and interaction strengths (etas) in a single plot.
 
     Parameters
     ----------
-    loss_histories : dict of (eta, optimizer) -> list of float
-        A dictionary where each key is a tuple (eta, optimizer name) and
-        the corresponding value is a list of loss values recorded during training.
+    loss_histories : dict
+        Dictionary where keys are eta values, and values are dictionaries mapping optimizer names to loss history lists.
     etas : list of float
-        A list of eta values corresponding to each loss history.
+        List of eta values used in training.
+    optimizer_names : list of str
+        List of optimizer names used during training.
     save_path : str, optional
-        The path to save the plot image (default is 'plots/loss_history.png').
-    potential_type  : str, optional
+        File path to save the plot, by default 'plots/loss_history.png'.
+    potential_type : str, optional
         Type of potential function to use. Default is 'gaussian'.
 
     Returns
     -------
     None
     """
+
     # Ensure the plots directory exists
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     plt.figure(figsize=(10, 6))
-    for (eta, optimizer_name), loss_history in loss_histories.items():
-        plt.plot(loss_history, label=f'Loss ({optimizer_name}, η={eta})')
+
+    for optimizer_name in optimizer_names:
+        for eta in etas:
+            if eta in loss_histories and optimizer_name in loss_histories[eta]:
+                loss = loss_histories[eta][optimizer_name]
+                plt.plot(np.arange(len(loss)), loss, marker='o', label=f"{optimizer_name}, η={eta}")
 
     plt.xlabel('Training step (x 100)', fontsize="xx-large")
     plt.ylabel('Total Loss', fontsize="xx-large")
     plt.yscale('log')
-    plt.title(f'Loss History for Different Interaction Strengths ($\\eta$) for {potential_type.capitalize()} Potential', fontsize="xx-large")
+    plt.title(f'Loss History for Different Interaction Strengths ($\\eta$) for {potential_type.capitalize()} Potential',
+              fontsize="xx-large")
     plt.legend(fontsize="large")
     plt.grid(True)
 
@@ -815,33 +830,44 @@ def plot_loss_history(loss_histories, etas, save_path='plots/loss_history.png', 
     plt.show()
 
 
-def plot_lambda_pde(lambda_pde_histories, etas, save_path="plots/lambda_pde.png"):
+def plot_lambda_pde(lambda_pde_histories, etas, optimizer_names, save_path="plots/lambda_pde.png", potential_type="harmonic"):
     """
-    Plots the evolution of lambda_pde over training iterations for different interaction strengths (etas).
+    Plot the evolution of λ_PDE over training iterations for all optimizers and interaction strengths in one figure.
 
     Parameters
     ----------
-    lambda_pde_histories : dict of (eta, optimizer) -> list of float
-        Dictionary where each key is a tuple (eta, optimizer name) and values are lists of λ_PDE values.
-    etas : list
+    lambda_pde_histories : dict
+        Dictionary where keys are eta values, and values are dictionaries mapping optimizer names to lambda_pde history lists.
+    etas : list of float
         List of eta values used in training.
+    optimizer_names : list of str
+        List of optimizer names used during training.
     save_path : str, optional
-        File path to save the plot, by default "plots/lambda_pde.png".
+        File path to save the plot, by default 'plots/lambda_pde.png'.
+    potential_type : str, optional
+        Type of potential function to use. Default is 'gaussian'.
 
-    Notes
-    -----
-    This function assumes that lambda_pde is recorded every 100 iterations.
-
+    Returns
+    -------
+    None
     """
+
+    # Ensure the plots directory exists
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
     plt.figure(figsize=(10, 6))
 
-    for (eta, optimizer_name), lambda_values in lambda_pde_histories.items():
-        iterations = np.arange(0, len(lambda_values) * 100, 100)
-        plt.plot(iterations, lambda_values, marker='o', linestyle='-', label=fr'$\eta={eta}, {optimizer_name}$')
+    for optimizer_name in optimizer_names:
+        for eta in etas:
+            if eta in lambda_pde_histories and optimizer_name in lambda_pde_histories[eta]:
+                lambda_pde = lambda_pde_histories[eta][optimizer_name]
+                plt.plot(np.arange(len(lambda_pde)), lambda_pde, marker='o', label=f"{optimizer_name}, η={eta}")
 
     plt.xlabel('Training step (x 100)', fontsize="xx-large")
     plt.ylabel(r"$\lambda_{PDE}$", fontsize="xx-large")
-    plt.title(r"$\lambda_{PDE}$ for Different Interaction Strengths ($\eta$) for " + f"{potential_type.capitalize()} Potential", fontsize="xx-large")
+    plt.title(
+        r"$\lambda_{PDE}$ for Different Interaction Strengths ($\eta$) for " + f"{potential_type.capitalize()} Potential",
+        fontsize="xx-large")
     plt.grid(True, linestyle="--", linewidth=0.5)
     plt.legend()
 
@@ -849,7 +875,9 @@ def plot_lambda_pde(lambda_pde_histories, etas, save_path="plots/lambda_pde.png"
     plt.xticks(fontsize="x-large")
     plt.yticks(fontsize="x-large")
 
-    plt.savefig(save_path)
+    # Save the plot
+    save_path = save_path.format(potential_type=potential_type)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
 
 
@@ -872,39 +900,54 @@ if __name__ == "__main__":
     #potential_types = ['gaussian', 'double_well', 'harmonic', 'periodic']
     potential_types = ['harmonic']
 
-    # Loop through each potential type
-    for potential_type in potential_types:
+    # Optimizers to compare
+    optimizer_names = ["Adam", "AdamW", "Shampoo"]
 
-        # Train and save models and loss history for different interaction strengths
-        # models = [] # Store all trained models
-        models = {}  # Dictionary to store models per optimizer
-        prev_model = None  # For eta = 1, use the weighted hermite approximation
-        loss_histories = {}  # Store loss history for each (eta, optimizer) pair
-        lambda_pde_histories = {}  # Store lambda_pde values for each eta
+    # Store results for plotting
+    all_loss_histories = {}
+    all_lambda_pde_histories = {}
+    models = {eta: {} for eta in etas}  # Store models for all η and optimizers
+
+# Loop through each potential type
+for potential_type in potential_types:
+
+    for optimizer_name in optimizer_names:
+        print(f"Training with {optimizer_name} optimizer...")
+
+        # Store results for each optimizer separately
+        prev_model = None
+        loss_histories = {}
+        lambda_pde_histories = {}
+
         for eta in etas:
-            model_save_path = f"trained_model_eta_{eta}.pth"
+            model_save_path = f"trained_model_eta_{eta}_{optimizer_name}.pth"
             model, loss_history, lambda_pde_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
                                                                           epochs=epochs, lb=lb, ub=ub,
                                                                           weights=weights, model_save_path=model_save_path,
-                                                                          potential_type=potential_type, prev_model=prev_model)
+                                                                          potential_type=potential_type, prev_model=prev_model,
+                                                                          optimizer_name=optimizer_name)
             prev_model = model  # Store the trained model for the next iteration
 
-            # Store loss histories and optimizer names for optimizers
-            for (eta_key, optimizer_name), loss_values in loss_history.items():
-                if optimizer_name not in models:
-                    models[optimizer_name] = []
-                models[optimizer_name].append(model)  # Store the trained model
-                loss_histories.setdefault((eta_key, optimizer_name), []).extend(loss_values)
+            # Store models by eta and optimizer
+            models[eta][optimizer_name] = model
 
-            # Store λ_PDE histories per optimizer
-            for (eta_key, optimizer_name), lambda_values in lambda_pde_history.items():
-                lambda_pde_histories.setdefault((eta_key, optimizer_name), []).extend(lambda_values)
+            # Store loss and λ_PDE history under each eta for this optimizer
+            if potential_type not in all_loss_histories:
+                all_loss_histories[potential_type] = {}
+            if potential_type not in all_lambda_pde_histories:
+                all_lambda_pde_histories[potential_type] = {}
 
-        # Predict and plot the solutions for each optimizer separately
-        predict_and_plot(models, etas, list(models.keys()), X_test, save_path='plots/predicted_solutions_{potential_type}.png', potential_type=potential_type, prev_prediction=prev_model)
+            all_loss_histories[potential_type].setdefault(eta, {})[optimizer_name] = loss_history
+            all_lambda_pde_histories[potential_type].setdefault(eta, {})[optimizer_name] = lambda_pde_history
 
-        # Plot the loss history for all etas
-        plot_loss_history(loss_histories, etas, save_path='plots/loss_history_{potential_type}.png', potential_type=potential_type)
+    # Predict and plot the solutions for each optimizer separately
+    predict_and_plot(models, etas, optimizer_names, X_test, save_path='plots/predicted_solutions_{potential_type}.png',
+                     potential_type=potential_type, prev_prediction=prev_model)
 
-        # Plot lambda_pde history for all etas
-        plot_lambda_pde(lambda_pde_histories, etas, save_path=f'plots/lambda_pde_{potential_type}.png')
+    # Plot the loss history for all etas
+    plot_loss_history(all_loss_histories[potential_type], etas, optimizer_names,
+                      save_path='plots/loss_history_{potential_type}.png', potential_type=potential_type)
+
+    # Plot lambda_pde history for all etas
+    plot_lambda_pde(all_lambda_pde_histories[potential_type], etas, optimizer_names,
+                    save_path=f'plots/lambda_pde_{potential_type}.png', potential_type=potential_type)
