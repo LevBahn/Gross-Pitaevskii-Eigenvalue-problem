@@ -112,6 +112,9 @@ class GrossPitaevskiiPINN(nn.Module):
             Output tensor representing the predicted solution.
         """
         return self.network(inputs)
+        # perturbation = self.network(inputs)  # The neural network predicts a perturbation term
+        # hermite_approx = self.weighted_hermite(inputs, self.mode)  # Base Hermite function
+        # return hermite_approx + perturbation  # Total wave function
 
     def compute_potential(self, x, potential_type="harmonic", **kwargs):
         """
@@ -197,6 +200,8 @@ class GrossPitaevskiiPINN(nn.Module):
             u = self.weighted_hermite(boundary_points, self.mode) + u_pred
         else:
             u = prev_prediction(boundary_points) + u_pred  # Use model’s output from previous eta
+            # u = self.weighted_hermite(boundary_points, self.mode)  # Start with the base weighted hermite solution
+            # u += prev_prediction(boundary_points) + u_pred  # Iteratively add perturbations
 
         return torch.mean((u - boundary_values) ** 2)
 
@@ -228,8 +233,9 @@ class GrossPitaevskiiPINN(nn.Module):
         if prev_prediction is None:
             u = self.weighted_hermite(inputs, self.mode) + predictions
         else:
-            scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
             u = prev_prediction(inputs) + predictions  # Use model’s output from previous eta
+            # u = self.weighted_hermite(inputs, self.mode)  # Start with the base weighted hermite solution
+            # u += prev_prediction(inputs) + predictions  # Iteratively add perturbations
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
@@ -280,8 +286,9 @@ class GrossPitaevskiiPINN(nn.Module):
         if prev_prediction is None:
             u = self.weighted_hermite(inputs, self.mode) + predictions
         else:
-            scaling_factor = torch.sqrt(torch.tensor(eta, dtype=torch.float32, device=device))
             u = prev_prediction(inputs) + predictions # Use model’s output from previous eta
+            # u = self.weighted_hermite(inputs, self.mode)  # Start with the base weighted hermite solution
+            # u += prev_prediction(inputs) + predictions  # Iteratively add perturbations
 
         # Compute first and second derivatives with respect to x
         u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -756,6 +763,8 @@ def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicte
     for optimizer_name in optimizers:
         plt.figure(figsize=(10, 6))
 
+        accumulated_prediction = None  # Store cumulative perturbations
+
         for eta in etas:
             if eta in models and optimizer_name in models[eta]:
                 model = models[eta][optimizer_name]  # Retrieve model for optimizer and eta
@@ -763,8 +772,18 @@ def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicte
 
                 # Prepare test data
                 X_test_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
+
+                # Weighted Hermite Approximation (η=0)
+                wh_approx = model.weighted_hermite(X_test_tensor, 0).detach().cpu().numpy()
+
+                # Get the model's prediction
                 u_pred = model(X_test_tensor).detach().cpu().numpy()
-                u_pred_normalized = normalize_wave_function(u_pred)
+
+                # Accumulate perturbations from previous eta values
+                if accumulated_prediction is None:
+                    accumulated_prediction = wh_approx + u_pred  # Base solution
+                else:
+                    accumulated_prediction += u_pred  # Add perturbations iteratively
 
                 # Calculate the potential
                 potential = model.compute_potential(X_test_tensor, potential_type)
@@ -777,12 +796,12 @@ def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicte
                 tf_approx_normalized = normalize_wave_function(tf_approx)
 
                 # Plot predicted solution for this optimizer
-                plt.plot(X_test, u_pred_normalized, label=f"η={eta}", linestyle="-")
+                plt.plot(X_test, accumulated_prediction, label=f"η={eta}", linestyle="-")
 
         # Plot Weighted Hermite Approximation (η=0)
         wh_approx = model.weighted_hermite(X_test_tensor, 0).detach().cpu().numpy()
         wh_approx_normalized = normalize_wave_function(wh_approx)
-        plt.plot(X_test, wh_approx_normalized, linestyle="--", color="black",
+        plt.plot(X_test, wh_approx, linestyle="--", color="black",
                  label="Weighted Hermite (η=0)")
 
         plt.title(f"PINN Solutions - {potential_type.capitalize()} - {optimizer_name}", fontsize="xx-large")
