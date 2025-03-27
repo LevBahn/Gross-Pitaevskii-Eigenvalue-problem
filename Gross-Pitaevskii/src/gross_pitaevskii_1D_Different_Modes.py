@@ -183,30 +183,30 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def get_complete_solution(self, x, perturbation, prev_prediction=None, mode=0):
         """
-        Combine the weighted Hermite approximation and the learned perturbation.
+        Combine base solution with learned perturbation.
 
         Parameters:
         -----------
         x : torch.Tensor
-            Input tensor of spatial coordinates.
+            Spatial coordinates.
         perturbation : torch.Tensor
-            The perturbation predicted by the neural network.
+            Learned perturbation from the neural network.
         prev_prediction : callable, optional
             Previously trained model's prediction function.
-        mode: int
-            Mode of ground state solution to Gross-Pitavskii equation. Default is 0.
+        mode : int
+            Mode of ground state solution.
 
         Returns:
         --------
         torch.Tensor
-            The complete wave function solution.
+            Complete wave function solution.
         """
         if prev_prediction is None:
-            # For the first model (eta=0), use weighted Hermite as base
+            # For η = 0, use weighted Hermite as base
             base_solution = self.weighted_hermite(x, mode)
             complete_solution = base_solution + self.alpha * perturbation
         else:
-            # For subsequent models, use previous complete solution plus perturbation
+            # For η > 0, use previous solution as base
             prev_solution = prev_prediction(x)
             complete_solution = prev_solution + self.alpha * perturbation
 
@@ -445,7 +445,7 @@ class GrossPitaevskiiPINN(nn.Module):
         width_penalty = -eta * torch.mean(collocation_points ** 2 * torch.abs(self.forward(collocation_points)) ** 2)
 
         # total_loss = data_loss + (pde_loss / domain_length) + (riesz_energy_loss  / domain_length) #+ 0.01 * width_penalty
-        #total_loss = data_loss + 0.1 * (pde_loss / domain_length) + 0.1 * (riesz_energy_loss / domain_length) #+ norm_loss
+        total_loss = data_loss + (pde_loss / domain_length) +  (riesz_energy_loss / domain_length) #+ norm_loss
 
         return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss
 
@@ -949,55 +949,56 @@ def plot_lambda_pde(lambda_pde_histories, etas, optimizer_names, save_path="plot
 
 def make_prev_prediction(prev_model, prev_prev_prediction, mode):
     """
-    Creates a callable function that returns the complete solution from a previously trained model,
-    using its perturbation output and recursively incorporating prior predictions from earlier models.
-
-    This function is used to form a chain of solutions where each model builds upon the complete
-    solution learned at the previous interaction strength (eta). For eta > 0, the complete solution
-    is formed by combining the previous model's solution with the current model's learned perturbation.
+    Creates a more physically meaningful prediction function that ensures:
+    1. For η = 0, the solution is the weighted Hermite approximation
+    2. For η > 0, the solution is a systematic perturbation from the ground state
 
     Parameters
     ----------
     prev_model : GrossPitaevskiiPINN
         The previously trained PINN model at the previous eta value.
     prev_prev_prediction : callable or None
-        A recursive callable representing the complete solution from the eta value before the previous one.
-        This may be `None` when the previous model was trained at eta = 0.
+        A recursive callable representing the complete solution from the previous eta value.
     mode : int
-        The quantum mode number corresponding to the solution (e.g., 0 for ground state).
+        The quantum mode number corresponding to the solution.
 
     Returns
     -------
     prev_prediction : callable
-        A function that takes an input tensor `x` and returns the complete wave function solution
-        predicted by `prev_model`, recursively incorporating all earlier solutions.
+        A function that computes the complete wave function solution.
     """
-
-    # Set the model to evaluation mode to ensure consistent behavior (e.g., dropout off, batchnorm frozen)
     prev_model.eval()
 
     def prev_prediction(x):
         """
-        Compute the complete solution at input points `x` using the previous model's prediction
-        and the recursively stored earlier complete solution.
+        Compute the complete solution at input points `x`.
 
         Parameters
         ----------
         x : torch.Tensor
-            Input tensor of spatial coordinates where the solution is evaluated.
+            Input tensor of spatial coordinates.
 
         Returns
         -------
         torch.Tensor
-            The complete solution at input `x` based on the previous model and prior predictions.
+            The complete solution at input `x`.
         """
-        # Get the perturbation from the model's forward pass
-        perturbation = prev_model.forward(x)
-
-        # Recursively compute the complete solution by combining the perturbation
-        # with the complete solution from the previous eta step (prev_prev_prediction)
         with torch.no_grad():
-            return prev_model.get_complete_solution(x, perturbation, prev_prev_prediction, mode)
+            # If this is the first model (η = 0), use weighted Hermite approximation
+            if prev_prev_prediction is None:
+                base_solution = prev_model.weighted_hermite(x, mode)
+                return base_solution
+
+            # For subsequent models (η > 0), create a systematic perturbation
+            perturbation = prev_model.forward(x)
+            complete_solution = prev_model.get_complete_solution(
+                x,
+                perturbation,
+                prev_prediction=prev_prev_prediction,
+                mode=mode
+            )
+
+            return complete_solution
 
     return prev_prediction
 
@@ -1006,7 +1007,7 @@ if __name__ == "__main__":
     # Parameters
     N_u = 400  # Number of boundary points
     N_f = 2000  # Number of collocation points
-    epochs = 101  # Number of iterations of training
+    epochs = 5001  # Number of iterations of training
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
@@ -1021,10 +1022,11 @@ if __name__ == "__main__":
     potential_types = ['harmonic']
 
     # Optimizers to compare
-    optimizer_names = ["Adam"]
+    optimizer_names = ["Shampoo"]
 
     # Modes for ground state solution to Gross-Pitavskii equation
-    modes = [0, 1, 2, 3]  # Reduced number of modes for faster testing
+    # modes = [0, 1, 2, 3]  # Reduced number of modes for faster testing
+    modes = [0]
 
     # Store results for plotting
     all_loss_histories = {}
