@@ -444,8 +444,8 @@ class GrossPitaevskiiPINN(nn.Module):
         # Add regularization term to encourage wider solutions for higher eta
         width_penalty = -eta * torch.mean(collocation_points ** 2 * torch.abs(self.forward(collocation_points)) ** 2)
 
-        # total_loss = data_loss + (pde_loss / domain_length) + (riesz_energy_loss  / domain_length) #+ 0.01 * width_penalty
-        total_loss = data_loss + (pde_loss / domain_length) +  (riesz_energy_loss / domain_length) #+ norm_loss
+        # total_loss = data_loss + (pde_loss / domain_length) + (riesz_energy_loss  / domain_length) + width_penalty
+        total_loss = data_loss + (pde_loss / domain_length) +  (riesz_energy_loss / domain_length) + norm_loss
 
         return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss
 
@@ -786,49 +786,41 @@ def predict_and_plot(models, etas, optimizers, mode, X_test, save_path='plots/pr
     """
     # Make a new directory if the plots directory doesn't exist
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-    # Make sure X_test_tensor has requires_grad=True
     X_test_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
 
     for optimizer_name in optimizers:
         plt.figure(figsize=(10, 6))
 
-        # Plot analytical solution for η=0 (weighted Hermite)
-        if etas[0] in models and optimizer_name in models[etas[0]]:
-            base_model = models[etas[0]][optimizer_name]
-            wh_approx = base_model.weighted_hermite(X_test_tensor, mode).detach().cpu().numpy()
-            plt.plot(X_test, wh_approx, linestyle="--", color="black", label="Weighted Hermite (η=0)")
+        prev_prediction = None  # Reset for each optimizer
 
-        # Plot solutions for each eta
-        for eta in etas:
+        for i, eta in enumerate(etas):
             if eta in models and optimizer_name in models[eta]:
                 model = models[eta][optimizer_name]
                 model.eval()
 
-                # Calculate predictions
-                u_pred = model.forward(X_test_tensor)
-                # complete_solution = model.get_complete_solution(X_test_tensor, u_pred)
-                # solution = np.abs(complete_solution.detach().cpu().numpy())
-                # solution = np.abs(u_pred.detach().cpu().numpy())
-                solution = u_pred.detach().cpu().numpy()
-
-                # For η=0, just use the weighted Hermite
+                # Base solution for η = 0
                 if eta == 0:
-                    solution = wh_approx
-                else:
-                    # Calculate potential
-                    potential = model.compute_potential(X_test_tensor, potential_type)
+                    wh_approx = model.weighted_hermite(X_test_tensor, mode).detach().cpu().numpy()
+                    plt.plot(X_test, wh_approx, linestyle="--", color="black", label="Weighted Hermite (η=0)")
 
-                    # Calculate lambda_pde with gradient tracking enabled
-                    _, _, lambda_pde = model.pde_loss(X_test_tensor, u_pred, eta, potential_type, potential)
+                # Predict u_pred from model
+                u_pred = model.forward(X_test_tensor)
+                complete_solution = model.get_complete_solution(X_test_tensor, u_pred, prev_prediction, mode)
+                solution = complete_solution.detach().cpu().numpy()
 
-                    # Thomas-Fermi approximation
-                    tf_approx = model.compute_thomas_fermi_approx(lambda_pde.item(), potential, eta)
-                    if tf_approx is not None and eta == 0:
-                        tf_approx = tf_approx.detach().cpu().numpy()
-                        plt.plot(X_test, tf_approx, linestyle=":", label=f"TF approx (η={eta})")
+                # Plot
+                plt.plot(X_test, np.abs(solution), label=f"η={eta}", linestyle="-")
 
-                plt.plot(X_test, solution, label=f"η={eta}", linestyle="-")
+                # Update prev_prediction using the correct flattening
+                def make_flat_prev_prediction(model_snapshot):
+                    def flat_prev(x):
+                        with torch.no_grad():
+                            pert = model_snapshot.forward(x)
+                            return model_snapshot.get_complete_solution(x, pert, None, mode)
+
+                    return flat_prev
+
+                prev_prediction = make_flat_prev_prediction(model)
 
         plt.title(f"PINN Solutions - {potential_type.capitalize()} - {optimizer_name} - Mode {mode}",
                   fontsize="xx-large")
@@ -947,58 +939,15 @@ def plot_lambda_pde(lambda_pde_histories, etas, optimizer_names, save_path="plot
     plt.show()
 
 
-def make_prev_prediction(prev_model, prev_prev_prediction, mode):
-    """
-    Creates a more physically meaningful prediction function that ensures:
-    1. For η = 0, the solution is the weighted Hermite approximation
-    2. For η > 0, the solution is a systematic perturbation from the ground state
-
-    Parameters
-    ----------
-    prev_model : GrossPitaevskiiPINN
-        The previously trained PINN model at the previous eta value.
-    prev_prev_prediction : callable or None
-        A recursive callable representing the complete solution from the previous eta value.
-    mode : int
-        The quantum mode number corresponding to the solution.
-
-    Returns
-    -------
-    prev_prediction : callable
-        A function that computes the complete wave function solution.
-    """
+def make_prev_prediction(prev_model, mode):
     prev_model.eval()
 
     def prev_prediction(x):
-        """
-        Compute the complete solution at input points `x`.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor of spatial coordinates.
-
-        Returns
-        -------
-        torch.Tensor
-            The complete solution at input `x`.
-        """
         with torch.no_grad():
-            # If this is the first model (η = 0), use weighted Hermite approximation
-            if prev_prev_prediction is None:
-                base_solution = prev_model.weighted_hermite(x, mode)
-                return base_solution
-
-            # For subsequent models (η > 0), create a systematic perturbation
-            perturbation = prev_model.forward(x)
-            complete_solution = prev_model.get_complete_solution(
-                x,
-                perturbation,
-                prev_prediction=prev_prev_prediction,
-                mode=mode
-            )
-
-            return complete_solution
+            # Always return the full solution for η=N (not stacking recursively)
+            base_perturbation = prev_model.forward(x)
+            base_solution = prev_model.get_complete_solution(x, base_perturbation, None, mode)
+            return base_solution
 
     return prev_prediction
 
@@ -1007,7 +956,7 @@ if __name__ == "__main__":
     # Parameters
     N_u = 400  # Number of boundary points
     N_f = 2000  # Number of collocation points
-    epochs = 5001  # Number of iterations of training
+    epochs = 2001  # Number of iterations of training
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
@@ -1017,12 +966,12 @@ if __name__ == "__main__":
     etas = [0, 10, 20, 30, 40]  # Interaction strengths
 
     # Weights for loss terms
-    weights = [50.0, 1.0, 2.0, 10.0, 50.0]
+    weights = [50.0, 1.0, 2.0, 100.0, 50.0]
 
     potential_types = ['harmonic']
 
     # Optimizers to compare
-    optimizer_names = ["Shampoo"]
+    optimizer_names = ["Adam"]
 
     # Modes for ground state solution to Gross-Pitavskii equation
     # modes = [0, 1, 2, 3]  # Reduced number of modes for faster testing
@@ -1067,7 +1016,7 @@ if __name__ == "__main__":
                         optimizer_name=optimizer_name, mode=mode)
 
                     # Store the previous prediction for the next iteration
-                    prev_prediction = make_prev_prediction(model, prev_prediction, mode)
+                    prev_prediction = make_prev_prediction(model, mode)
 
                     # Store models by eta and optimizer
                     models[eta][optimizer_name] = model
