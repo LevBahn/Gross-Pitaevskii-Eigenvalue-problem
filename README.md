@@ -18,7 +18,7 @@ The following Python libraries are required:
 - `numpy` (for matrix operations)
 - `pyDOE` (for Latin Hypercube Sampling of collocation points)
 - `matplotlib` (for visualizing the results)
-- 'scipy' (for special functions)
+- `scipy` (for special functions)
 
 Install these dependencies using:
 
