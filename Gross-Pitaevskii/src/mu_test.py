@@ -29,7 +29,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, beta_init=1.0, alpha_init=1.0, decay_rate=0.001):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, beta_init=1.0, alpha_init=1.0, decay_rate=0.001, gamma=1.0):
         """
         Parameters
         ----------
@@ -58,6 +58,7 @@ class GrossPitaevskiiPINN(nn.Module):
         self.alpha = alpha_init
         self.decay_rate = decay_rate
         self.iteration = 0
+        self.gamma = gamma  # Interaction strength parameter
 
     def update_alpha_beta(self):
         """
@@ -108,7 +109,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def fixed_mu_pde_loss(self, inputs, predictions, mu, gamma, potential_type, precomputed_potential=None,
                           prev_prediction=None, mode=0):
-        u = self.get_complete_solution(inputs, predictions, prev_prediction, mode)
+        u = self.get_complete_solution(inputs, predictions, mode)
 
         u_x = torch.autograd.grad(outputs=u, inputs=inputs,
                                   grad_outputs=torch.ones_like(u),
@@ -122,9 +123,38 @@ class GrossPitaevskiiPINN(nn.Module):
         else:
             V = self.compute_potential(inputs, potential_type)
 
-        residual = -u_xx + V * u + gamma * u ** 3 - mu * u
+        # Use gamma for the interaction term as per the paper
+        residual = -0.5 * u_xx + V * u + gamma * u ** 3 - mu * u
         pde_loss = torch.mean(residual ** 2)
         return pde_loss, residual
+
+    def pde_loss(self, inputs, predictions, gamma, potential_type, precomputed_potential=None, prev_prediction=None,
+                 mode=0):
+        """
+        Compute the PDE loss for the Gross-Pitaevskii equation.
+        """
+        u = self.get_complete_solution(inputs, predictions, mode)
+
+        # Compute first and second derivatives with respect to x
+        u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+        u_xx = grad(u_x, inputs, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+
+        # Compute potential
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
+
+        # Calculate chemical potential (μ) as per the paper
+        lambda_pde = torch.mean(0.5 * u_x ** 2 + V * u ** 2 + gamma * u ** 4) / torch.mean(u ** 2)
+
+        # Residual of the 1D Gross-Pitaevskii equation (with the 0.5 factor for kinetic term)
+        pde_residual = -0.5 * u_xx + V * u + gamma * u ** 2 * u - lambda_pde * u
+
+        # PDE loss (residual)
+        pde_loss = torch.mean(pde_residual ** 2)
+
+        return pde_loss, pde_residual, lambda_pde
 
     def forward(self, inputs):
         """
@@ -170,17 +200,17 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return V
 
-    def compute_thomas_fermi_approx(self, lambda_pde, potential, eta):
+    def compute_thomas_fermi_approx(self, mu, x, gamma):
         """
         Calculate the Thomas–Fermi approximation for the given potential.
 
         Parameters
         ----------
-        lambda_pde : float
-            Eigenvalue from lowest energy ground state.
-        potential : torch.Tensor
-            Potential values corresponding to the spatial coordinates.
-        eta : float
+        mu : float
+            Chemical potential.
+        x : torch.Tensor
+            Spatial coordinates.
+        gamma : float
             Interaction strength.
 
         Returns
@@ -188,23 +218,29 @@ class GrossPitaevskiiPINN(nn.Module):
         torch.Tensor
             Thomas–Fermi approximation of the wave function.
         """
-        # For eta = 0, return None (TF approximation not valid)
-        if eta == 0:
+        # For gamma = 0, return None (TF approximation not valid)
+        if gamma == 0:
             return None
 
-        # Calculate TF approximation: ψ_TF(x) = sqrt(max(0, (λ - V(x))/η))
-        # tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
-        tf_approx = torch.sqrt((lambda_pde - potential) / eta)
+        # Compute potential
+        V = self.compute_potential(x, "harmonic")
+
+        # Calculate TF approximation: ψ_TF(x) = sqrt(max(0, (μ - V(x))/γ))
+        zeros = torch.zeros_like(x)
+        tf_approx = torch.sqrt(torch.maximum((mu - V) / gamma, zeros))
+
+        # Normalize the TF approximation
+        if torch.sum(tf_approx ** 2) > 0:
+            # If dx is available
+            if x.size(0) > 1:
+                dx = x[1, 0] - x[0, 0]
+                norm = torch.sqrt(torch.sum(tf_approx ** 2) * dx)
+                tf_approx = tf_approx / norm
 
         return tf_approx
 
-    def get_complete_solution(self, x, perturbation, prev_prediction=None, mode=0):
-        if prev_prediction is None:
-            base_solution = self.weighted_hermite(x, mode)
-        else:
-            base_solution = prev_prediction(x)
-
-        # return self.alpha * (base_solution + perturbation)
+    def get_complete_solution(self, x, perturbation, mode=0):
+        base_solution = self.weighted_hermite(x, mode)
         return base_solution + self.alpha * perturbation
 
     def boundary_loss(self, boundary_points, boundary_values, prev_prediction=None, mode=0):
@@ -229,9 +265,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Mean squared error (MSE) at the boundary points.
         """
         u_pred = self.forward(boundary_points)
-        u = self.get_complete_solution(boundary_points, u_pred, prev_prediction, mode)
-
-        return torch.mean((u - boundary_values) ** 2)
+        full_u = self.get_complete_solution(boundary_points, u_pred, mode)
+        return torch.mean((full_u - boundary_values) ** 2)
 
     def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None, prev_prediction=None, mode=0):
         """
@@ -261,7 +296,7 @@ class GrossPitaevskiiPINN(nn.Module):
             Riesz energy loss value.
         """
 
-        u = self.get_complete_solution(inputs, predictions, prev_prediction, mode)
+        u = self.get_complete_solution(inputs, predictions, mode)
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
@@ -279,72 +314,6 @@ class GrossPitaevskiiPINN(nn.Module):
 
         riesz_energy = 0.5 * (laplacian_term + potential_term + interaction_term)
         return riesz_energy
-
-    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None, prev_prediction=None, mode=0):
-        """
-        Compute the PDE loss for the Gross-Pitaevskii equation.
-
-        Parameters
-        ----------
-        inputs : torch.Tensor
-            Input tensor of spatial coordinates (collocation points).
-        predictions : torch.Tensor
-            Predicted solution from the network.
-        eta : float
-            Interaction strength.
-        potential_type : str
-            Type of potential function to use.
-        precomputed_potential : torch.Tensor
-            Precomputed potential. Default is None.
-        prev_prediction : GrossPitaevskiiPINN or None
-            Previously trained model whose predictions are used as part of the training process.
-            If None, the model starts training from scratch.
-        mode: int
-            Mode of ground state solution to Gross-Pitavskii equation. Default is 0.
-
-        Returns
-        -------
-        tuple
-            Tuple containing:
-                - torch.Tensor: PDE loss value.
-                - torch.Tensor: PDE residual.
-                - torch.Tensor: Smallest eigenvalue (lambda).
-        """
-        u = self.get_complete_solution(inputs, predictions, prev_prediction, mode)
-
-        # Compute first and second derivatives with respect to x
-        u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-        u_xx = grad(u_x, inputs, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
-
-        # Compute λ from the energy functional
-        if precomputed_potential is not None:
-            V = precomputed_potential
-        else:
-            V = self.compute_potential(inputs, potential_type)
-        lambda_pde = torch.mean(u_x ** 2 + V * u ** 2 + eta * u ** 4) / torch.mean(u ** 2)
-
-        # Residual of the 1D Gross-Pitaevskii equation
-        if precomputed_potential is not None:
-            V = precomputed_potential
-        else:
-            V = self.compute_potential(inputs, potential_type)
-        pde_residual = -u_xx + V * u + eta * torch.abs(u ** 2) * u - lambda_pde * u
-
-        # Regularization: See https://arxiv.org/abs/2010.05075
-
-        # Term 1: L_f = 1 / (f(x, λ))^2, penalizes the network if the PDE residual is close to zero to avoid trivial eigenfunctions
-        L_f = 1 / (torch.mean(u ** 2) + 1e-2)
-
-        # Term 2: L_λ = 1 / λ^2, penalizes small eigenvalues λ, ensuring non-trivial eigenvalues
-        L_lambda = 1 / (lambda_pde ** 2 + 1e-6)
-
-        # Term 3: L_drive = e^(-λ + c), encourages λ to grow, preventing collapse to small values
-        L_drive = torch.exp(-lambda_pde + 1.0)
-
-        # PDE loss (residual plus regularization terms)
-        pde_loss = torch.mean(pde_residual ** 2)  #+ L_lambda + L_f
-
-        return pde_loss, pde_residual, lambda_pde
 
     def symmetry_loss(self, collocation_points, lb, ub):
         """
@@ -374,6 +343,12 @@ class GrossPitaevskiiPINN(nn.Module):
         # Compute MSE to enforce symmetry
         sym_loss = torch.mean((u_original - u_reflected) ** 2)
         return sym_loss
+
+    def compute_normalization_loss(self, u, x):
+        """Compute normalization loss using proper numerical integration"""
+        dx = x[1] - x[0]  # Assuming uniform grid
+        integral = torch.sum(u ** 2) * dx
+        return (integral - 1.0) ** 2
 
     def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
                    precomputed_potential=None, prev_prediction=None, mode=0):
@@ -503,6 +478,101 @@ def normalize_wavefunction(u):
     return u / norm
 
 
+def train_with_fixed_gamma(gamma_values, modes, X_train, N_u, N_f, lb, ub, layers, epochs, weights,
+                           potential_type='harmonic'):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    mu_table = {}
+    models_by_mode = {}
+
+    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
+
+    # Sort gamma values to train from smaller to larger (helps convergence)
+    gamma_values = sorted(gamma_values)
+
+    for mode in modes:
+        mu_logs = []
+        prev_prediction = None
+        models_by_gamma = {}
+
+        for gamma in gamma_values:
+            print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}")
+            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
+            model.apply(initialize_weights)
+
+            # Use Adam optimizer with a reasonable learning rate
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=100, factor=0.5,
+                                                                   verbose=True)
+
+            X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
+            lb_tensor = torch.tensor(lb, dtype=torch.float32).to(device)
+            ub_tensor = torch.tensor(ub, dtype=torch.float32).to(device)
+
+            # Track mu values during training
+            mu_history = []
+            loss_history = []
+
+            for epoch in range(epochs):
+                optimizer.zero_grad()
+                u_pred = model.forward(X_tensor)
+
+                # Get PDE loss and compute mu value
+                pde_loss, _, lambda_pde = model.pde_loss(X_tensor, u_pred, gamma, potential_type, None, prev_prediction,
+                                                         mode)
+                boundary_loss = model.boundary_loss(boundary_points, boundary_values, prev_prediction, mode)
+
+                # Get full solution and normalize
+                full_u = model.get_complete_solution(X_tensor, u_pred, mode)
+                dx = X_train[1, 0] - X_train[0, 0]  # Assuming uniform grid
+                norm_squared = torch.sum(full_u ** 2) * dx
+                norm_loss = (norm_squared - 1.0) ** 2
+
+                sym_loss = model.symmetry_loss(X_tensor, lb_tensor, ub_tensor)
+
+                # Calculate Riesz energy loss
+                riesz_loss = model.riesz_loss(u_pred, X_tensor, gamma, potential_type, None, prev_prediction, mode)
+
+                # Use all loss components with appropriate weights
+                total_loss = (
+                        weights[0] * boundary_loss +
+                        weights[1] * riesz_loss / (ub - lb) +
+                        weights[2] * pde_loss / (ub - lb) +
+                        weights[3] * norm_loss +
+                        weights[4] * sym_loss
+                )
+
+                # Store history for plotting
+                if epoch % 100 == 0:
+                    mu_history.append(lambda_pde.item())
+                    loss_history.append(total_loss.item())
+
+                total_loss.backward()
+
+                # Clip gradients for stability
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                optimizer.step()
+                scheduler.step(total_loss)
+
+                if epoch % 500 == 0:
+                    print(f"Epoch {epoch}, Loss: {total_loss.item():.6f}, μ: {lambda_pde.item():.4f}")
+
+            # Use the average of the last few mu values for stability
+            final_mu = sum(mu_history[-10:]) / 10 if mu_history else 0
+            mu_logs.append((gamma, final_mu))
+            models_by_gamma[gamma] = model
+
+            # For γ > 0, use the previous model's predictions to help convergence
+            if gamma > 0:
+                prev_prediction = make_prev_prediction(model, mode)
+
+        mu_table[mode] = mu_logs
+        models_by_mode[mode] = models_by_gamma
+
+    return models_by_mode, mu_table
+
+
 def plot_loss_history(loss_histories, etas, optimizer_names, save_path='plots/loss_history.png', potential_type='gaussian'):
     """
     Plot the training loss history for all optimizers and interaction strengths (etas) in a single plot.
@@ -614,7 +684,7 @@ def make_prev_prediction(model, mode):
     def _predict(x):
         with torch.no_grad():
             u_pred = model.forward(x)
-            return model.get_complete_solution(x, u_pred, None, mode)
+            return model.get_complete_solution(x, u_pred, mode)
     return _predict
 
 
@@ -646,7 +716,7 @@ def train_with_mu_and_mode(mu_values, modes, X_train, N_u, N_f, lb, ub, layers, 
             for epoch in range(epochs):
                 optimizer.zero_grad()
                 u_pred = model.forward(X_tensor)
-                full_u = model.get_complete_solution(X_tensor, u_pred, prev_prediction, mode)
+                full_u = model.get_complete_solution(X_tensor, u_pred, mode)
                 gamma = compute_gamma(full_u)
                 full_u = normalize_wavefunction(full_u)
                 pde_loss, _ = model.fixed_mu_pde_loss(X_tensor, u_pred, mu, gamma, potential_type, None, prev_prediction, mode)
@@ -674,39 +744,140 @@ def train_with_mu_and_mode(mu_values, modes, X_train, N_u, N_f, lb, ub, layers, 
         gamma_table[mode] = gamma_logs
         models_by_mode[mode] = models_by_mu
 
-    return models_by_mode, gamma_table
-
-
-def plot_figure11(models_by_mode, mu_values, X_test, modes, save_dir="plots"):
-    os.makedirs(save_dir, exist_ok=True)
-    X_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True)
-
+    # After training, calculate actual gamma values for each model
+    gamma_values = {}
     for mode in modes:
-        plt.figure(figsize=(10, 6))
-
-        # Plot weighted Hermite approximation once
-        dummy_model = list(models_by_mode[mode].values())[0]  # Use any model to access .weighted_hermite
-        wh_tensor = dummy_model.weighted_hermite(X_tensor, mode).detach().cpu().numpy().flatten()
-        wh_tensor /= np.sqrt(np.sum(wh_tensor ** 2) * (X_test[1] - X_test[0]))
-        plt.plot(X_test, wh_tensor, linestyle='--', color='black', label='Weighted Hermite')
-
-        for i, mu in enumerate(mu_values):
+        gamma_values[mode] = []
+        for mu in mu_values:
             model = models_by_mode[mode][mu]
-            model.eval()
+            X_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
             u_pred = model.forward(X_tensor)
-            full_u = model.get_complete_solution(X_tensor, u_pred, None, mode)
-            u_np = full_u.detach().cpu().numpy().flatten()
-            dx = X_test[1] - X_test[0]
-            u_np = u_np / np.sqrt(np.sum(u_np ** 2) * dx)
-            plt.plot(X_test, u_np, label=f"μ={mu:.2f}")
+            full_u = model.get_complete_solution(X_tensor, u_pred, mode)
+            gamma = compute_gamma(full_u)
+            gamma_values[mode].append(gamma)
 
-        plt.title(f"Mode {mode} solutions Ψ(x)", fontsize=14)
-        plt.xlabel("x")
-        plt.ylabel("Ψ(x)")
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(os.path.join(save_dir, f"figure11_mode_{mode}.png"), dpi=300)
-        plt.show()
+    return models_by_mode, gamma_table, gamma_values
+
+
+def plot_figure11_corrected(models_by_mode, X_test, mode=0, save_dir="plots"):
+    """Plot Figure 11 from the paper following their exact procedure"""
+    os.makedirs(save_dir, exist_ok=True)
+    X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+    dx = X_test[1, 0] - X_test[0, 0]  # Spatial step size
+
+    plt.figure(figsize=(10, 6))
+
+    # Get the gammas for this mode from the model dictionary
+    gammas = sorted(list(models_by_mode[mode].keys()))
+
+    # Plot analytical solution for γ=0 first (if available in models)
+    if 0.0 in models_by_mode[mode]:
+        # Use the model trained with gamma=0
+        model = models_by_mode[mode][0.0]
+        model.eval()
+        with torch.no_grad():
+            u_pred = model.forward(X_tensor)
+            full_u = model.get_complete_solution(X_tensor, u_pred, mode)
+            wh_tensor = full_u.cpu().numpy().flatten()
+            # Normalize properly with integration
+            wh_tensor /= np.sqrt(np.sum(wh_tensor ** 2) * dx)
+            plt.plot(X_test, wh_tensor ** 2, 'k-', label='γ=0')
+    else:
+        # Fallback to using theoretical Hermite function
+        dummy_model = list(models_by_mode[mode].values())[0]
+        wh_tensor = dummy_model.weighted_hermite(X_tensor, mode).detach().cpu().numpy().flatten()
+        # Normalize properly with integration
+        wh_tensor /= np.sqrt(np.sum(wh_tensor ** 2) * dx)
+        plt.plot(X_test, wh_tensor ** 2, 'k-', label='γ=0')
+
+    # Different line styles for different gamma values
+    linestyles = ['-', '--', '-.', ':', '-', '--']
+    colors = ['k', 'b', 'r', 'g', 'm', 'c']
+
+    # Plot numerical solutions for γ > 0
+    for i, gamma in enumerate(gammas):
+        if np.isclose(gamma, 0.0):
+            continue  # Skip, already plotted
+
+        model = models_by_mode[mode][gamma]
+        model.eval()
+        with torch.no_grad():
+            u_pred = model.forward(X_tensor)
+            full_u = model.get_complete_solution(X_tensor, u_pred, mode)
+            u_np = full_u.cpu().numpy().flatten()
+
+            # Normalize properly with integration
+            u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+
+            plt.plot(X_test, u_np ** 2, linestyle=linestyles[(i - 1) % len(linestyles)],
+                     color=colors[(i - 1) % len(colors)], label=f"γ={gamma:.1f}")
+
+    plt.title(f"Mode {mode} solution densities", fontsize=14)
+    plt.xlabel("x", fontsize=12)
+    plt.ylabel("|ψ(x)|²", fontsize=12)
+    plt.grid(True)
+    plt.legend()
+    plt.xlim(-10, 10)  # Match the paper's x-range
+
+    # Add a tight layout to make it look nicer
+    plt.tight_layout()
+
+    plt.savefig(os.path.join(save_dir, f"figure11_mode_{mode}.png"), dpi=300)
+    plt.show()
+
+
+def plot_figure2(models_by_mode, X_test, gamma_values, mu_table, save_dir="plots"):
+    """
+    Plot Figure 2 from the paper - comparison with Thomas-Fermi approximation
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    X_tensor = torch.tensor(X_test.reshape(-1, 1), dtype=torch.float32).to(device)
+    dx = X_test[1] - X_test[0]  # Spatial step size
+
+    # Use mode 0 with the highest gamma value (strongest interaction)
+    mode = 0
+    gamma = max(gamma_values)  # Should be 100.0 to match the paper
+    model = models_by_mode[mode][gamma]
+    model.eval()
+
+    # Get the mu value for this gamma
+    mu = next(mu for g, mu in mu_table[mode] if g == gamma)
+
+    # Get the predicted wavefunction
+    with torch.no_grad():
+        u_pred = model.forward(X_tensor)
+        full_u = model.get_complete_solution(X_tensor, u_pred, mode)
+        u_np = full_u.cpu().numpy().flatten()
+
+    # Proper normalization
+    u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+
+    # Calculate Thomas-Fermi approximation
+    tf_approx = model.compute_thomas_fermi_approx(mu, X_tensor, gamma)
+    tf_np = tf_approx.cpu().numpy().flatten()
+
+    # Calculate potential V(x)/μ
+    V = 0.5 * X_test ** 2  # Harmonic potential
+    V_scaled = V / mu
+
+    # Plot with exact paper styling
+    plt.figure(figsize=(10, 6))
+    plt.plot(X_test, u_np ** 2, 'b-', linewidth=2, label="Numerical (PINN)")
+    plt.plot(X_test, tf_np ** 2, 'r--', linewidth=2, label="Thomas-Fermi")
+    plt.plot(X_test, V_scaled, 'g-.', linewidth=2, label="V(x)/μ")
+
+    plt.title(f"Ground state density, γ={gamma:.1f}, μ={mu:.2f}", fontsize=14)
+    plt.xlabel("x", fontsize=12)
+    plt.ylabel("|ψ(x)|²", fontsize=12)
+    plt.grid(True)
+    plt.legend()
+    plt.xlim(-5, 5)  # Match the paper's x-range
+
+    # Add a tight layout
+    plt.tight_layout()
+
+    plt.savefig(os.path.join(save_dir, "figure2_comparison.png"), dpi=300)
+    plt.show()
 
 
 def plot_gamma_table(gamma_table, save_path="plots/table_gamma_vs_mu.png"):
@@ -725,23 +896,43 @@ def plot_gamma_table(gamma_table, save_path="plots/table_gamma_vs_mu.png"):
 
 
 if __name__ == "__main__":
-    lb, ub = -10, 10
-    N_f = 4000
-    N_u = 200
-    epochs = 5000
-    layers = [1, 100, 100, 100, 1]
+    lb, ub = -10, 10  # Domain boundaries
+    N_f = 4000  # Number of collocation points
+    N_u = 200  # Number of boundary points
+    epochs = 5001  # More epochs for better convergence
+    layers = [1, 100, 100, 100, 1]  # Neural network architecture
 
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)
-    X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)
+    X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)  # Higher resolution for plotting
 
-    mu_values = [10, 20, 30, 40, 50]
-    # modes = list(range(0, 8))  # Mode 0 to 7
-    modes = [0]
-    weights = [1.0, 50.0, 20.0, 200.0]
+    # Use gamma values directly from Figure 11 in the paper
+    gamma_values = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]  # Exact values from the paper
+    modes = [0, 1, 2, 3]
 
-    models_by_mode, gamma_table = train_with_mu_and_mode(mu_values, modes, X, N_u, N_f, lb, ub, layers, epochs, weights)
+    # Adjusted weights for better convergence
+    weights = [1.0, 5.0, 1.0, 10.0, 1.0]  # [data_loss, riesz_loss, pde_loss, norm_loss, sym_loss]
 
-    plot_gamma_table(gamma_table)
-    plot_figure11(models_by_mode, mu_values, X_test, modes)
+    # Train with fixed gamma values directly
+    models_by_mode, mu_table = train_with_fixed_gamma(
+        gamma_values, modes, X, N_u, N_f, lb, ub, layers, epochs, weights)
 
+    # Plot Figure 11 (mode 0)
+    plot_figure11_corrected(models_by_mode, X_test, mode=0)
+
+    # Plot Figure 2 (Thomas-Fermi comparison with high gamma)
+    plot_figure2(models_by_mode, X_test.flatten(), gamma_values, mu_table, save_dir="plots")
+
+    # Plot mu vs gamma as in the paper
+    plt.figure(figsize=(8, 6))
+    for mode, logs in mu_table.items():
+        gamma_list, mu_list = zip(*logs)
+        plt.plot(gamma_list, mu_list, 'o-', label=f"Mode {mode}")
+
+    plt.xlabel("γ")
+    plt.ylabel("μ")
+    plt.title("Chemical potential vs. interaction strength")
+    plt.grid(True)
+    plt.legend()
+    plt.savefig("plots/mu_vs_gamma.png", dpi=300)
+    plt.show()
 
