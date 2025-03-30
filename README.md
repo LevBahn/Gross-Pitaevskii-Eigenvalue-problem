@@ -1,12 +1,12 @@
 # Gross Pitaevskii and Helmholtz Equation Solver using PINNs
 
-This repository implements a Physics-Informed Neural Network (PINN) to solve the Helmholtz equation (and will in the future include the Gross–Pitaevskii equation), a type of partial differential equation (PDE). The method combines traditional neural network training with physical constraints enforced by the governing equation.
+This repository implements a Physics-Informed Neural Network (PINN) to solve both the Helmholtz equation and the the Gross–Pitaevskii equation. The method combines traditional neural network training with physical constraints enforced by the governing equation.
 
 ## Features
 
-- **Physics-Informed Neural Networks (PINNs)**: The neural network is trained not only to minimize boundary condition errors but also to respect the underlying physics of the Helmholtz equation through the PDE loss.
-- **Adaptive Optimizers**: The code uses both the Adam and L-BFGS optimizers to effectively minimize the loss and improve convergence.
-- **LeakyReLU Activation Function**: The model utilizes the LeakyReLU activation function, which helps avoid the vanishing gradient problem and provides a more stable convergence.
+- **Physics-Informed Neural Networks (PINNs)**: The neural network is trained not only to minimize boundary condition errors but also to respect the underlying physics of the Helmholtz and Gross–Pitaevskii equation through the PDE loss. The Gross–Pitaevskii PINN class contains three additional loss terms including the Riesz energy loss, normalization loss, and symmetry loss.
+- **Adaptive Optimizers**: The code uses both the Adam and L-BFGS optimizers to effectively minimize the loss and improve convergence. It also contains [Distributed Shampoo optimizer](https://github.com/facebookresearch/optimizers/tree/main) for better performance.
+- **Tanh Activation Function**: The model employs the hyperbolic tangent (Tanh) activation function, which maps input values to a range between -1 and 1. This zero-centered output can facilitate faster convergence during training by promoting more balanced gradients.
 - **Custom Loss Functions**: The loss function combines both boundary condition losses and PDE residual losses to drive the network training.
 - **Data Scaling**: Input features are scaled between 0 and 1 to improve convergence and stability during training.
 
@@ -18,11 +18,22 @@ The following Python libraries are required:
 - `numpy` (for matrix operations)
 - `pyDOE` (for Latin Hypercube Sampling of collocation points)
 - `matplotlib` (for visualizing the results)
+- `scipy` (for special functions)
 
 Install these dependencies using:
 
 ```bash
-pip install torch numpy pyDOE matplotlib
+pip install torch numpy pyDOE matplotlib scipy
+```
+
+The PyTorch Distributed Shampoo optimizer can be installed by
+
+```bash
+pip install pytorch-optimizer
+git clone https://github.com/facebookresearch/optimizers.git
+cd optimizers
+pip install .
+cd ..
 ```
 
 ## How It Works
@@ -30,15 +41,17 @@ pip install torch numpy pyDOE matplotlib
 The network architecture consists of fully connected layers with customizable sizes. Both boundary condition data and collocation points generated via Latin Hypercube Sampling are fed into the network.
 
 1. **Training Data**: The network is trained on boundary conditions and a set of random collocation points within the domain.
-2. **Loss Function**: The loss function is a combination of boundary condition loss and the Helmholtz PDE loss:
+2. **Loss Function**: The loss function is a combination of boundary condition loss and the PDE loss. The Gross–Pitaevskii equation has five loss terms:
    - **Boundary Condition Loss**: Mean squared error between predicted and known boundary values.
-   - **PDE Loss**: Residual of the Helmholtz equation computed via automatic differentiation.
-   - **Riesz Loss**: The Riesz energy loss from the energy functional (for regularization).
-3. **Optimizers**: Training is initially performed using the Adam optimizer, followed by fine-tuning with the L-BFGS optimizer for higher precision.
+   - **PDE Loss**: Residual of the Gross–Pitaevskii equation computed via automatic differentiation.
+   - **Riesz Energy Loss**: The energy loss from the energy functional (for regularization).
+   - **Normalization Loss**: The $L^2$ norm of the solution should be equal to $1$.
+   - **Symmetry Loss**: A symmetry potential should generate a symmetric solution.
+3. **Optimizers**: Training is initially performed using the Adam optimizer, followed by fine-tuning with the L-BFGS optimizer and variants of the Shampoo optimizers for higher precision.
 
-## LeakyReLU Activation Function
+## Tanh Activation Function
 
-The LeakyReLU function is used as the activation function, which is particularly useful for handling vanishing gradients. This can be easily modified in the code as needed.
+The Tanh function is used as the activation function, which is particularly useful for nonlinear PDEs.
 
 ## Usage
 
@@ -66,5 +79,5 @@ The solver will generate a plot showing:
 ## Future Improvements
 
 - Add more flexible handling of boundary conditions.
-- Extend the solver to more complex forms of the Helmholtz equation (such as the Gross–Pitaevskii equation).
+- Extend the solver to more complex forms of different PDEs.
 - Explore the use of different activation functions and optimizers for further improvement.
