@@ -759,70 +759,90 @@ def train_with_mu_and_mode(mu_values, modes, X_train, N_u, N_f, lb, ub, layers, 
     return models_by_mode, gamma_table, gamma_values
 
 
-def plot_figure11_corrected(models_by_mode, X_test, mode=0, save_dir="plots"):
-    """Plot Figure 11 from the paper following their exact procedure"""
+def plot_figure11_corrected(models_by_mode, X_test, modes=[0, 1, 2, 3], save_dir="plots"):
+    """
+    Plot Figure 11 from the paper following their exact procedure.
+    Creates a 2x2 grid of subplots showing different modes.
+
+    Parameters:
+    -----------
+    models_by_mode : dict
+        Dictionary containing trained models for each mode and gamma value
+    X_test : numpy.ndarray
+        Array of x coordinates for testing/plotting
+    modes : list, optional
+        List of modes to plot, default is [0, 1, 2, 3]
+    save_dir : str, optional
+        Directory to save the plot
+    """
     os.makedirs(save_dir, exist_ok=True)
     X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
     dx = X_test[1, 0] - X_test[0, 0]  # Spatial step size
 
-    plt.figure(figsize=(10, 6))
-
-    # Get the gammas for this mode from the model dictionary
-    gammas = sorted(list(models_by_mode[mode].keys()))
-
-    # Plot analytical solution for γ=0 first (if available in models)
-    if 0.0 in models_by_mode[mode]:
-        # Use the model trained with gamma=0
-        model = models_by_mode[mode][0.0]
-        model.eval()
-        with torch.no_grad():
-            u_pred = model.forward(X_tensor)
-            full_u = model.get_complete_solution(X_tensor, u_pred, mode)
-            wh_tensor = full_u.cpu().numpy().flatten()
-            # Normalize properly with integration
-            wh_tensor /= np.sqrt(np.sum(wh_tensor ** 2) * dx)
-            plt.plot(X_test, wh_tensor ** 2, 'k-', label='γ=0')
-    else:
-        # Fallback to using theoretical Hermite function
-        dummy_model = list(models_by_mode[mode].values())[0]
-        wh_tensor = dummy_model.weighted_hermite(X_tensor, mode).detach().cpu().numpy().flatten()
-        # Normalize properly with integration
-        wh_tensor /= np.sqrt(np.sum(wh_tensor ** 2) * dx)
-        plt.plot(X_test, wh_tensor ** 2, 'k-', label='γ=0')
+    # Create a 2x2 grid of subplots
+    fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+    axs = axs.flatten()
 
     # Different line styles for different gamma values
     linestyles = ['-', '--', '-.', ':', '-', '--']
     colors = ['k', 'b', 'r', 'g', 'm', 'c']
 
-    # Plot numerical solutions for γ > 0
-    for i, gamma in enumerate(gammas):
-        if np.isclose(gamma, 0.0):
-            continue  # Skip, already plotted
+    for idx, mode in enumerate(modes):
+        ax = axs[idx]
 
-        model = models_by_mode[mode][gamma]
-        model.eval()
-        with torch.no_grad():
-            u_pred = model.forward(X_tensor)
-            full_u = model.get_complete_solution(X_tensor, u_pred, mode)
-            u_np = full_u.cpu().numpy().flatten()
+        # Get the gammas for this mode from the model dictionary
+        gammas = sorted(list(models_by_mode[mode].keys()))
 
+        # Plot analytical solution for γ=0 first (if available in models)
+        if 0.0 in models_by_mode[mode]:
+            # Use the model trained with gamma=0
+            model = models_by_mode[mode][0.0]
+            model.eval()
+            with torch.no_grad():
+                u_pred = model.forward(X_tensor)
+                full_u = model.get_complete_solution(X_tensor, u_pred, mode)
+                wh_tensor = full_u.cpu().numpy().flatten()
+                # Normalize properly with integration
+                wh_tensor /= np.sqrt(np.sum(wh_tensor ** 2) * dx)
+                ax.plot(X_test, wh_tensor ** 2, 'k-', label='γ=0')
+        else:
+            # Fallback to using theoretical Hermite function
+            dummy_model = list(models_by_mode[mode].values())[0]
+            wh_tensor = dummy_model.weighted_hermite(X_tensor, mode).detach().cpu().numpy().flatten()
             # Normalize properly with integration
-            u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+            wh_tensor /= np.sqrt(np.sum(wh_tensor ** 2) * dx)
+            ax.plot(X_test, wh_tensor ** 2, 'k-', label='γ=0')
 
-            plt.plot(X_test, u_np ** 2, linestyle=linestyles[(i - 1) % len(linestyles)],
-                     color=colors[(i - 1) % len(colors)], label=f"γ={gamma:.1f}")
+        # Plot numerical solutions for γ > 0
+        for i, gamma in enumerate(gammas):
+            if np.isclose(gamma, 0.0):
+                continue  # Skip, already plotted
 
-    plt.title(f"Mode {mode} solution densities", fontsize=14)
-    plt.xlabel("x", fontsize=12)
-    plt.ylabel("|ψ(x)|²", fontsize=12)
-    plt.grid(True)
-    plt.legend()
-    plt.xlim(-10, 10)  # Match the paper's x-range
+            model = models_by_mode[mode][gamma]
+            model.eval()
+            with torch.no_grad():
+                u_pred = model.forward(X_tensor)
+                full_u = model.get_complete_solution(X_tensor, u_pred, mode)
+                u_np = full_u.cpu().numpy().flatten()
 
-    # Add a tight layout to make it look nicer
-    plt.tight_layout()
+                # Normalize properly with integration
+                u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-    plt.savefig(os.path.join(save_dir, f"figure11_mode_{mode}.png"), dpi=300)
+                ax.plot(X_test, u_np ** 2, linestyle=linestyles[(i - 1) % len(linestyles)],
+                        color=colors[(i - 1) % len(colors)], label=f"γ={gamma:.1f}")
+
+        ax.set_title(f"Mode {mode}", fontsize=14)
+        ax.set_xlabel("x", fontsize=12)
+        ax.set_ylabel("|ψ(x)|²", fontsize=12)
+        ax.grid(True)
+        ax.legend()
+        ax.set_xlim(-10, 10)  # Match the paper's x-range
+
+    # Add a common title
+    fig.suptitle("Solution densities for different modes and interaction strengths", fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust for the suptitle
+
+    plt.savefig(os.path.join(save_dir, "figure11_all_modes.png"), dpi=300)
     plt.show()
 
 
@@ -899,7 +919,7 @@ if __name__ == "__main__":
     lb, ub = -10, 10  # Domain boundaries
     N_f = 4000  # Number of collocation points
     N_u = 200  # Number of boundary points
-    epochs = 5001  # More epochs for better convergence
+    epochs = 2001  # More epochs for better convergence
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
 
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)
@@ -917,7 +937,7 @@ if __name__ == "__main__":
         gamma_values, modes, X, N_u, N_f, lb, ub, layers, epochs, weights)
 
     # Plot Figure 11 (mode 0)
-    plot_figure11_corrected(models_by_mode, X_test, mode=0)
+    plot_figure11_corrected(models_by_mode, X_test, modes=modes)
 
     # Plot Figure 2 (Thomas-Fermi comparison with high gamma)
     plot_figure2(models_by_mode, X_test.flatten(), gamma_values, mu_table, save_dir="plots")
