@@ -879,7 +879,7 @@ if __name__ == "__main__":
     lb, ub = -10, 10  # Domain boundaries
     N_f = 4000  # Number of collocation points
     N_u = 200  # Number of boundary points
-    epochs = 2001  # More epochs for better convergence as in the paper
+    epochs = 5001  # More epochs for better convergence as in the paper
     layers = [1, 100, 100, 100, 1]  # Neural network architecture as in the paper
 
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)
@@ -891,7 +891,7 @@ if __name__ == "__main__":
 
     # Adjusted weights for better convergence
     # [pde_loss, norm_loss, sym_loss, boundary_loss]
-    weights = [1.0, 10.0, 0.1, 1.0]
+    weights = [1.0, 10.0, 0.1, 10.0]
 
     # Train with fixed mu values (Algorithm 2)
     models_by_mode, gamma_table = train_with_mu_and_mode(
