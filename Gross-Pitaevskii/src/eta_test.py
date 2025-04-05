@@ -137,6 +137,31 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return pde_loss, pde_residual, lambda_pde, u
 
+    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None, prev_prediction=None,
+                   mode=0):
+        """
+        Compute the Riesz energy loss for the Gross-Pitaevskii equation.
+        """
+
+        u = self.get_complete_solution(inputs, predictions, prev_prediction, mode)
+
+        if not inputs.requires_grad:
+            inputs = inputs.clone().detach().requires_grad_(True)
+        u_x = torch.autograd.grad(outputs=u, inputs=inputs,
+                                  grad_outputs=torch.ones_like(predictions),
+                                  create_graph=True, retain_graph=True)[0]
+
+        laplacian_term = torch.mean(u_x ** 2)  # Kinetic term
+        if precomputed_potential is not None:
+            V = precomputed_potential
+        else:
+            V = self.compute_potential(inputs, potential_type)
+        potential_term = torch.mean(V * u ** 2)  # Potential term
+        interaction_term = 0.5 * eta * torch.mean(u ** 4)  # Interaction term
+
+        riesz_energy = 0.5 * (laplacian_term + potential_term + interaction_term)
+        return riesz_energy
+
     def boundary_loss(self, boundary_points, boundary_values):
         """
         Compute the boundary loss for the boundary conditions.
