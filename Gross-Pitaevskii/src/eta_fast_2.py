@@ -32,11 +32,11 @@ class SinusoidalLayer(nn.Module):
 
     def __init__(self, in_features, out_features):
         super().__init__()
-        self.omega = nn.Parameter(torch.randn(in_features, out_features))
-        self.linear = nn.Linear(in_features, out_features)
+        self.linear1 = nn.Linear(in_features, out_features)  # For the frequency
+        self.linear2 = nn.Linear(in_features, out_features)  # For the linear term
 
     def forward(self, x):
-        return torch.sin(self.omega * x) + self.linear(x)
+        return torch.sin(self.linear1(x)) + self.linear2(x)
 
 
 class ImprovedGrossPitaevskiiPINN(nn.Module):
@@ -434,21 +434,24 @@ def advanced_initialization(m, mode):
         m.bias.data.fill_(0.01)
 
     elif isinstance(m, SinusoidalLayer):
-        # Initialize frequency parameters
+        # Initialize for the updated SinusoidalLayer implementation
         # Higher frequencies for higher modes
         scale = 1.0 + 0.2 * mode
-        m.omega.data.uniform_(-scale, scale)
 
-        # Initialize linear part
-        nn.init.xavier_uniform_(m.linear.weight, gain=0.5)
-        m.linear.bias.data.fill_(0.01)
+        # Initialize linear1 (for frequencies) with higher values
+        nn.init.xavier_uniform_(m.linear1.weight, gain=scale)
+        m.linear1.bias.data.fill_(0.01)
+
+        # Initialize linear2 (for linear component) normally
+        nn.init.xavier_uniform_(m.linear2.weight, gain=0.5)
+        m.linear2.bias.data.fill_(0.01)
 
 
 def train_gpe_model(gamma_values, modes, X_train, lb, ub,
                     base_layers, high_mode_layers, epochs,
                     potential_type='harmonic', lr=1e-3, verbose=True):
     """
-    Train the GPE model for different modes and gamma values with improved training strategies.
+    Train the GPE model for different modes and gamma values with simplified constraint handling.
     """
     # Calculate grid spacing
     dx = X_train[1, 0] - X_train[0, 0]  # Assuming uniform grid
@@ -507,11 +510,6 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub,
             lambda_history = []
             loss_history = []
 
-            # Add normalized constraint tracking
-            constraint_names = ['boundary', 'norm', 'sym', 'node', 'freq']
-            individual_constraints = {name: [] for name in constraint_names}
-            constraint_weights = {name: 0.0 for name in constraint_names}
-
             # Calculate number of iterations for fine-tuning with Shampoo
             shampoo_epochs = min(50, epochs // 10)
             adam_epochs = epochs - shampoo_epochs
@@ -528,42 +526,6 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub,
 
                 model.epoch = epoch  # Track epoch for adaptive weights
                 optimizer.zero_grad()
-
-                # Calculate constraint losses with proper normalization and adaptive weights
-                # Modify the base weights to be more balanced
-                base_boundary_weight = 5.0  # Reduced from 10.0
-                base_norm_weight = 10.0  # Reduced from 20.0
-                base_sym_weight = 2.0  # Reduced from 5.0
-                base_node_weight = 1.0  # Reduced from 2.0
-                base_freq_weight = 0.5 if mode >= 3 else 0.0  # Reduced from 1.0
-
-                # Implement a more sophisticated weight decay for constraints
-                # Early phase: focus on establishing physically valid solutions
-                if epoch < adam_epochs * 0.2:  # First 20% of training
-                    boundary_weight = base_boundary_weight
-                    norm_weight = base_norm_weight
-                    sym_weight = base_sym_weight
-                    node_weight = base_node_weight * (0.1 + epoch / (adam_epochs * 0.1))
-                    freq_weight = base_freq_weight * (0.1 + epoch / (adam_epochs * 0.1))
-                    physics_weight = 0.1 + epoch / (adam_epochs * 0.1)
-                # Middle phase: balanced optimization
-                elif epoch < adam_epochs * 0.6:  # Middle 40% of training
-                    progress = (epoch - adam_epochs * 0.2) / (adam_epochs * 0.4)  # Progress through middle phase
-                    boundary_weight = base_boundary_weight * (1.0 - 0.5 * progress)  # Gradually reduce
-                    norm_weight = base_norm_weight * (1.0 - 0.3 * progress)  # Gradually reduce
-                    sym_weight = base_sym_weight * (1.0 - 0.5 * progress)
-                    node_weight = base_node_weight * (1.0 - 0.3 * progress)
-                    freq_weight = base_freq_weight * (1.0 - 0.3 * progress)
-                    physics_weight = 1.0 + 4.0 * progress  # Gradually increase
-                # Late phase: emphasize physics with decreasing constraints
-                else:  # Last 40% of training
-                    progress = (epoch - adam_epochs * 0.6) / (adam_epochs * 0.4)  # Progress through late phase
-                    boundary_weight = base_boundary_weight * 0.5 * (1.0 - progress)  # Continue reducing
-                    norm_weight = base_norm_weight * 0.7 * (1.0 - progress)
-                    sym_weight = base_sym_weight * 0.5 * (1.0 - progress)
-                    node_weight = base_node_weight * 0.7 * (1.0 - progress)
-                    freq_weight = base_freq_weight * 0.7 * (1.0 - progress)
-                    physics_weight = 5.0 + 5.0 * progress  # Increase physics weight more aggressively
 
                 # Decide which physics loss to use based on mode
                 if mode == 0:
@@ -582,37 +544,27 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub,
                 node_loss = model.node_constraint_loss(X_tensor, full_u)
                 freq_loss = model.frequency_loss(full_u, dx)
 
-                # Store for monitoring
-                individual_constraints['boundary'].append(boundary_loss.item())
-                individual_constraints['norm'].append(norm_loss.item())
-                individual_constraints['sym'].append(sym_loss.item())
-                individual_constraints['node'].append(node_loss.item())
-                individual_constraints['freq'].append(freq_loss.item())
+                # Use simple fixed weights for constraints
+                # These weights balance the relative importance without complex adaptation
+                boundary_weight = 0.5
+                norm_weight = 1.0
+                sym_weight = 0.5
+                node_weight = 0.5
+                freq_weight = 0.2 if mode >= 3 else 0.0
 
-                constraint_weights['boundary'] = boundary_weight
-                constraint_weights['norm'] = norm_weight
-                constraint_weights['sym'] = sym_weight
-                constraint_weights['node'] = node_weight
-                constraint_weights['freq'] = freq_weight
-
-                # Apply loss normalization factors for better balance
-                # These factors help normalize the scale of different constraints
-                boundary_norm_factor = 1.0
-                norm_norm_factor = 1.0
-                sym_norm_factor = 2.0  # Increase if symmetry loss is typically small
-                node_norm_factor = 2.0 if mode > 2 else 1.0  # Higher for higher modes
-                freq_norm_factor = 3.0 if mode > 3 else 1.0  # Higher for higher modes
-
-                # Combined constraint loss with normalization factors
+                # Combined constraint loss
                 constraint_loss = (
-                        boundary_weight * boundary_loss * boundary_norm_factor +
-                        norm_weight * norm_loss * norm_norm_factor +
-                        sym_weight * sym_loss * sym_norm_factor +
-                        node_weight * node_loss * node_norm_factor +
-                        freq_weight * freq_loss * freq_norm_factor
+                        boundary_weight * boundary_loss +
+                        norm_weight * norm_loss +
+                        sym_weight * sym_loss +
+                        node_weight * node_loss +
+                        freq_weight * freq_loss
                 )
 
-                # Total loss with more aggressive physics weighting
+                # Fixed physics weight
+                physics_weight = 1.0
+
+                # Total loss with fixed weighting
                 total_loss = physics_weight * physics_loss + constraint_loss
 
                 # Backpropagate without retain_graph=True to save memory
@@ -621,17 +573,6 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub,
                 # Gradient clipping (stronger for higher modes)
                 max_norm = 1.0 / (1.0 + 0.05 * mode)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-
-                # Adaptive learning rate adjustment based on constraint progress
-                if epoch > 1000 and epoch % 100 == 0 and len(loss_history) > 5:
-                    # Check if constraints are stuck
-                    recent_constraints = [l for l in loss_history[-5:]]
-                    if max(recent_constraints) / (min(recent_constraints) + 1e-10) < 1.05:
-                        # Constraints aren't improving much, adjust learning rate
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = param_group['lr'] * 0.8
-                            if verbose:
-                                print(f"Adjusting learning rate to {param_group['lr']:.6f}")
 
                 optimizer.step()
                 scheduler.step()
@@ -642,14 +583,14 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub,
                     loss_history.append(total_loss.item())
 
                     if verbose and epoch % 500 == 0:
-                        print(f"Epoch {epoch}, {loss_type}: {physics_loss.item():.6f}")
-                        print(f"  Constraints: (Total: {constraint_loss.item():.6f})")
-                        print(f"    Boundary: {boundary_loss.item():.6f} (w={boundary_weight:.1f})")
-                        print(f"    Normalization: {norm_loss.item():.6f} (w={norm_weight:.1f})")
-                        print(f"    Symmetry: {sym_loss.item():.6f} (w={sym_weight:.1f})")
-                        print(f"    Node: {node_loss.item():.6f} (w={node_weight:.1f})")
-                        print(f"    Frequency: {freq_loss.item():.6f} (w={freq_weight:.1f})")
-                        print(f"  μ: {lambda_value.item():.4f}")
+                        print(f"Epoch {epoch}, {loss_type}: {physics_loss.item():.6f}, "
+                              f"Constraints: {constraint_loss.item():.6f}, μ: {lambda_value.item():.4f}")
+
+                        # Print individual constraints for debugging
+                        if epoch % 1000 == 0:
+                            print(f"  Boundary: {boundary_loss.item():.6f}, Norm: {norm_loss.item():.6f}, "
+                                  f"Sym: {sym_loss.item():.6f}, Node: {node_loss.item():.6f}, "
+                                  f"Freq: {freq_loss.item():.6f}")
 
                 # Check for early stopping condition
                 if epoch > 1000 and epoch > 100 and loss_history[-1] < 1e-6:
@@ -698,8 +639,8 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub,
                         norm_loss = model.normalization_loss(full_u, dx)
                         boundary_loss = model.boundary_loss(boundary_points, boundary_values)
 
-                        # Total loss with adjusted weights for fine-tuning
-                        total_loss = 5.0 * physics_loss + 2.0 * norm_loss + 0.5 * boundary_loss
+                        # Total loss with fixed weights for fine-tuning
+                        total_loss = 2.0 * physics_loss + 1.0 * norm_loss + 0.5 * boundary_loss
 
                         # Backpropagate
                         total_loss.backward()
@@ -1205,7 +1146,7 @@ if __name__ == "__main__":
     # Setup parameters
     lb, ub = -10, 10  # Domain boundaries
     N_f = 4000  # Number of collocation points
-    epochs = 5001  # Increased epochs for better convergence
+    epochs = 2001  # Increased epochs for better convergence
 
     # Define network architectures for different mode complexities
     base_layers = [1, 64, 64, 64, 1]  # For modes 0-2
