@@ -1,19 +1,18 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-from scipy.special import airy, gamma as gamma_func
+from scipy.special import hermite
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class GrossPitaevskiiPINN(nn.Module):
     """
-    Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation
-    with a gravitational trap potential.
+    Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
     def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0):
@@ -38,7 +37,6 @@ class GrossPitaevskiiPINN(nn.Module):
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
         self.gamma = gamma  # Interaction strength parameter
-        self.g = 1.0  # Gravitational acceleration parameter
 
     def build_network(self):
         """
@@ -51,57 +49,14 @@ class GrossPitaevskiiPINN(nn.Module):
                 layers.append(nn.Tanh())
         return nn.Sequential(*layers)
 
-    def gravitational_solution(self, x, n):
+    def weighted_hermite(self, x, n):
         """
-        Compute the analytical solution for the gravitational trap for the linear case (gamma = 0).
-        Based on equations (28)-(31) from the paper.
-
-        For gravitational potential V(x) = mgx for x > 0 and infinity for x < 0.
-        The solutions involve Airy functions.
+        Compute the weighted Hermite polynomial solution for the linear case (gamma = 0).
         """
-        # Convert to numpy for Airy function calculation
-        x_np = x.cpu().detach().numpy()
-
-        # Parameters for gravitational trap (equations 28-31 in the paper)
-        xi_n = self.get_airy_zeros(n + 1)[-1]  # Get the (n+1)th zero of the Airy function
-        l_0 = (self.hbar ** 2 / (2 * self.m ** 2 * self.g)) ** (1 / 3)  # Characteristic length
-
-        # Calculate xi = (x/l_0 - E_n/(m*g*l_0))
-        # Where E_n = -xi_n * m * g * l_0 is the energy of the nth state
-        xi = x_np / l_0 - xi_n
-
-        # Calculate the Airy function
-        Ai_vals = np.zeros_like(xi)
-        mask = x_np >= 0  # Only calculate for x >= 0 (where potential is finite)
-
-        # Get Airy function values where x >= 0
-        Ai_vals[mask] = airy(xi[mask])[0]
-
-        # Normalization factor (from paper equation 31)
-        # This is approximate and might need manual adjustment
-        norm_factor = 1.0 / (l_0 * (airy(xi_n)[1]) ** 2) ** (0.5)
-
-        # Convert back to tensor and apply normalization
-        solution = norm_factor * torch.tensor(Ai_vals, dtype=torch.float32).to(device)
-
-        # Set solution to zero for x < 0 (infinite potential barrier)
-        solution[x < 0] = 0.0
-
-        return solution
-
-    def get_airy_zeros(self, num_zeros):
-        """
-        Get the first n zeros of the Airy function Ai(x).
-        These are the negative zeros in ascending order by absolute value.
-        """
-        # Approximate values of the first several zeros of the Airy function
-        # These are more precise than what scipy.special.ai_zeros provides for the small n we need
-        airy_zeros = [
-            -2.33811, -4.08795, -5.52056, -6.78671, -7.94413,
-            -9.02265, -10.0401, -11.0085, -11.9361, -12.8288,
-            -13.6915, -14.5272, -15.3394, -16.1307, -16.9039
-        ]
-        return np.array(airy_zeros[:num_zeros])
+        H_n = hermite(n)(x.cpu().detach().numpy())  # Hermite polynomial evaluated at x
+        norm_factor = (2 ** n * math.factorial(n) * np.sqrt(np.pi)) ** (-0.5)
+        weighted_hermite = norm_factor * torch.exp(-x ** 2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
+        return weighted_hermite
 
     def forward(self, inputs):
         """
@@ -111,29 +66,18 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def get_complete_solution(self, x, perturbation, mode=None):
         """
-        Get the complete solution by combining the base gravitational solution with
-        the neural network perturbation.
+        Get the complete solution by combining the base Hermite solution with the neural network perturbation.
         """
         if mode is None:
             mode = self.mode
-        base_solution = self.gravitational_solution(x, mode)
+        base_solution = self.weighted_hermite(x, mode)
         return base_solution + perturbation
 
-    def compute_potential(self, x, potential_type="gravitational", **kwargs):
+    def compute_potential(self, x, potential_type="harmonic", **kwargs):
         """
         Compute potential function for the 1D domain.
         """
-        if potential_type == "gravitational":
-            g = kwargs.get('g', self.g)  # Gravitational acceleration
-            # V(x) = mgx for x >= 0, and infinity (practically a large value) for x < 0
-            V = torch.zeros_like(x)
-            mask_positive = (x >= 0)
-            mask_negative = (x < 0)
-
-            V[mask_positive] = self.m * g * x[mask_positive]
-            V[mask_negative] = 1e6  # Very large value to approximate infinity
-
-        elif potential_type == "harmonic":
+        if potential_type == "harmonic":
             omega = kwargs.get('omega', 1.0)  # Frequency for harmonic potential
             V = 0.5 * omega ** 2 * x ** 2
         elif potential_type == "gaussian":
@@ -147,7 +91,7 @@ class GrossPitaevskiiPINN(nn.Module):
             raise ValueError(f"Unknown potential type: {potential_type}")
         return V
 
-    def pde_loss(self, inputs, predictions, gamma, potential_type="gravitational", precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, gamma, potential_type="harmonic", precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
         μψ = -1/2 ∇²ψ + Vψ + γ|ψ|²ψ
@@ -195,7 +139,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return pde_loss, pde_residual, lambda_pde, u
 
-    def riesz_loss(self, inputs, predictions, gamma, potential_type="gravitational", precomputed_potential=None):
+    def riesz_loss(self, inputs, predictions, gamma, potential_type="harmonic", precomputed_potential=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
         E[ψ] = ∫[|∇ψ|²/2 + V|ψ|² + γ|ψ|⁴/2]dx
@@ -218,9 +162,11 @@ class GrossPitaevskiiPINN(nn.Module):
             retain_graph=True
         )[0]
 
-        # Calculate normalization factor for proper integration
+        # Calculate normalization factor for proper numerical integration
         dx = inputs[1] - inputs[0]  # Grid spacing
         norm_factor = torch.sum(u ** 2) * dx
+
+        # Compute each term in the energy functional with proper normalization
 
         # Kinetic energy term: |∇ψ|²/2 with proper normalization
         kinetic_term = 0.5 * torch.sum(u_x ** 2) * dx / norm_factor
@@ -239,6 +185,7 @@ class GrossPitaevskiiPINN(nn.Module):
         riesz_energy = kinetic_term + potential_term + interaction_term
 
         # Calculate chemical potential using variational approach
+        # For the harmonic oscillator ground state (mode 0), μ should be 0.5 when γ = 0
         lambda_riesz = riesz_energy
 
         return riesz_energy, lambda_riesz, u
@@ -246,33 +193,33 @@ class GrossPitaevskiiPINN(nn.Module):
     def boundary_loss(self, boundary_points, boundary_values):
         """
         Compute the boundary loss for the boundary conditions.
-        For gravitational trap, we need to enforce ψ(x) = 0 for x < 0.
         """
         u_pred = self.forward(boundary_points)
         full_u = self.get_complete_solution(boundary_points, u_pred)
         return torch.mean((full_u - boundary_values) ** 2)
 
-    def negative_domain_loss(self, x):
+    def symmetry_loss(self, collocation_points, lb, ub):
         """
-        Enforce zero wavefunction in the negative domain (x < 0) for gravitational trap.
+        Compute the symmetry loss to enforce u(x) = u(-x) for even modes
+        and u(x) = -u(-x) for odd modes.
         """
-        # Select points where x < 0
-        mask = x < 0
-        if not torch.any(mask):
-            return torch.tensor(0.0, device=device)
+        # For symmetric potential around x=0, we reflect around 0
+        x_reflected = -collocation_points
 
-        x_neg = x[mask]
+        # Evaluate u(x) and u(-x) for the FULL solution
+        u_pred_original = self.forward(collocation_points)
+        u_full_original = self.get_complete_solution(collocation_points, u_pred_original)
 
-        # Issue: x_neg needs to be reshaped properly for the network
-        # Fix: Ensure x_neg has shape [n, 1] instead of [n]
-        if len(x_neg.shape) == 1:
-            x_neg = x_neg.reshape(-1, 1)
+        u_pred_reflected = self.forward(x_reflected)
+        u_full_reflected = self.get_complete_solution(x_reflected, u_pred_reflected)
 
-        u_pred = self.forward(x_neg)
-        full_u = self.get_complete_solution(x_neg, u_pred)
+        # For odd modes, apply anti-symmetry condition
+        if self.mode % 2 == 1:
+            sym_loss = torch.mean((u_full_original + u_full_reflected) ** 2)
+        else:
+            sym_loss = torch.mean((u_full_original - u_full_reflected) ** 2)
 
-        # Penalize any non-zero values in the negative domain
-        return torch.mean(full_u ** 2)
+        return sym_loss
 
     def normalization_loss(self, u, dx):
         """
@@ -292,7 +239,7 @@ def initialize_weights(m):
 
 
 def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
-                    potential_type='gravitational', lr=1e-3, verbose=True):
+                    potential_type='harmonic', lr=1e-3, verbose=True):
     """
     Train the GPE model for different modes and gamma values.
 
@@ -311,7 +258,7 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
     epochs : int
         Number of training epochs
     potential_type : str
-        Type of potential ('gravitational', 'harmonic', etc.)
+        Type of potential ('harmonic', 'gaussian', etc.)
     lr : float
         Learning rate
     verbose : bool
@@ -327,10 +274,8 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    # For gravitational trap, we need to enforce ψ(x) = 0 for x < 0
-    # and ψ(x) → 0 as x → ∞
-    boundary_points = torch.tensor([[lb], [0.0], [ub]], dtype=torch.float32).to(device)
-    boundary_values = torch.zeros((3, 1), dtype=torch.float32).to(device)
+    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
     # Track models and chemical potentials
     models_by_mode = {}
@@ -365,12 +310,9 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
             optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
             # Create scheduler to decrease learning rate during training
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=100, min_lr=1e-5, verbose=verbose
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer, T_0=200, T_mult=2, eta_min=1e-6
             )
-
-            # Pre-compute potential for efficiency
-            potential = model.compute_potential(X_tensor, potential_type=potential_type)
 
             # Track learning history
             lambda_history = []
@@ -385,27 +327,25 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
 
                 # Calculate common constraint losses for all modes
                 boundary_loss = model.boundary_loss(boundary_points, boundary_values)
-
-                # For gravitational trap, enforce zero wavefunction for x < 0
-                negative_domain_loss = model.negative_domain_loss(X_tensor)
-
-                # Ensure proper normalization
                 norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
+                sym_loss = model.symmetry_loss(X_tensor, lb, ub)
 
-                # Combined constraint loss - the negative domain constraint is crucial for gravitational trap
-                constraint_loss = 10.0 * boundary_loss + 50.0 * negative_domain_loss + 20.0 * norm_loss
+                # Combined constraint loss
+                constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss + 5.0 * sym_loss
 
                 # Decide which loss to use based on mode
                 if mode == 0:
                     # Use Riesz energy functional for mode 0 as specified in the paper (Algorithm 2)
                     riesz_energy, lambda_value, full_u = model.riesz_loss(
-                        X_tensor, u_pred, gamma, potential_type, precomputed_potential=potential
+                        X_tensor, u_pred, gamma, potential_type
                     )
+
                     pde_loss, _, _, _ = model.pde_loss(
-                        X_tensor, u_pred, gamma, potential_type, precomputed_potential=potential
+                        X_tensor, u_pred, gamma, potential_type
                     )
 
                     # For mode 0, we want to minimize the energy while satisfying constraints
+                    # Note: We don't expect the energy to go to zero, it should converge to the ground state energy
                     physics_loss = riesz_energy + pde_loss
                     loss_type = "Riesz energy"
 
@@ -414,7 +354,7 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
                 else:
                     # Use PDE residual for other modes
                     pde_loss, _, lambda_value, full_u = model.pde_loss(
-                        X_tensor, u_pred, gamma, potential_type, precomputed_potential=potential
+                        X_tensor, u_pred, gamma, potential_type
                     )
                     physics_loss = pde_loss
                     loss_type = "PDE residual"
@@ -426,7 +366,7 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
                 total_loss = physics_loss + constraint_loss
 
                 # Backpropagate
-                total_loss.backward(retain_graph=True)
+                total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
                 optimizer.step()
                 scheduler.step(total_loss)
@@ -460,10 +400,9 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
     return models_by_mode, mu_table
 
 
-def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="plots_gravitational"):
+def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="plots"):
     """
-    Plot wavefunction for different modes and gamma values.
-    Specially formatted for the gravitational trap to match Figure 7 in the paper.
+    Plot wavefunctions (not densities) for different modes and gamma values.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -478,7 +417,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="plo
         X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
         dx = X_test[1, 0] - X_test[0, 0]  # Spatial step size
 
-        # Different line styles and colors - match the paper's color scheme
+        # Different line styles and colors
         linestyles = ['-', '--', '-.', ':', '-', '--']
         colors = ['k', 'b', 'r', 'g', 'm', 'c', 'y', 'orange']
 
@@ -495,34 +434,39 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="plo
                 full_u = model.get_complete_solution(X_tensor, u_pred)
                 u_np = full_u.cpu().numpy().flatten()
 
-                # Normalization - ensure it's properly normalized for physical interpretation
+                # Normalization
                 u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                # Enforce zero for x < 0 (infinite potential barrier)
-                u_np[X_test.flatten() < 0] = 0
+                # For mode 0, ensure all wavefunctions are positive
+                if mode == 0:
+                    # Take absolute value to ensure positive values
+                    # This is valid for ground state (mode 0) which should be nodeless
+                    u_np = np.abs(u_np)
 
-                # Plot wavefunction density
+                # Plot wavefunction (not density)
                 plt.plot(X_test.flatten(), u_np,
                          linestyle=linestyles[j % len(linestyles)],
                          color=colors[j % len(colors)],
                          label=f"γ={gamma:.1f}")
 
-        # Configure individual figure to match the paper
-        plt.title(f"Mode {mode} Wavefunction Density (Gravitational Trap)", fontsize=14)
+        # Configure individual figure
+        plt.title(f"Mode {mode} Wavefunction", fontsize=14)
         plt.xlabel("x", fontsize=12)
         plt.ylabel("ψ(x)", fontsize=12)
         plt.grid(True)
         plt.legend()
-        plt.xlim(0, 35)  # Adjusted range to focus on the positive domain
+        plt.xlim(-10, 10)  # Match paper's range
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"grav_mode_{mode}_wavefunction.png"), dpi=300)
+        plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction.png"), dpi=300)
         plt.close()
 
+    # Also create a combined grid figure to show all modes
+    plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir)
 
-def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="plots_gravitational"):
+
+def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="plots"):
     """
     Create a grid of subplots showing all modes.
-    Formatted to match Figure 7 in the paper.
     """
     # Determine grid dimensions
     n_modes = len(modes)
@@ -541,7 +485,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="pl
     X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
     dx = X_test[1, 0] - X_test[0, 0]  # Spatial step size
 
-    # Different line styles and colors - match paper's style
+    # Different line styles and colors
     linestyles = ['-', '--', '-.', ':', '-', '--']
     colors = ['k', 'b', 'r', 'g', 'm', 'c', 'y', 'orange']
 
@@ -568,38 +512,39 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="pl
                 # Proper normalization
                 u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                # Enforce zero for x < 0 (infinite potential barrier)
-                u_np[X_test.flatten() < 0] = 0
+                # For mode 0, ensure all wavefunctions are positive
+                if mode == 0:
+                    # Take absolute value to ensure positive values
+                    u_np = np.abs(u_np)
 
-                # Plot on the appropriate subplot
+                # Plot the wavefunction (not density)
                 ax.plot(X_test.flatten(), u_np,
                         linestyle=linestyles[j % len(linestyles)],
                         color=colors[j % len(colors)],
                         label=f"γ={gamma:.1f}")
 
-        # Configure the subplot to match the paper's style
+        # Configure the subplot
         ax.set_title(f"Mode {mode}", fontsize=12)
         ax.set_xlabel("x", fontsize=10)
         ax.set_ylabel("ψ(x)", fontsize=10)
         ax.grid(True)
         ax.legend(fontsize=8)
-        ax.set_xlim(0, 35)  # Focus on positive domain
+        ax.set_xlim(-10, 10)
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
         axes[i].axis('off')
 
     # Finalize and save combined figure
-    fig.suptitle("Wavefunction for Gravitational Trap", fontsize=16)
+    fig.suptitle("Wavefunctions for All Modes", fontsize=16)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(os.path.join(save_dir, "grav_all_modes_combined.png"), dpi=300)
+    fig.savefig(os.path.join(save_dir, "all_modes_combined_wavefunctions.png"), dpi=300)
     plt.close(fig)
 
 
-def plot_mu_vs_gamma(mu_table, modes, save_dir="plots_gravitational"):
+def plot_mu_vs_gamma(mu_table, modes, save_dir="plots"):
     """
     Plot chemical potential vs. interaction strength for different modes.
-    Formatted to show the relationship for the gravitational trap.
     """
     os.makedirs(save_dir, exist_ok=True)
     plt.figure(figsize=(10, 8))
@@ -622,11 +567,11 @@ def plot_mu_vs_gamma(mu_table, modes, save_dir="plots_gravitational"):
 
     plt.xlabel("γ (Interaction Strength)", fontsize=12)
     plt.ylabel("μ (Chemical Potential)", fontsize=12)
-    plt.title("Chemical Potential vs. Interaction Strength for Gravitational Trap", fontsize=14)
+    plt.title("Chemical Potential vs. Interaction Strength for All Modes", fontsize=14)
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "grav_mu_vs_gamma_all_modes.png"), dpi=300)
+    plt.savefig(os.path.join(save_dir, "mu_vs_gamma_all_modes.png"), dpi=300)
     plt.close()
 
 
@@ -634,24 +579,22 @@ def advanced_initialization(m, mode):
     """Initialize network weights with consideration of the mode number"""
     if isinstance(m, nn.Linear):
         # Use Xavier initialization but scale based on mode
-        gain = 1.0 / (1.0 + 0.1 * mode)  # Decrease gain for higher modes
-        nn.init.xavier_uniform_(m.weight, gain=gain)
+        gain = 1.0 / (1.0 + 0.2 * mode)  # Stronger scaling for higher modes
+        nn.init.xavier_normal_(m.weight, gain=gain)  # Normal instead of uniform
 
-        # Initialize biases with small values
-        m.bias.data.fill_(0.01)
+        # More careful bias initialization for higher modes
+        if mode > 3:
+            m.bias.data.fill_(0.001)  # Smaller initial bias for higher modes
+        else:
+            m.bias.data.fill_(0.01)
 
 
 if __name__ == "__main__":
     # Setup parameters
-    #lb, ub = -5, 20  # Domain boundaries adjusted for gravitational trap
-    lb, ub = 0, 35  # Domain boundaries adjusted for gravitational trap
-    N_f = 5000  # Number of collocation points (increased for better resolution)
+    lb, ub = -10, 10  # Domain boundaries
+    N_f = 4000  # Number of collocation points
     epochs = 4001  # Increased epochs for better convergence
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
-    save_dir = "plots_gravitational"  # Define the output directory for plots
-
-    # Create the directory if it doesn't exist
-    os.makedirs(save_dir, exist_ok=True)
 
     # Create uniform grid for training and testing
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)
@@ -667,17 +610,14 @@ if __name__ == "__main__":
     print("Starting training for all modes and gamma values...")
     models_by_mode, mu_table = train_gpe_model(
         gamma_values, modes, X, lb, ub, layers, epochs,
-        potential_type='gravitational', lr=1e-3, verbose=True
+        potential_type='harmonic', lr=1e-3, verbose=True
     )
     print("Training completed!")
 
-    # Plot wavefunction for individual modes
+    # Plot wavefunctions (not densities) for individual modes
     print("Generating individual mode plots...")
     plot_wavefunction(models_by_mode, X_test, gamma_values, modes)
 
     # Plot μ vs γ for all modes
     print("Generating chemical potential vs. gamma plot...")
     plot_mu_vs_gamma(mu_table, modes)
-
-    # Also create a combined grid figure to show all modes
-    plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir)
