@@ -651,7 +651,7 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
                                      prev_prediction=prev_prediction)
 
     # Directory to save the models
-    model_save_dir = 'models'
+    model_save_dir = '../models'
     os.makedirs(model_save_dir, exist_ok=True)  # Create the directory if it doesn't exist
 
     # Save model after training

@@ -29,7 +29,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, g=100.0, mode=0, prev_prediction=None):
+    def __init__(self, layers, hbar=1.0, m=1.0, g=100.0, mode=0, beta_init=1.0, alpha_init=1.0, decay_rate=0.001):
         """
         Parameters
         ----------
@@ -43,9 +43,12 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength (default is 100.0).
         mode : int, optional
             Mode number (default is 0).
-        prev_prediction : callable, optional
-            A function representing the previous model's forward pass, used to incorporate past solutions
-            when computing the current solution (default is None).
+        beta_init : float, optional
+            Initial weight for previous predictions, default is 1.0.
+        alpha_init : float, optional
+            Initial weight for learned perturbations, default is 1.0.
+        decay_rate : float, optional
+            Rate at which beta decays over time, default is 0.001.
         """
         super().__init__()
         self.layers = layers
@@ -54,9 +57,18 @@ class GrossPitaevskiiPINN(nn.Module):
         self.hbar = hbar  # Planck's constant, fixed
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
+        self.beta = beta_init
+        self.alpha = alpha_init
+        self.decay_rate = decay_rate
+        self.iteration = 0
 
-        # Trainable log-scale weights for adaptive balancing
-        self.log_alpha = nn.Parameter(torch.zeros(5, dtype=torch.float32))
+    def update_alpha_beta(self):
+        """
+        Updates the weighting factors alpha and beta adaptively.
+        """
+        self.iteration += 1
+        self.beta = max(0.5, self.beta * torch.exp(torch.tensor(-self.decay_rate * self.iteration)))
+        self.alpha = 1.0 + (1.0 - self.beta)  # Makes α increase as β decreases
 
     def build_network(self):
         """
@@ -100,21 +112,8 @@ class GrossPitaevskiiPINN(nn.Module):
     def forward(self, inputs):
         """
         Forward pass through the neural network.
-
-        Parameters
-        ----------
-        inputs : torch.Tensor
-            Input tensor containing spatial points (collocation points).
-
-        Returns
-        -------
-        torch.Tensor
-            Output tensor representing the predicted solution.
         """
         return self.network(inputs)
-        # perturbation = self.network(inputs)  # The neural network predicts a perturbation term
-        # hermite_approx = self.weighted_hermite(inputs, self.mode)  # Base Hermite function
-        # return hermite_approx + perturbation  # Total wave function
 
     def compute_potential(self, x, potential_type="harmonic", **kwargs):
         """
@@ -161,7 +160,7 @@ class GrossPitaevskiiPINN(nn.Module):
         Parameters
         ----------
         lambda_pde : float
-            Eigenvalue from lowest enegry ground state.
+            Eigenvalue from lowest energy ground state.
         potential : torch.Tensor
             Potential values corresponding to the spatial coordinates.
         eta : float
@@ -172,10 +171,48 @@ class GrossPitaevskiiPINN(nn.Module):
         torch.Tensor
             Thomas–Fermi approximation of the wave function.
         """
-        tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
+        # For eta = 0, return None (TF approximation not valid)
+        if eta == 0:
+            return None
+
+        # Calculate TF approximation: ψ_TF(x) = sqrt(max(0, (λ - V(x))/η))
+        # tf_approx = torch.sqrt(torch.relu((lambda_pde - potential) / eta))
+        tf_approx = torch.sqrt((lambda_pde - potential) / eta)
+
         return tf_approx
 
-    def boundary_loss(self, boundary_points, boundary_values, prev_prediction=None):
+    def get_complete_solution(self, x, perturbation, prev_prediction=None, mode=0):
+        """
+        Combine base solution with learned perturbation.
+
+        Parameters:
+        -----------
+        x : torch.Tensor
+            Spatial coordinates.
+        perturbation : torch.Tensor
+            Learned perturbation from the neural network.
+        prev_prediction : callable, optional
+            Previously trained model's prediction function.
+        mode : int
+            Mode of ground state solution.
+
+        Returns:
+        --------
+        torch.Tensor
+            Complete wave function solution.
+        """
+        if prev_prediction is None:
+            # For η = 0, use weighted Hermite as base
+            base_solution = self.weighted_hermite(x, mode)
+            complete_solution = base_solution + self.alpha * perturbation
+        else:
+            # For η > 0, use previous solution as base
+            prev_solution = prev_prediction(x)
+            complete_solution = prev_solution + self.alpha * perturbation
+
+        return complete_solution
+
+    def boundary_loss(self, boundary_points, boundary_values, prev_prediction=None, mode=0):
         """
         Compute the boundary loss (MSE) for the boundary conditions.
 
@@ -188,6 +225,8 @@ class GrossPitaevskiiPINN(nn.Module):
         prev_prediction : GrossPitaevskiiPINN or None
             Previously trained model whose predictions are used as part of the training process.
             If None, the model starts training from scratch.
+        mode: int
+            Mode of ground state solution to Gross-Pitavskii equation. Default is 0.
 
         Returns
         -------
@@ -195,17 +234,11 @@ class GrossPitaevskiiPINN(nn.Module):
             Mean squared error (MSE) at the boundary points.
         """
         u_pred = self.forward(boundary_points)
-
-        if prev_prediction is None:
-            u = self.weighted_hermite(boundary_points, self.mode) + u_pred
-        else:
-            u = prev_prediction(boundary_points) + u_pred  # Use model’s output from previous eta
-            # u = self.weighted_hermite(boundary_points, self.mode)  # Start with the base weighted hermite solution
-            # u += prev_prediction(boundary_points) + u_pred  # Iteratively add perturbations
+        u = self.get_complete_solution(boundary_points, u_pred, prev_prediction, mode)
 
         return torch.mean((u - boundary_values) ** 2)
 
-    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None, prev_prediction=None):
+    def riesz_loss(self, predictions, inputs, eta, potential_type, precomputed_potential=None, prev_prediction=None, mode=0):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
 
@@ -224,18 +257,16 @@ class GrossPitaevskiiPINN(nn.Module):
         prev_prediction : GrossPitaevskiiPINN or None
             Previously trained model whose predictions are used as part of the training process.
             If None, the model starts training from scratch.
+        mode: int
+            Mode of ground state solution to Gross-Pitavskii equation. Default is 0.
 
         Returns
         -------
         torch.Tensor
             Riesz energy loss value.
         """
-        if prev_prediction is None:
-            u = self.weighted_hermite(inputs, self.mode) + predictions
-        else:
-            u = prev_prediction(inputs) + predictions  # Use model’s output from previous eta
-            # u = self.weighted_hermite(inputs, self.mode)  # Start with the base weighted hermite solution
-            # u += prev_prediction(inputs) + predictions  # Iteratively add perturbations
+
+        u = self.get_complete_solution(inputs, predictions, prev_prediction, mode)
 
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
@@ -252,10 +283,9 @@ class GrossPitaevskiiPINN(nn.Module):
         interaction_term = 0.5 * eta * torch.mean(u ** 4)  # Interaction term
 
         riesz_energy = 0.5 * (laplacian_term + potential_term + interaction_term)
-
         return riesz_energy
 
-    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None, prev_prediction=None):
+    def pde_loss(self, inputs, predictions, eta, potential_type, precomputed_potential=None, prev_prediction=None, mode=0):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
 
@@ -274,6 +304,8 @@ class GrossPitaevskiiPINN(nn.Module):
         prev_prediction : GrossPitaevskiiPINN or None
             Previously trained model whose predictions are used as part of the training process.
             If None, the model starts training from scratch.
+        mode: int
+            Mode of ground state solution to Gross-Pitavskii equation. Default is 0.
 
         Returns
         -------
@@ -283,12 +315,7 @@ class GrossPitaevskiiPINN(nn.Module):
                 - torch.Tensor: PDE residual.
                 - torch.Tensor: Smallest eigenvalue (lambda).
         """
-        if prev_prediction is None:
-            u = self.weighted_hermite(inputs, self.mode) + predictions
-        else:
-            u = prev_prediction(inputs) + predictions # Use model’s output from previous eta
-            # u = self.weighted_hermite(inputs, self.mode)  # Start with the base weighted hermite solution
-            # u += prev_prediction(inputs) + predictions  # Iteratively add perturbations
+        u = self.get_complete_solution(inputs, predictions, prev_prediction, mode)
 
         # Compute first and second derivatives with respect to x
         u_x = grad(u, inputs, grad_outputs=torch.ones_like(u), create_graph=True)[0]
@@ -354,47 +381,41 @@ class GrossPitaevskiiPINN(nn.Module):
         return sym_loss
 
     def total_loss(self, collocation_points, boundary_points, boundary_values, eta, lb, ub, weights, potential_type,
-                   precomputed_potential=None, prev_prediction=None):
+                   precomputed_potential=None, prev_prediction=None, mode=0):
         """
-        Compute the total loss combining multiple loss terms with self-adaptive weight balancing.
+        Compute the total loss combining boundary loss, Riesz energy loss,
+        PDE loss, L^2 norm regularization loss, and symmetry loss.
 
         Parameters
         ----------
         collocation_points : torch.Tensor
-            Tensor of spatial coordinates for interior points.
+            Input tensor of spatial coordinates for the interior points.
         boundary_points : torch.Tensor
-            Tensor of spatial coordinates at domain boundaries.
+            Input tensor of boundary spatial points.
         boundary_values : torch.Tensor
-            Expected function values at boundary points (Dirichlet conditions).
+            Tensor of boundary values (for Dirichlet conditions).
         eta : float
-            Interaction strength parameter.
+            Interaction strength.
         lb : torch.Tensor
-            Lower bound of the spatial domain.
+            Lower bound of interval.
         ub : torch.Tensor
-            Upper bound of the spatial domain.
+            Upper bound of interval.
+        weights : list
+            Weights for different loss terms.
         potential_type : str
-            Type of potential function used in the PDE.
-        precomputed_potential : torch.Tensor, optional
-            Precomputed potential values for efficiency (default: None, computed dynamically).
-        prev_prediction : GrossPitaevskiiPINN, optional
-            A previously trained model to incorporate past solutions (default: None).
+            Type of potential function to use
+        precomputed_potential : torch.Tensor
+            Precomputed potential. Default is None.
+        prev_prediction : GrossPitaevskiiPINN or None
+            Previously trained model whose predictions are used as part of the training process.
+            If None, the model starts training from scratch. Default is None.
+        mode: int
+            Mode of ground state solution to Gross-Pitavskii equation. Default is 0.
 
         Returns
         -------
         total_loss : torch.Tensor
-            Combined loss value weighted by dynamically learned coefficients.
-        data_loss : torch.Tensor
-            Loss enforcing boundary conditions.
-        riesz_energy_loss : torch.Tensor
-            Loss based on the Riesz energy formulation.
-        pde_loss : torch.Tensor
-            Loss from the PDE residual enforcement.
-        norm_loss : torch.Tensor
-            Regularization loss ensuring wave function normalization.
-        sym_loss : torch.Tensor
-            Loss enforcing domain symmetry.
-        alpha : torch.Tensor
-            Adaptive weights for balancing individual loss terms.
+            Total loss value.
         """
 
         # Use precomputed potential if provided
@@ -404,29 +425,29 @@ class GrossPitaevskiiPINN(nn.Module):
             V = self.compute_potential(collocation_points, potential_type)
 
         # Compute individual loss components
-        data_loss = self.boundary_loss(boundary_points, boundary_values, prev_prediction)
-        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type,V, prev_prediction)
-        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type, V, prev_prediction)
+        data_loss = self.boundary_loss(boundary_points, boundary_values, prev_prediction, mode)
+        riesz_energy_loss = self.riesz_loss(self.forward(collocation_points), collocation_points, eta, potential_type,
+                                            V, prev_prediction, mode)
+        pde_loss, _, _ = self.pde_loss(collocation_points, self.forward(collocation_points), eta, potential_type,
+                                            V, prev_prediction, mode)
         norm_loss = (torch.norm(self.forward(collocation_points), p=2) - 1) ** 2
         sym_loss = self.symmetry_loss(collocation_points, lb, ub)
-
-        # Compute self-adaptive weights
-        alpha = torch.exp(self.log_alpha)
-
-        # Normalize weights for self-adaptation
-        # weights = torch.tensor(weights, device=collocation_points.device)
-        # weights = weights / weights.max()
 
         # Scaling factor for pde loss and riesz energy loss
         domain_length = ub - lb
 
         # Compute weighted losses and total loss
         losses = [data_loss, riesz_energy_loss  / domain_length, pde_loss / domain_length, norm_loss, sym_loss]
-        weighted_losses = [alpha[i] * weights[i] * loss for i, loss in enumerate(losses)]
-        #weighted_losses = [alpha[i] * losses[i] for i in range(len(losses))]
+        weighted_losses = [weights[i] * loss for i, loss in enumerate(losses)]
         total_loss = sum(weighted_losses)
 
-        return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss, sym_loss, alpha
+        # Add regularization term to encourage wider solutions for higher eta
+        width_penalty = -eta * torch.mean(collocation_points ** 2 * torch.abs(self.forward(collocation_points)) ** 2)
+
+        # total_loss = data_loss + (pde_loss / domain_length) + (riesz_energy_loss  / domain_length) + width_penalty
+        total_loss = data_loss + (pde_loss / domain_length) +  (riesz_energy_loss / domain_length) + norm_loss
+
+        return total_loss, data_loss, riesz_energy_loss, pde_loss, norm_loss
 
 
 def initialize_weights(m):
@@ -441,6 +462,7 @@ def initialize_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.xavier_uniform_(m.weight)
         m.bias.data.fill_(0.01)
+
 
 def prepare_training_data(N_u, N_f, lb, ub):
     """
@@ -477,13 +499,15 @@ def prepare_training_data(N_u, N_f, lb, ub):
     return collocation_points, boundary_points, boundary_values
 
 
-def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type,
-                              prev_prediction, optimizer_name):
+def train_pinn_with_optimizer(model, X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type,
+                              prev_prediction, optimizer_name, mode):
     """
     Train the Physics-Informed Neural Network (PINN) for the 1D Gross-Pitaevskii equation.
 
     Parameters
     ----------
+    model : GrossPitaevskiiPINN
+        The initialized PINN model to be trained.
     X : np.ndarray
         Input data for the neural network
     N_u : int
@@ -511,6 +535,8 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
         If None, the model starts training from scratch.
     optimizer_name : str
         Name of optimizer to train.
+    mode: int
+        Mode of ground state solution to Gross-Pitavskii equation.
 
     Returns
     -------
@@ -521,13 +547,11 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
     lambda_pde_history : list of float
         List of λ_PDE values recorded during training for the specific optimizer.
     """
-    # Instantiate the PINN model for each optimizer and initialize its weights
-    model = GrossPitaevskiiPINN(layers).to(device)
-    model.apply(initialize_weights)
 
     # Select the optimizer
     optimizers = {
         "Adam": optim.Adam(model.parameters(), lr=1e-3),
+        # "Adam": optim.Adam(model.parameters(), lr=5e-3),
         "AdamW": optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.99)),
         "Shampoo": DistributedShampoo( model.parameters(),
                                        lr=0.001,
@@ -545,7 +569,8 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
 
     optimizer = optimizers[optimizer_name]
     # scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=epochs // 10, epochs=epochs)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=25, factor=0.5, verbose=True)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs // 10, eta_min=1e-5)
 
     # Prepare training data (collocation and boundary points)
     collocation_points, boundary_points, boundary_values = prepare_training_data(N_u, N_f, lb, ub)
@@ -574,13 +599,14 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
 
         # Calculate the total loss (boundary, Riesz energy, PDE, normalization, and symmetry losses)
         # with precomputed potential and Thomas-Fermi approximation
-        loss, data_loss, riesz_energy_loss, pde_loss, norm_loss, sym_loss, alpha = model.total_loss(collocation_points_tensor,
+        model.update_alpha_beta()
+        loss, data_loss, riesz_energy, pde_loss, norm_loss = model.total_loss(collocation_points_tensor,
                                                                               boundary_points_tensor,
                                                                               boundary_values_tensor,
                                                                               eta,
                                                                               lb_tensor, ub_tensor,
                                                                               weights, potential_type, V,
-                                                                              prev_prediction)
+                                                                              prev_prediction, mode)
 
         # Backpropagation and optimization
         loss.backward()
@@ -604,10 +630,7 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
                 collocation_points_tensor, model.forward(collocation_points_tensor),
                 eta, potential_type, V, prev_prediction
             )
-            print(f"[{optimizer_name}] Epoch [{epoch}/{epochs}]: η = {eta}, λ_PDE = {lambda_pde.item():.6f},  Loss: {loss.item():.6f}, "
-                  f"Data Loss = {data_loss.item():.6f}, Riesz Loss = {riesz_energy_loss.item():.6f}, "
-                  f"PDE Loss = {pde_loss.item():.6f}, Norm Loss = {norm_loss.item():.6f}, "
-                  f"Sym Loss = {sym_loss.item():.6f}, Adaptive Weights: {alpha.tolist()}")
+            print(f"[{optimizer_name}] Epoch [{epoch}/{epochs}]: η = {eta}, λ_PDE = {lambda_pde.item():.6f}, Loss: {loss.item():.6f}")
 
     return model, loss_history, lambda_pde_history
 
@@ -654,7 +677,7 @@ def plot_potential_1D(X_test, potential):
 
 
 def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model_save_path, potential_type,
-                        prev_model, optimizer_name):
+                        prev_prediction, optimizer_name, mode):
     """
     Train the Physics-Informed Neural Network (PINN) model and save it.
 
@@ -688,11 +711,13 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
         File name to save the trained model weights (e.g., 'model_eta_1.pth').
     potential_type: str
         Type of potential function to use
-    prev_model : GrossPitaevskiiPINN or None
+    prev_prediction : np.ndarray or None
         Previously trained model whose predictions are used as part of the training process.
         If None, the model starts training from scratch.
     optimizer_name : str
         Name of optimizer.
+    mode: int
+        Mode of ground state solution to Gross-Pitavskii equation.
 
     Returns
     -------
@@ -706,21 +731,21 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
         the corresponding value is a list of λ_PDE values recorded during training.
     """
 
-    # Create a new model, passing the previous model's forward function if available
-    prev_prediction = prev_model.forward if prev_model is not None else None
-    if prev_model is not None:
-        prev_model.eval()
-    model = GrossPitaevskiiPINN(layers, prev_prediction=prev_prediction).to(device)
-    model.apply(initialize_weights)
+    # Initialize the new model
+    initial_model = GrossPitaevskiiPINN(layers, mode=mode).to(device)
+
+    # Apply weight initialization
+    initial_model.apply(initialize_weights)
 
     # Train the model
-    model, loss_history, lambda_pde_history = train_pinn_with_optimizer(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
-                                      epochs=epochs, lb=lb, ub=ub, weights=weights, model_save_path=model_save_path,
-                                      potential_type=potential_type, prev_prediction=prev_prediction,
-                                      optimizer_name=optimizer_name)
+    model, loss_history, lambda_pde_history = train_pinn_with_optimizer(
+        initial_model, X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
+        epochs=epochs, lb=lb, ub=ub, weights=weights, model_save_path=model_save_path,
+        potential_type=potential_type, prev_prediction=prev_prediction,
+        optimizer_name=optimizer_name, mode=mode)
 
     # Directory to save the models
-    model_save_dir = 'models'
+    model_save_dir = '../models'
     os.makedirs(model_save_dir, exist_ok=True)  # Create the directory if it doesn't exist
 
     # Save model after training
@@ -730,7 +755,7 @@ def train_and_save_pinn(X, N_u, N_f, layers, eta, epochs, lb, ub, weights, model
     return model, loss_history, lambda_pde_history
 
 
-def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicted_solutions.png',
+def predict_and_plot(models, etas, optimizers, mode, X_test, save_path='plots/predicted_solutions.png',
                      potential_type='gaussian', prev_prediction=None):
     """
     Predict and plot the solutions for all models, making separate plots for each optimizer.
@@ -744,6 +769,8 @@ def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicte
         A list of η values used during training.
     optimizers : list of str
         A list of optimizer names used during training.
+    mode : int
+        The mode of ground state solution to Gross-Pitavskii equation used during training.
     X_test : np.ndarray
         Test points along the 1D interval.
     save_path : str, optional
@@ -757,64 +784,54 @@ def predict_and_plot(models, etas, optimizers, X_test, save_path='plots/predicte
     -------
     None
     """
-    # Ensure the plots directory exists
+    # Make a new directory if the plots directory doesn't exist
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
 
     for optimizer_name in optimizers:
         plt.figure(figsize=(10, 6))
 
-        accumulated_prediction = None  # Store cumulative perturbations
+        prev_prediction = None  # Reset for each optimizer
 
-        for eta in etas:
+        for i, eta in enumerate(etas):
             if eta in models and optimizer_name in models[eta]:
-                model = models[eta][optimizer_name]  # Retrieve model for optimizer and eta
+                model = models[eta][optimizer_name]
                 model.eval()
 
-                # Prepare test data
-                X_test_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
+                # Base solution for η = 0
+                if eta == 0:
+                    wh_approx = model.weighted_hermite(X_test_tensor, mode).detach().cpu().numpy()
+                    plt.plot(X_test, wh_approx, linestyle="--", color="black", label="Weighted Hermite (η=0)")
 
-                # Weighted Hermite Approximation (η=0)
-                wh_approx = model.weighted_hermite(X_test_tensor, 0).detach().cpu().numpy()
+                # Predict u_pred from model
+                u_pred = model.forward(X_test_tensor)
+                complete_solution = model.get_complete_solution(X_test_tensor, u_pred, prev_prediction, mode)
+                solution = complete_solution.detach().cpu().numpy()
 
-                # Get the model's prediction
-                u_pred = model(X_test_tensor).detach().cpu().numpy()
+                # Plot
+                plt.plot(X_test, np.abs(solution), label=f"η={eta}", linestyle="-")
 
-                # Accumulate perturbations from previous eta values
-                if accumulated_prediction is None:
-                    accumulated_prediction = wh_approx + u_pred  # Base solution
-                else:
-                    accumulated_prediction += u_pred  # Add perturbations iteratively
+                # Update prev_prediction using the correct flattening
+                def make_flat_prev_prediction(model_snapshot):
+                    def flat_prev(x):
+                        with torch.no_grad():
+                            pert = model_snapshot.forward(x)
+                            return model_snapshot.get_complete_solution(x, pert, None, mode)
 
-                # Calculate the potential
-                potential = model.compute_potential(X_test_tensor, potential_type)
+                    return flat_prev
 
-                # Calculate λ_PDE and the Thomas-Fermi approximation
-                _, _, lambda_pde = model.pde_loss(X_test_tensor,
-                                                  model.forward(X_test_tensor), eta,
-                                                  potential_type, potential, prev_prediction)
-                tf_approx = model.compute_thomas_fermi_approx(X_test_tensor, potential, eta).detach().cpu().numpy()
-                tf_approx_normalized = normalize_wave_function(tf_approx)
+                prev_prediction = make_flat_prev_prediction(model)
 
-                # Plot predicted solution for this optimizer
-                plt.plot(X_test, accumulated_prediction, label=f"η={eta}", linestyle="-")
-
-        # Plot Weighted Hermite Approximation (η=0)
-        wh_approx = model.weighted_hermite(X_test_tensor, 0).detach().cpu().numpy()
-        wh_approx_normalized = normalize_wave_function(wh_approx)
-        plt.plot(X_test, wh_approx, linestyle="--", color="black",
-                 label="Weighted Hermite (η=0)")
-
-        plt.title(f"PINN Solutions - {potential_type.capitalize()} - {optimizer_name}", fontsize="xx-large")
+        plt.title(f"PINN Solutions - {potential_type.capitalize()} - {optimizer_name} - Mode {mode}",
+                  fontsize="xx-large")
         plt.xlabel("$x$", fontsize="xx-large")
-        plt.ylabel("Normalized $u(x)$", fontsize="xx-large")
+        plt.ylabel("$|u(x)|$", fontsize="xx-large")
         plt.grid(True)
         plt.legend(fontsize="large")
-
-        # Set tick sizes
         plt.xticks(fontsize="x-large")
         plt.yticks(fontsize="x-large")
 
-        # Save the plot for this optimizer
+        # Save the plot
         optimizer_plot_path = save_path.format(optimizer=optimizer_name, potential_type=potential_type)
         plt.savefig(optimizer_plot_path, dpi=300, bbox_inches='tight')
         plt.show()
@@ -922,74 +939,108 @@ def plot_lambda_pde(lambda_pde_histories, etas, optimizer_names, save_path="plot
     plt.show()
 
 
+def make_prev_prediction(prev_model, mode):
+    prev_model.eval()
+
+    def prev_prediction(x):
+        with torch.no_grad():
+            # Always return the full solution for η=N (not stacking recursively)
+            base_perturbation = prev_model.forward(x)
+            base_solution = prev_model.get_complete_solution(x, base_perturbation, None, mode)
+            return base_solution
+
+    return prev_prediction
+
+
 if __name__ == "__main__":
     # Parameters
-    N_u = 200  # Number of boundary points
-    N_f = 4000  # Number of collocation points
-    epochs = 2001 # Number of iterations of training
+    N_u = 400  # Number of boundary points
+    N_f = 2000  # Number of collocation points
+    epochs = 2001  # Number of iterations of training
     layers = [1, 100, 100, 100, 1]  # Neural network architecture
     lb, ub = -10, 10  # Boundary limits
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Input grid for training
 
     # Test points
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
-    etas = [1, 10, 50, 100]  # Interaction strengths
+    etas = [0, 10, 20, 30, 40]  # Interaction strengths
 
     # Weights for loss terms
-    # weights = [50.0, 1.0, 2.0, 10.0, 50.0]
-    weights = [10.0, 1.0, 2.0, 10.0, 10.0]
+    weights = [50.0, 1.0, 2.0, 100.0, 50.0]
 
-    potential_types = ['gaussian', 'harmonic', 'periodic']
-    #potential_types = ['harmonic']
+    potential_types = ['harmonic']
 
     # Optimizers to compare
-    optimizer_names = ["Adam", "AdamW", "Shampoo"]
+    optimizer_names = ["Adam"]
+
+    # Modes for ground state solution to Gross-Pitavskii equation
+    # modes = [0, 1, 2, 3]  # Reduced number of modes for faster testing
+    modes = [0]
 
     # Store results for plotting
     all_loss_histories = {}
     all_lambda_pde_histories = {}
     models = {eta: {} for eta in etas}  # Store models for all η and optimizers
 
-# Loop through each potential type
-for potential_type in potential_types:
+    # Loop through every mode
+    for mode in modes:
+        print(f"Training for mode {mode}")
 
-    for optimizer_name in optimizer_names:
-        print(f"Training with {optimizer_name} optimizer...")
+        # Loop through each potential type
+        for potential_type in potential_types:
+            print(f"Using potential type: {potential_type}")
 
-        # Store results for each optimizer separately
-        prev_model = None
-        loss_histories = {}
-        lambda_pde_histories = {}
+            for optimizer_name in optimizer_names:
+                print(f"Training with {optimizer_name} optimizer...")
 
-        for eta in etas:
-            model_save_path = f"trained_model_eta_{eta}_{optimizer_name}.pth"
-            model, loss_history, lambda_pde_history = train_and_save_pinn(X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
-                                                                          epochs=epochs, lb=lb, ub=ub,
-                                                                          weights=weights, model_save_path=model_save_path,
-                                                                          potential_type=potential_type, prev_model=prev_model,
-                                                                          optimizer_name=optimizer_name)
-            prev_model = model  # Store the trained model for the next iteration
+                # Store results for each optimizer separately
+                prev_model = None
+                loss_histories = {}
+                lambda_pde_histories = {}
 
-            # Store models by eta and optimizer
-            models[eta][optimizer_name] = model
+                # Process etas in order, starting with eta=0
+                # Ensuring eta=0 is processed first as our base case
+                sorted_etas = sorted(etas)
 
-            # Store loss and λ_PDE history under each eta for this optimizer
-            if potential_type not in all_loss_histories:
-                all_loss_histories[potential_type] = {}
-            if potential_type not in all_lambda_pde_histories:
-                all_lambda_pde_histories[potential_type] = {}
+                prev_prediction = None  # Initial state
 
-            all_loss_histories[potential_type].setdefault(eta, {})[optimizer_name] = loss_history
-            all_lambda_pde_histories[potential_type].setdefault(eta, {})[optimizer_name] = lambda_pde_history
+                for eta in sorted_etas:
+                    print(f"Training for eta = {eta}")
 
-    # Predict and plot the solutions for each optimizer separately
-    predict_and_plot(models, etas, optimizer_names, X_test, save_path='plots/predicted_solutions_{potential_type}.png',
-                     potential_type=potential_type, prev_prediction=prev_model)
+                    model_save_path = f"trained_model_mode_{mode}_eta_{eta}_{optimizer_name}.pth"
+                    model, loss_history, lambda_pde_history = train_and_save_pinn(
+                        X, N_u=N_u, N_f=N_f, layers=layers, eta=eta,
+                        epochs=epochs, lb=lb, ub=ub,
+                        weights=weights, model_save_path=model_save_path,
+                        potential_type=potential_type, prev_prediction=prev_prediction,
+                        optimizer_name=optimizer_name, mode=mode)
 
-    # Plot the loss history for all etas
-    plot_loss_history(all_loss_histories[potential_type], etas, optimizer_names,
-                      save_path='plots/loss_history_{potential_type}.png', potential_type=potential_type)
+                    # Store the previous prediction for the next iteration
+                    prev_prediction = make_prev_prediction(model, mode)
 
-    # Plot lambda_pde history for all etas
-    plot_lambda_pde(all_lambda_pde_histories[potential_type], etas, optimizer_names,
-                    save_path=f'plots/lambda_pde_{potential_type}.png', potential_type=potential_type)
+                    # Store models by eta and optimizer
+                    models[eta][optimizer_name] = model
+
+                    # Store loss and λ_PDE history under each eta for this optimizer
+                    if potential_type not in all_loss_histories:
+                        all_loss_histories[potential_type] = {}
+                    if potential_type not in all_lambda_pde_histories:
+                        all_lambda_pde_histories[potential_type] = {}
+
+                    all_loss_histories[potential_type].setdefault(eta, {})[optimizer_name] = loss_history
+                    all_lambda_pde_histories[potential_type].setdefault(eta, {})[optimizer_name] = lambda_pde_history
+
+            # Predict and plot the solutions for each optimizer separately
+            predict_and_plot(models, sorted_etas, optimizer_names, mode, X_test,
+                             save_path=f'plots/mode_{mode}_predicted_solutions_{potential_type}.png',
+                             potential_type=potential_type)
+
+            # Plot the loss history for all etas
+            # plot_loss_history(all_loss_histories[potential_type], sorted_etas, optimizer_names,
+            #                   save_path=f'plots/mode_{mode}_loss_history_{potential_type}.png',
+            #                   potential_type=potential_type)
+            #
+            # # Plot lambda_pde history for all etas
+            # plot_lambda_pde(all_lambda_pde_histories[potential_type], sorted_etas, optimizer_names,
+            #                 save_path=f'plots/mode_{mode}_lambda_pde_{potential_type}.png',
+            #                 potential_type=potential_type)

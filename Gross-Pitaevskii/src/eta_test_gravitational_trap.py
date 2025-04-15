@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -53,55 +51,76 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def gravitational_solution(self, x, n):
         """
-        Compute the analytical solution for the gravitational trap for the linear case (gamma = 0).
-        Based on equations (28)-(31) from the paper.
+        Create gravitational trap eigenfunctions using the actual Airy functions according to
+        equations (30-31) from the paper: Ψₙ(x) = Aₙ·Ai(x + xₙ)
 
-        For gravitational potential V(x) = mgx for x > 0 and infinity for x < 0.
-        The solutions involve Airy functions.
+        Parameters:
+        -----------
+        x : torch.Tensor
+            Spatial coordinates tensor
+        n : int
+            Mode number (0 = ground state, 1 = first excited state, etc.)
+
+        Returns:
+        --------
+        torch.Tensor
+            The exact eigenfunction for the given mode
         """
-        # Convert to numpy for Airy function calculation
-        x_np = x.cpu().detach().numpy()
+        # Convert to numpy for calculation, making sure to detach first
+        x_np = x.detach().cpu().numpy()
 
-        # Parameters for gravitational trap (equations 28-31 in the paper)
-        xi_n = self.get_airy_zeros(n + 1)[-1]  # Get the (n+1)th zero of the Airy function
-        l_0 = (self.hbar ** 2 / (2 * self.m ** 2 * self.g)) ** (1 / 3)  # Characteristic length
+        # Initialize wavefunction array - all zeros
+        psi = np.zeros_like(x_np)
 
-        # Calculate xi = (x/l_0 - E_n/(m*g*l_0))
-        # Where E_n = -xi_n * m * g * l_0 is the energy of the nth state
-        xi = x_np / l_0 - xi_n
-
-        # Calculate the Airy function
-        Ai_vals = np.zeros_like(xi)
-        mask = x_np >= 0  # Only calculate for x >= 0 (where potential is finite)
-
-        # Get Airy function values where x >= 0
-        Ai_vals[mask] = airy(xi[mask])[0]
-
-        # Normalization factor (from paper equation 31)
-        # This is approximate and might need manual adjustment
-        norm_factor = 1.0 / (l_0 * (airy(xi_n)[1]) ** 2) ** (0.5)
-
-        # Convert back to tensor and apply normalization
-        solution = norm_factor * torch.tensor(Ai_vals, dtype=torch.float32).to(device)
-
-        # Set solution to zero for x < 0 (infinite potential barrier)
-        solution[x < 0] = 0.0
-
-        return solution
-
-    def get_airy_zeros(self, num_zeros):
-        """
-        Get the first n zeros of the Airy function Ai(x).
-        These are the negative zeros in ascending order by absolute value.
-        """
-        # Approximate values of the first several zeros of the Airy function
-        # These are more precise than what scipy.special.ai_zeros provides for the small n we need
+        # Get the zeros of the Airy function - these are the negative values where Ai(x) = 0
         airy_zeros = [
             -2.33811, -4.08795, -5.52056, -6.78671, -7.94413,
             -9.02265, -10.0401, -11.0085, -11.9361, -12.8288,
             -13.6915, -14.5272, -15.3394, -16.1307, -16.9039
         ]
-        return np.array(airy_zeros[:num_zeros])
+
+        # For the gravitational trap, use the nth zero
+        if n < len(airy_zeros):
+            x_n = airy_zeros[n]  # Use the nth zero
+        else:
+            # Fallback approximation for higher modes
+            x_n = -(1.5 * np.pi * (n + 0.75)) ** (2 / 3)
+
+        # Only calculate for the positive domain (x >= 0) - gravitational trap
+        mask_positive = (x_np >= 0)
+
+        # Check if we have any positive domain points
+        if not np.any(mask_positive):
+            # If all points are in negative domain, return zeros (wavefunction vanishes for x < 0)
+            return torch.zeros_like(x)
+
+        x_pos = x_np[mask_positive]
+
+        # Calculate the Airy function values: Ai(x + xₙ)
+        airy_vals = airy(x_pos + x_n)[0]  # [0] selects Ai from the airy function output
+
+        # Handle sign convention only if we have values to work with
+        if len(airy_vals) > 0:
+            # For modes 0, 2, 4, ... (even modes), function should be positive near x=0
+            # For modes 1, 3, 5, ... (odd modes), function should be negative near x=0
+            if n % 2 == 1 and airy_vals[0] > 0:
+                airy_vals = -airy_vals
+            elif n % 2 == 0 and airy_vals[0] < 0:
+                airy_vals = -airy_vals
+
+            # Compute normalization constant Aₙ according to equation (31)
+            dx = float(x[1].detach() - x[0].detach()) if len(x) > 1 else 0.01
+            norm_factor = np.sqrt(np.sum(airy_vals ** 2) * dx)
+
+            # Avoid division by zero
+            if norm_factor > 0:
+                # Apply normalization and assign to the positive domain
+                psi[mask_positive] = airy_vals / norm_factor
+
+        # Convert back to tensor
+        solution = torch.tensor(psi, dtype=torch.float32).to(device)
+
+        return solution
 
     def forward(self, inputs):
         """
@@ -132,17 +151,6 @@ class GrossPitaevskiiPINN(nn.Module):
 
             V[mask_positive] = self.m * g * x[mask_positive]
             V[mask_negative] = 1e6  # Very large value to approximate infinity
-
-        elif potential_type == "harmonic":
-            omega = kwargs.get('omega', 1.0)  # Frequency for harmonic potential
-            V = 0.5 * omega ** 2 * x ** 2
-        elif potential_type == "gaussian":
-            a = kwargs.get('a', 0.0)  # Center of the Gaussian
-            V = torch.exp(-(x - a) ** 2)
-        elif potential_type == "periodic":
-            V0 = kwargs.get('V0', 1.0)  # Depth of the potential
-            k = kwargs.get('k', 2 * np.pi / 5.0)  # Wave number for periodic potential
-            V = V0 * torch.cos(k * x) ** 2
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
         return V
@@ -218,9 +226,11 @@ class GrossPitaevskiiPINN(nn.Module):
             retain_graph=True
         )[0]
 
-        # Calculate normalization factor for proper integration
+        # Calculate normalization factor for proper numerical integration
         dx = inputs[1] - inputs[0]  # Grid spacing
         norm_factor = torch.sum(u ** 2) * dx
+
+        # Compute each term in the energy functional with proper normalization
 
         # Kinetic energy term: |∇ψ|²/2 with proper normalization
         kinetic_term = 0.5 * torch.sum(u_x ** 2) * dx / norm_factor
@@ -280,15 +290,6 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         integral = torch.sum(u ** 2) * dx
         return (integral - 1.0) ** 2
-
-
-def initialize_weights(m):
-    """
-    Initialize the weights using Xavier uniform initialization.
-    """
-    if isinstance(m, nn.Linear):
-        nn.init.xavier_uniform_(m.weight)
-        m.bias.data.fill_(0.01)
 
 
 def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
@@ -377,6 +378,13 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
             loss_history = []
             constraint_history = []
 
+            # Early stopping setup
+            best_loss = float('inf')
+            best_model_state = None
+            patience = 500  # Number of epochs to wait for improvement
+            no_improve_count = 0
+            min_epochs = 2000  # Minimum number of epochs to train
+
             for epoch in range(epochs):
                 optimizer.zero_grad()
 
@@ -425,6 +433,12 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
                 # Total loss for optimization
                 total_loss = physics_loss + constraint_loss
 
+                # Skip problematic gradients (avoid NaN/Inf)
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    if verbose and epoch % 500 == 0:
+                        print(f"Warning: NaN or Inf loss at epoch {epoch}")
+                    continue
+
                 # Backpropagate
                 total_loss.backward(retain_graph=True)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
@@ -445,8 +459,44 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
                             print(
                                 f"Epoch {epoch}, {loss_type}: {physics_loss.item():.6f}, μ: {lambda_value.item():.4f}")
 
+                # Early stopping check
+                curr_loss = total_loss.item()
+                if curr_loss < best_loss:
+                    best_loss = curr_loss
+                    # Save the model state dictionary to CPU to avoid memory issues
+                    best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+
+                # Early stopping with minimum epochs requirement
+                if no_improve_count > patience and epoch > min_epochs:
+                    if verbose:
+                        print(f"Early stopping at epoch {epoch}")
+                    break
+
+            # Load the best model if we saved one
+            if best_model_state is not None:
+                model.load_state_dict({k: v.to(device) for k, v in best_model_state.items()})
+
+            # Calculate final chemical potential with the best model
+            model.eval()
+            with torch.no_grad():
+                u_pred = model.forward(X_tensor)
+                if mode == 0:
+                    _, final_lambda, _ = model.riesz_loss(
+                        X_tensor, u_pred, gamma, potential_type, precomputed_potential=potential
+                    )
+                else:
+                    _, _, final_lambda, _ = model.pde_loss(
+                        X_tensor, u_pred, gamma, potential_type, precomputed_potential=potential
+                    )
+                final_mu = final_lambda.item()
+
             # Record final chemical potential and save model
-            final_mu = lambda_history[-1] if lambda_history else 0
+            if verbose:
+                print(f"Final μ for mode {mode}, γ={gamma}: {final_mu:.4f}")
+
             mu_logs.append((gamma, final_mu))
             models_by_gamma[gamma] = model
 
@@ -513,7 +563,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="plo
         plt.ylabel("ψ(x)", fontsize=12)
         plt.grid(True)
         plt.legend()
-        plt.xlim(0, 35)  # Adjusted range to focus on the positive domain
+        plt.xlim(-5, 20)  # Adjusted range to focus on the positive domain
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"grav_mode_{mode}_wavefunction.png"), dpi=300)
         plt.close()
@@ -577,13 +627,40 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="pl
                         color=colors[j % len(colors)],
                         label=f"γ={gamma:.1f}")
 
-        # Configure the subplot to match the paper's style
-        ax.set_title(f"Mode {mode}", fontsize=12)
-        ax.set_xlabel("x", fontsize=10)
-        ax.set_ylabel("ψ(x)", fontsize=10)
-        ax.grid(True)
-        ax.legend(fontsize=8)
-        ax.set_xlim(0, 35)  # Focus on positive domain
+                # Configure the subplot to match the paper's style
+            ax.set_title(f"Mode {mode}", fontsize=12)
+            ax.set_xlabel("x", fontsize=10)
+            ax.set_ylabel("ψ(x)", fontsize=10)
+            ax.grid(True)
+            ax.legend(fontsize=8)
+            ax.set_xlim(0, 35)  # Focus on positive domain
+
+        # Hide any unused subplots
+        for i in range(len(modes), len(axes)):
+            axes[i].axis('off')
+
+            # Finalize and save combined figure
+        fig.suptitle("Wavefunction for Gravitational Trap", fontsize=16)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.savefig(os.path.join(save_dir, "grav_all_modes_combined.png"), dpi=300)
+        plt.close(fig)
+
+        # Enforce zero for x < 0 (infinite potential barrier)
+        u_np[X_test.flatten() < 0] = 0
+
+        # Plot on the appropriate subplot
+        ax.plot(X_test.flatten(), u_np,
+                linestyle=linestyles[j % len(linestyles)],
+                color=colors[j % len(colors)],
+                label=f"γ={gamma:.1f}")
+
+    # Configure the subplot to match the paper's style
+    ax.set_title(f"Mode {mode}", fontsize=12)
+    ax.set_xlabel("x", fontsize=10)
+    ax.set_ylabel("ψ(x)", fontsize=10)
+    ax.grid(True)
+    ax.legend(fontsize=8)
+    ax.set_xlim(0, 35)  # Focus on positive domain
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
@@ -631,22 +708,211 @@ def plot_mu_vs_gamma(mu_table, modes, save_dir="plots_gravitational"):
 
 
 def advanced_initialization(m, mode):
-    """Initialize network weights with consideration of the mode number"""
+    """Initialize network weights optimized for gravitational trap eigenstates"""
     if isinstance(m, nn.Linear):
-        # Use Xavier initialization but scale based on mode
-        gain = 1.0 / (1.0 + 0.1 * mode)  # Decrease gain for higher modes
+        # Smaller gain for all modes to avoid large initial perturbations
+        # from the analytical Airy function solution
+        gain = 0.1 / (1.0 + 0.2 * mode)  # More aggressive reduction for higher modes
         nn.init.xavier_uniform_(m.weight, gain=gain)
 
-        # Initialize biases with small values
-        m.bias.data.fill_(0.01)
+        # Initialize biases closer to zero for better numerical stability
+        # Higher modes need smaller perturbations initially
+        m.bias.data.fill_(0.001 / (1.0 + mode))
+
+
+def test_gravitational_solutions(model, mode_range, save_path=None):
+    """
+    Test and visualize the gravitational trap eigenfunctions to verify correct node count.
+
+    Parameters:
+    -----------
+    model : GrossPitaevskiiPINN
+        The model containing the gravitational_solution method
+    mode_range : list or range
+        The range of modes to test
+    save_path : str, optional
+        Path to save the generated figure
+    """
+    # Create a test domain
+    x = np.linspace(0, 35, 1000)  # Focus on positive domain
+    x_tensor = torch.tensor(x.reshape(-1, 1), dtype=torch.float32).to(device)
+
+    # Set up the plot
+    fig, axes = plt.subplots(len(mode_range), 1, figsize=(10, 3 * len(mode_range)))
+    if len(mode_range) == 1:
+        axes = [axes]
+
+    # Test each mode
+    for i, mode in enumerate(mode_range):
+        # Compute the eigenfunction
+        with torch.no_grad():
+            psi = model.gravitational_solution(x_tensor, mode).cpu().numpy()
+
+        # Count zero crossings to verify node count
+        sign_changes = np.where(np.diff(np.signbit(psi)))[0]
+        node_count = len(sign_changes)
+
+        # Plot the wavefunction
+        axes[i].plot(x, psi, 'b-', linewidth=2)
+        axes[i].set_title(f"Mode {mode}: Expected {mode} nodes, Found {node_count} nodes")
+
+        # Mark the nodes with red dots
+        if node_count > 0:
+            node_positions = x[sign_changes]
+            axes[i].plot(node_positions, np.zeros_like(node_positions), 'ro', markersize=4)
+
+        # Add grid and labels
+        axes[i].grid(True)
+        axes[i].set_xlabel("x")
+        axes[i].set_ylabel("ψ(x)")
+
+        # Print verification
+        print(f"Mode {mode}: Expected {mode} nodes, found {node_count} nodes")
+        if node_count > 0:
+            print(f"  Node positions: {node_positions}")
+
+    plt.tight_layout()
+
+    # Save the figure if a path is provided
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+        print(f"Figure saved to {save_path}")
+
+    plt.show()
+
+
+def plot_theoretical_solutions(modes, X_test, gamma_values=None, save_dir="plots_gravitational"):
+    """
+    Plot theoretical eigenfunctions for the linear case (γ=0) using Airy functions
+    based on equations (30-31) from the paper.
+
+    Parameters:
+    -----------
+    modes : list of int
+        List of modes to generate (0, 1, 2, etc.)
+    X_test : numpy.ndarray
+        Spatial grid
+    gamma_values : list of float, optional
+        If provided, compare with computed solutions for these gamma values
+    save_dir : str, optional
+        Directory to save plots
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Get the first several zeros of the Airy function Ai(x)
+    # These are more precise than what scipy.special.ai_zeros provides
+    airy_zeros = [
+        -2.33811, -4.08795, -5.52056, -6.78671, -7.94413,
+        -9.02265, -10.0401, -11.0085, -11.9361, -12.8288
+    ]
+
+    x_np = X_test.flatten()
+
+    for mode in modes:
+        plt.figure(figsize=(10, 6))
+
+        # Get the appropriate zero for this mode
+        if mode < len(airy_zeros):
+            x_n = airy_zeros[mode]
+
+            # Compute the Airy function values over the domain
+            psi = np.zeros_like(x_np)
+            mask = (x_np >= 0)  # Gravitational trap: wavefunction = 0 for x < 0
+
+            # Compute Ψₙ(x) = Aₙ·Ai(x + xₙ)
+            airy_vals = airy(x_np[mask] + x_n)[0]  # [0] selects Ai from the airy function output
+
+            # Compute normalization constant Aₙ
+            dx = x_np[1] - x_np[0]
+            norm_factor = np.sqrt(np.sum(airy_vals ** 2) * dx)
+
+            # Apply normalization
+            psi[mask] = airy_vals / norm_factor
+
+            # Plot theoretical solution
+            plt.plot(x_np, psi, 'k-', linewidth=2, label=f"Theoretical (γ=0)")
+
+            # Fixed node detection - only count sign changes in the POSITIVE domain
+            # This is the key fix: we're only interested in nodes where x >= 0
+            positive_domain_indices = np.where(x_np >= 0)[0]
+            if len(positive_domain_indices) > 0:
+                # Only look at the wavefunction in the positive domain
+                positive_psi = psi[positive_domain_indices]
+                positive_x = x_np[positive_domain_indices]
+
+                # Find sign changes (nodes) ONLY in the positive domain
+                # Exclude the x=0 point itself from consideration
+                exclude_boundary = positive_x > 0
+                inner_psi = positive_psi[exclude_boundary]
+                inner_x = positive_x[exclude_boundary]
+
+                # Now find sign changes in this cleaned-up region
+                sign_changes = np.where(np.diff(np.signbit(inner_psi)))[0]
+                node_count = len(sign_changes)
+
+                # Get node positions for plotting
+                if node_count > 0:
+                    # +1 adjustment to account for the shift due to excluding boundary
+                    node_indices = sign_changes + 1
+                    node_positions = inner_x[node_indices]
+                    plt.plot(node_positions, np.zeros_like(node_positions), 'ro', markersize=6)
+            else:
+                node_count = 0
+                node_positions = []
+
+            plt.title(f"Mode {mode} Eigenfunction: Expected {mode} nodes, Found {node_count} nodes", fontsize=14)
+            plt.xlabel("x", fontsize=12)
+            plt.ylabel("ψ(x)", fontsize=12)
+            plt.grid(True)
+            plt.legend()
+            plt.xlim(-5, 20)
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f"theoretical_mode_{mode}.png"), dpi=300)
+            plt.close()
+
+            print(f"Theoretical Mode {mode}: Expected {mode} nodes, found {node_count} nodes")
+            if node_count > 0:
+                print(f"  Node positions: {node_positions}")
+        else:
+            print(f"No theoretical solution generated for mode {mode}: Airy zero not available")
+
+    # Create a combined plot of theoretical solutions
+    plt.figure(figsize=(12, 8))
+
+    for mode in range(min(7, len(airy_zeros))):  # Show first 7 modes or fewer
+        x_n = airy_zeros[mode]
+
+        # Compute the Airy function values
+        psi = np.zeros_like(x_np)
+        mask = (x_np >= 0)
+        airy_vals = airy(x_np[mask] + x_n)[0]
+
+        # Normalization
+        dx = x_np[1] - x_np[0]
+        norm_factor = np.sqrt(np.sum(airy_vals ** 2) * dx)
+        psi[mask] = airy_vals / norm_factor
+
+        # Plot with offset for clarity
+        offset = mode * 0.6
+        plt.plot(x_np, psi + offset, linewidth=2, label=f"Mode {mode}")
+        plt.axhline(y=offset, color='gray', linestyle='--', alpha=0.3)
+
+    plt.title("Theoretical Eigenfunctions for Gravitational Trap (γ=0)", fontsize=14)
+    plt.xlabel("x", fontsize=12)
+    plt.ylabel("ψ(x) + offset", fontsize=12)
+    plt.grid(True)
+    plt.legend()
+    plt.xlim(-5, 20)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "all_theoretical_modes.png"), dpi=300)
+    plt.close()
 
 
 if __name__ == "__main__":
     # Setup parameters
-    #lb, ub = -5, 20  # Domain boundaries adjusted for gravitational trap
-    lb, ub = 0, 35  # Domain boundaries adjusted for gravitational trap
+    lb, ub = -5, 20  # Domain boundaries adjusted for gravitational trap
     N_f = 5000  # Number of collocation points (increased for better resolution)
-    epochs = 4001  # Increased epochs for better convergence
+    epochs = 101  # Number of training epochs
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
     save_dir = "plots_gravitational"  # Define the output directory for plots
 
@@ -662,6 +928,10 @@ if __name__ == "__main__":
 
     # Include modes 0 through 7
     modes = [0, 1, 2, 3, 4, 5, 6, 7]
+
+    # First, plot theoretical solutions based on Airy functions for γ=0
+    print("Generating theoretical Airy function solutions...")
+    plot_theoretical_solutions(modes, X_test, save_dir=save_dir)
 
     # Train models
     print("Starting training for all modes and gamma values...")
