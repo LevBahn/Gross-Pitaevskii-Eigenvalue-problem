@@ -576,7 +576,7 @@ if __name__ == "__main__":
     # Setup parameters
     lb, ub = -10, 10  # Domain boundaries
     N_f = 4000  # Number of collocation points
-    epochs = 101  # Increased epochs for better convergence
+    epochs = 4001  # Increased epochs for better convergence
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
 
     # Create uniform grid for training and testing
