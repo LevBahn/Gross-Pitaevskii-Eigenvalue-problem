@@ -12,6 +12,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import matplotlib.pyplot as plt
 import scienceplots
 import matplotlib as mpl
+
 mpl.rcParams['text.usetex'] = False  # Disable LaTeX rendering
 
 plot_params = {
@@ -41,7 +42,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=1.0):
         """
         Parameters
         ----------
@@ -55,6 +56,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Mode number (default is 0).
         gamma : float, optional
             Interaction strength parameter.
+        L : float, optional
+            Length of the box (default is 1.0).
         """
         super().__init__()
         self.layers = layers
@@ -63,6 +66,7 @@ class GrossPitaevskiiPINN(nn.Module):
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
         self.gamma = gamma  # Interaction strength parameter
+        self.L = L  # Length of the box
 
     def build_network(self):
         """
@@ -75,14 +79,37 @@ class GrossPitaevskiiPINN(nn.Module):
                 layers.append(nn.Tanh())
         return nn.Sequential(*layers)
 
-    def weighted_hermite(self, x, n):
+    def box_eigenfunction(self, x, n):
         """
-        Compute the weighted Hermite polynomial solution for the linear case (gamma = 0).
+        Compute the analytic eigenfunction for a particle in a box.
+
+        For the linear case (gamma = 0), the solution is:
+        phi_n(x) = sqrt(2/L) * sin((n+1)*pi*x/L)
+
+        This corresponds to equation (22) in the paper.
         """
-        H_n = hermite(n)(x.cpu().detach().numpy())  # Hermite polynomial evaluated at x
-        norm_factor = (2 ** n * math.factorial(n) * np.sqrt(np.pi)) ** (-0.5)
-        weighted_hermite = norm_factor * torch.exp(-x ** 2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
-        return weighted_hermite
+        # For mode 0, n=1 in the sine function per equation (22)
+        n_actual = n + 1  # Convert mode number to quantum number (n=0 → first excited state with n_actual=1)
+
+        # Normalization factor
+        norm_factor = torch.sqrt(torch.tensor(2.0 / self.L))
+
+        # Sine function with proper scaling
+        phi_n = norm_factor * torch.sin(n_actual * torch.pi * x / self.L)
+
+        return phi_n
+
+    def energy_eigenvalue(self, n):
+        """
+        Compute the energy eigenvalue for mode n in a box potential.
+
+        E_n = ((n+1)²π²ħ²)/(2mL²)  # Adjusting for 0-indexed modes
+
+        With ħ=1 and m=1, this simplifies to:
+        E_n = ((n+1)²π²)/(2L²)
+        """
+        n_actual = n + 1  # Convert mode to quantum number
+        return (n_actual ** 2 * np.pi ** 2) / (2 * self.L ** 2)
 
     def forward(self, inputs):
         """
@@ -92,32 +119,32 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def get_complete_solution(self, x, perturbation, mode=None):
         """
-        Get the complete solution by combining the base Hermite solution with the neural network perturbation.
+        Get the complete solution by combining the base sine solution with the neural network perturbation.
         """
         if mode is None:
             mode = self.mode
-        base_solution = self.weighted_hermite(x, mode)
+        base_solution = self.box_eigenfunction(x, mode)
         return base_solution + perturbation
 
-    def compute_potential(self, x, potential_type="harmonic", **kwargs):
+    def compute_potential(self, x, potential_type="box"):
         """
         Compute potential function for the 1D domain.
+
+        For the box potential:
+        V(x) = 0 for 0 < x < L
+        V(x) = ∞ for x <= 0 or x >= L (enforced via boundary conditions)
         """
-        if potential_type == "harmonic":
-            omega = kwargs.get('omega', 1.0)  # Frequency for harmonic potential
+        if potential_type == "box":
+            # Infinite square well / box potential is zero inside the box
+            V = torch.zeros_like(x)
+        elif potential_type == "harmonic":
+            omega = 1.0  # Frequency for harmonic potential
             V = 0.5 * omega ** 2 * x ** 2
-        elif potential_type == "gaussian":
-            a = kwargs.get('a', 0.0)  # Center of the Gaussian
-            V = torch.exp(-(x - a) ** 2)
-        elif potential_type == "periodic":
-            V0 = kwargs.get('V0', 1.0)  # Depth of the potential
-            k = kwargs.get('k', 2 * np.pi / 5.0)  # Wave number for periodic potential
-            V = V0 * torch.cos(k * x) ** 2
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
         return V
 
-    def pde_loss(self, inputs, predictions, gamma, p, potential_type="harmonic", precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, gamma, p, potential_type="box", precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
         μψ = -1/2 ∇²ψ + Vψ + γ|ψ|²ψ
@@ -151,8 +178,9 @@ class GrossPitaevskiiPINN(nn.Module):
         # Calculate chemical potential
         kinetic = -0.5 * u_xx
         potential = V * u
-        #interaction = gamma * u ** 3
-        interaction = gamma * torch.abs(u) ** (p - 1) * u
+
+        # Always use cubic nonlinearity (p=3) for box problem
+        interaction = gamma * u ** 3
 
         numerator = torch.mean(u * (kinetic + potential + interaction))
         denominator = torch.mean(u ** 2)
@@ -166,7 +194,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return pde_loss, pde_residual, lambda_pde, u
 
-    def riesz_loss(self, inputs, predictions, gamma, potential_type="harmonic", precomputed_potential=None):
+    def riesz_loss(self, inputs, predictions, gamma, potential_type="box", precomputed_potential=None):
         """
         Compute the Riesz energy loss for the Gross-Pitaevskii equation.
         E[ψ] = ∫[|∇ψ|²/2 + V|ψ|² + γ|ψ|⁴/2]dx
@@ -270,8 +298,8 @@ def advanced_initialization(m, mode):
             m.bias.data.fill_(0.01)
 
 
-def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
-                    potential_type='harmonic', lr=1e-3, verbose=True):
+def train_gpe_model(gamma_values, modes, L, p, X_train, layers, epochs,
+                    potential_type='box', lr=1e-3, verbose=True):
     """
     Train the GPE model for different modes and gamma values.
 
@@ -281,18 +309,18 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
         List of interaction strengths to train models for
     modes : list of int
         List of modes to train (0, 1, 2, 3, etc.)
-    X_train : numpy.ndarray
-        Training points array
+    L : float
+        Length of the box
     p : int
         Parameter for nonlinearity power
-    lb, ub : float
-        Lower and upper boundaries of the domain
+    X_train : numpy.ndarray
+        Training points array
     layers : list of int
         Network architecture
     epochs : int
         Number of training epochs
     potential_type : str
-        Type of potential ('harmonic', 'gaussian', etc.)
+        Type of potential ('box', 'harmonic', etc.)
     lr : float
         Learning rate
     verbose : bool
@@ -308,7 +336,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
+    boundary_points = torch.tensor([[0.0], [L]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
     # Track models and chemical potentials
@@ -331,7 +359,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                 print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}")
 
             # Initialize model for this mode and gamma
-            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
+            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L).to(device)
 
             # If this isn't the first gamma value, initialize with previous model's weights
             if prev_model is not None:
@@ -362,7 +390,16 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                 pde_loss, _, lambda_pde, full_u = model.pde_loss(X_tensor, u_pred, gamma, p, potential_type)
                 boundary_loss = model.boundary_loss(boundary_points, boundary_values)
                 norm_loss = model.normalization_loss(full_u, dx)
-                sym_loss = model.symmetry_loss(X_tensor, lb, ub)
+                sym_loss = model.symmetry_loss(X_tensor, 0, L)
+
+                # For γ = 0.0, we know the exact energy should be π²/(2L²)
+                if gamma == 0.0:
+                    # Get the analytical energy value
+                    exact_energy = model.energy_eigenvalue(mode)
+
+                    # Add loss term to push towards the correct energy
+                    energy_error = (lambda_pde - exact_energy) ** 2
+                    pde_loss = pde_loss + 5.0 * energy_error
 
                 # Total loss - balance different components
                 total_loss = pde_loss + 10.0 * boundary_loss + 20.0 * norm_loss + 5.0 * sym_loss
@@ -396,7 +433,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
     return models_by_mode, mu_table
 
 
-def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, save_dir="plots"):
+def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, L, p, save_dir="plots"):
     """
     Plot wavefunction densities for different modes and gamma values.
     """
@@ -433,7 +470,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, save_dir="
                 # Normalization
                 u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                # Plot wavefunction density
+                # Plot wavefunction
                 plt.plot(X_test.flatten(), u_np,
                          linestyle=linestyles[j % len(linestyles)],
                          color=colors[j % len(colors)],
@@ -445,27 +482,26 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, save_dir="
         plt.ylabel(r"$\psi(x)$", fontsize=18)
         plt.grid(True)
         plt.legend()
-        plt.xlim(-10, 10)  # Match paper's range
+        plt.xlim(0, L)  # Set x limits to match domain
+        if mode == 0:
+            plt.ylim(-0.2, 1.6)
+        else:
+            plt.ylim(-1.6, 1.6)  # Set y limits to match Figure 5 in paper
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction.png"), dpi=300)
         plt.close()
 
     # Also create a combined grid figure to show all modes
-    plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, save_dir)
+    plot_combined_grid(models_by_mode, X_test, gamma_values, modes, L, p, save_dir)
 
 
-def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, save_dir="plots"):
+def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, L, p, save_dir="plots"):
     """
     Create a grid of subplots showing all modes.
-
-    Parameters:
-    -----------
-    p : int
-        Nonlinearity power used in the models
     """
     # Determine grid dimensions
     n_modes = len(modes)
-    n_cols = min(4, n_modes)  # Max 4 columns
+    n_cols = min(3, n_modes)  # Max 3 columns (to match paper's format)
     n_rows = (n_modes + n_cols - 1) // n_cols  # Ceiling division
 
     # Create figure with subplots
@@ -507,24 +543,23 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, save_dir=
                 # Proper normalization
                 u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                # For mode 0, ensure all wavefunctions are positive
-                if mode == 0:
-                    # Take absolute value to ensure positive values
-                    u_np = np.abs(u_np)
-
-                # Plot the wavefunction (not density)
+                # Plot the wavefunction
                 ax.plot(X_test.flatten(), u_np,
                         linestyle=linestyles[j % len(linestyles)],
                         color=colors[j % len(colors)],
                         label=f"γ={gamma:.1f}")
 
         # Configure the subplot
-        ax.set_title(f"Mode {mode}", fontsize=12)
-        ax.set_xlabel("x", fontsize=18)
-        ax.set_ylabel(r"$\psi(x)$", fontsize=18)
+        ax.set_title(f"mode {mode}", fontsize=12)
+        ax.set_xlabel("x", fontsize=12)
+        ax.set_ylabel(r"$\psi(x)$", fontsize=12)
         ax.grid(True)
         ax.legend(fontsize=8)
-        ax.set_xlim(-10, 10)
+        ax.set_xlim(0, L)  # Match domain [0,1]
+        if mode == 0:
+            plt.ylim(-0.2, 1.6)
+        else:
+            plt.ylim(-1.6, 1.6)  # Set y limits to match Figure 5 in paper
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
@@ -577,44 +612,49 @@ def plot_mu_vs_gamma(mu_table, modes, p, save_dir="plots"):
 
 if __name__ == "__main__":
     # Setup parameters
-    lb, ub = -10, 10  # Domain boundaries
+    L = 1.0  # Length of the box (0 to L) - Changed from 10.0
     N_f = 4000  # Number of collocation points
-    epochs = 4001  # Increased epochs for better convergence
+    epochs = 2001  # Increased epochs for better convergence
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
 
     # Create uniform grid for training and testing
-    X = np.linspace(lb, ub, N_f).reshape(-1, 1)
-    X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)  # Higher resolution for plotting
+    X = np.linspace(0, L, N_f).reshape(-1, 1)
+    X_test = np.linspace(0, L, 1000).reshape(-1, 1)  # Higher resolution for plotting
 
-    # Gamma values from the paper
+    # Gamma values from the paper (Figure 5)
     gamma_values = [0.0, 10.0, 20.0, 50.0, 100.0, 200.0]
 
-    # Include modes 0 through 7
-    modes = [0, 1, 2, 3, 4, 5, 6, 7]
+    # Include modes 0 through 5 to match Figure 5
+    modes = [0, 1, 2, 3, 4, 5]
 
-    # Nonlinearity powers
-    nonlinearity_powers = [4]
+    # Fixed nonlinearity power p=3 for cubic nonlinearity
+    p = 3
 
-    for p in nonlinearity_powers:
-        # Create a specific directory for this p value
-        p_save_dir = f"plots_p{p}"
-        os.makedirs(p_save_dir, exist_ok=True)
+    # Print expected analytical energies for reference
+    print("Expected analytical energies for γ = 0:")
+    for mode in modes:
+        energy = ((mode + 1) ** 2 * np.pi ** 2) / (2 * L ** 2)  # Adjusted for 0-indexed modes
+        print(f"Mode {mode}: Energy = {energy:.6f}")
 
-        # Train models
-        print(f"Starting training for all modes and gamma values with p={p}...")
-        models_by_mode, mu_table = train_gpe_model(
-            gamma_values, modes, p, X, lb, ub, layers, epochs,
-            potential_type='harmonic', lr=1e-3, verbose=True
-        )
-        print(f"Training completed for p={p}.")
+    # Create a specific directory for box potential
+    save_dir = "plots_box_figure5"
+    os.makedirs(save_dir, exist_ok=True)
 
-        # Plot wavefunctions (not densities) for individual modes
-        print("Generating individual mode plots...")
-        plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, p_save_dir)
+    # Train models
+    print(f"Starting training for all modes and gamma values with p={p}...")
+    models_by_mode, mu_table = train_gpe_model(
+        gamma_values, modes, L, p, X, layers, epochs,
+        potential_type='box',  # Changed from 'harmonic' to 'box'
+        lr=1e-3, verbose=True
+    )
+    print("Training completed.")
 
-        # Plot μ vs γ for all modes
-        print("Generating chemical potential vs. gamma plot...")
-        plot_mu_vs_gamma(mu_table, modes, p, p_save_dir)
+    # Plot wavefunctions for individual modes
+    print("Generating individual mode plots...")
+    plot_wavefunction(models_by_mode, X_test, gamma_values, modes, L, p, save_dir)
 
-        print(f"Completed all calculations for nonlinearity power p={p}")
-        print("-" * 80)
+    # Plot μ vs γ for all modes
+    print("Generating chemical potential vs. gamma plot...")
+    plot_mu_vs_gamma(mu_table, modes, p, save_dir)
+
+    print("Completed all calculations for box potential")
