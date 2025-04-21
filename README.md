@@ -5,10 +5,10 @@ This repository implements a Physics-Informed Neural Network (PINN) to solve bot
 ## Features
 
 - **Physics-Informed Neural Networks (PINNs)**: The neural network is trained not only to minimize boundary condition errors but also to respect the underlying physics of the Helmholtz and Gross–Pitaevskii equation through the PDE loss. The Gross–Pitaevskii PINN class contains three additional loss terms including the Riesz energy loss, normalization loss, and symmetry loss.
-- **Adaptive Optimizers**: The code uses both the Adam and L-BFGS optimizers to effectively minimize the loss and improve convergence. It also contains [Distributed Shampoo optimizer](https://github.com/facebookresearch/optimizers/tree/main) for better performance.
+- **Adaptive Optimizers**: The code uses both the Adam and L-BFGS optimizers to effectively minimize the loss and improve convergence. It also contains the [Distributed Shampoo optimizer](https://github.com/facebookresearch/optimizers/tree/main) for better performance.
 - **Tanh Activation Function**: The model employs the hyperbolic tangent (Tanh) activation function, which maps input values to a range between -1 and 1. This zero-centered output can facilitate faster convergence during training by promoting more balanced gradients.
 - **Custom Loss Functions**: The loss function combines both boundary condition losses and PDE residual losses to drive the network training.
-- **Data Scaling**: Input features are scaled between 0 and 1 to improve convergence and stability during training.
+- **Data Scaling**: Input features are optionally scaled between 0 and 1 to improve convergence and stability during training.
 
 ## Prerequisites
 
@@ -73,7 +73,7 @@ The final test error will be printed and plotted.
 The solver will generate a plot showing:
 
 - **Ground Truth Solution**: The known solution for the Helmholtz equation.
-- **Predicted Solution**: The solution predicted by the neural network.
+- **Predicted Solution**: The  Gross–Pitaevskii or Helmholtz solution predicted by the neural network.
 - **Absolute Error**: The difference between the true solution and the predicted solution.
 
 ## Future Improvements
@@ -81,3 +81,4 @@ The solver will generate a plot showing:
 - Add more flexible handling of boundary conditions.
 - Extend the solver to more complex forms of different PDEs.
 - Explore the use of different activation functions and optimizers for further improvement.
+- Implement alternative optimizers for better performance.
