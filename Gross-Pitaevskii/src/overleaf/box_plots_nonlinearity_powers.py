@@ -614,7 +614,7 @@ if __name__ == "__main__":
     # Setup parameters
     L = 1.0  # Length of the box (0 to L) - Changed from 10.0
     N_f = 4000  # Number of collocation points
-    epochs = 2001  # Increased epochs for better convergence
+    epochs = 4001  # Increased epochs for better convergence
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
 
     # Create uniform grid for training and testing
@@ -622,7 +622,7 @@ if __name__ == "__main__":
     X_test = np.linspace(0, L, 1000).reshape(-1, 1)  # Higher resolution for plotting
 
     # Gamma values from the paper (Figure 5)
-    gamma_values = [0.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+    gamma_values = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
 
     # Include modes 0 through 5 to match Figure 5
     modes = [0, 1, 2, 3, 4, 5]
