@@ -451,7 +451,7 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
     return models_by_mode, mu_table, training_history
 
 
-def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="harmonic_plots"):
+def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="tmp"):
     """
     Plot wavefunctions (not densities) for different modes and gamma values.
     """
@@ -515,7 +515,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="har
     plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir)
 
 
-def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="harmonic_plots"):
+def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="tmp"):
     """
     Create a grid of subplots showing all modes.
     """
@@ -593,7 +593,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="ha
     plt.close(fig)
 
 
-def plot_mu_vs_gamma(mu_table, modes, save_dir="harmonic_plots"):
+def plot_mu_vs_gamma(mu_table, modes, save_dir="tmp"):
     """
     Plot chemical potential vs. interaction strength for different modes.
     """
@@ -640,7 +640,7 @@ def advanced_initialization(m, mode):
             m.bias.data.fill_(0.01)
 
 
-def plot_combined_loss_history(training_history, modes, gamma_values, epochs, save_dir="harmonic_plots"):
+def plot_combined_loss_history(training_history, modes, gamma_values, epochs, save_dir="tmp"):
     """
     Plot the training loss history for all modes on a single log-scale plot.
 
@@ -699,7 +699,7 @@ def plot_combined_loss_history(training_history, modes, gamma_values, epochs, sa
         plt.close()
 
 
-def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, save_dir="harmonic_plots"):
+def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, save_dir="tmp"):
     """
     Plot the training loss history for all modes and all gamma values with each mode in its own subplot.
 
@@ -761,7 +761,7 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, sav
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
         ax.set_xlabel("Epochs", fontsize=12)
-        ax.set_ylabel("Loss (log scale)", fontsize=12)
+        ax.set_ylabel("Loss", fontsize=12)
         ax.grid(True)
         ax.legend(fontsize=6)
 
@@ -776,11 +776,103 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, sav
     plt.close(fig)
 
 
+def plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, save_dir="tmp"):
+    """
+    Creates informative visualizations of the training progress.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1. Separate plots by loss type
+    plt.figure(figsize=(12, 6))
+
+    # Plot for Mode 0 (energy minimization)
+    plt.subplot(1, 2, 1)
+    for gamma in gamma_values:
+        if 0 in training_history and gamma in training_history[0]:
+            # Get loss history for mode 0
+            loss_history = training_history[0][gamma]['loss']
+            epoch_nums = np.linspace(0, epochs, len(loss_history))
+            plt.semilogy(epoch_nums, loss_history, label=f"γ={gamma:.1f}")
+
+    plt.title("Mode 0: Energy Functional Minimization", fontsize=18)
+    plt.xlabel("Epochs", fontsize=18)
+    plt.ylabel("Energy Functional", fontsize=18)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+
+    # Plot for Modes 1+ (PDE residual minimization)
+    plt.subplot(1, 2, 2)
+    for mode in modes:
+        if mode == 0:
+            continue  # Skip mode 0 for this plot
+
+        for gamma in [0.0]:  # Focus on γ=0 for clarity
+            if mode in training_history and gamma in training_history[mode]:
+                loss_history = training_history[mode][gamma]['loss']
+                epoch_nums = np.linspace(0, epochs, len(loss_history))
+                plt.semilogy(epoch_nums, loss_history, label=f"Mode {mode}")
+
+    plt.title(r"Modes 1-5: PDE Residual Minimization", fontsize=18)
+    plt.xlabel("Epochs", fontsize=18)
+    plt.ylabel("PDE Residual", fontsize=18)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "separated_loss_types.png"), dpi=300)
+    plt.close()
+
+    # 2. Plot chemical potential convergence
+    plt.figure(figsize=(10, 6))
+    for mode in modes:
+        for gamma in [0.0]:  # Focus on γ=0 for clarity
+            if mode in training_history and gamma in training_history[mode]:
+                lambda_history = training_history[mode][gamma]['lambda']
+                epoch_nums = np.linspace(0, epochs, len(lambda_history))
+
+                # For γ=0, the theoretical value should be mode + 0.5
+                theoretical_value = mode + 0.5
+
+                # Plot relative error to theoretical value
+                relative_error = [abs(l - theoretical_value) / theoretical_value for l in lambda_history]
+                plt.semilogy(epoch_nums, relative_error, label=f"Mode {mode}")
+
+    plt.title(r"Chemical Potential Convergence", fontsize=18)
+    plt.xlabel("Epochs", fontsize=18)
+    plt.ylabel(r"Relative Error in $\mu$", fontsize=18)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "chemical_potential_convergence.png"), dpi=300)
+    plt.close()
+
+    # 3. Plot normalized loss (as percentage of initial loss)
+    plt.figure(figsize=(10, 6))
+    for mode in modes:
+        for gamma in [0.0]:  # Focus on γ=0 for clarity
+            if mode in training_history and gamma in training_history[mode]:
+                loss_history = training_history[mode][gamma]['loss']
+                initial_loss = loss_history[0]
+                normalized_loss = [l / initial_loss for l in loss_history]
+
+                epoch_nums = np.linspace(0, epochs, len(loss_history))
+                plt.semilogy(epoch_nums, normalized_loss, label=f"Mode {mode}")
+
+    plt.title(r"Normalized Loss Convergence", fontsize=18)
+    plt.xlabel("Epochs", fontsize=18)
+    plt.ylabel("Loss / Initial Loss", fontsize=18)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "normalized_loss.png"), dpi=300)
+    plt.close()
+
+
 if __name__ == "__main__":
     # Setup parameters
     lb, ub = -10, 10  # Domain boundaries
     N_f = 4000  # Number of collocation points
-    epochs = 4001  # Increased epochs for better convergence
+    epochs = 5001  # Increased epochs for better convergence
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
 
     # Create uniform grid for training and testing
@@ -811,5 +903,6 @@ if __name__ == "__main__":
 
     # Plot combined loss history
     print("Generating combined loss plots...")
-    plot_combined_loss_history(training_history, modes, gamma_values, epochs)
+    #plot_combined_loss_history(training_history, modes, gamma_values, epochs)
+    plot_improved_loss_visualization(training_history, modes, gamma_values, epochs)
     plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs)
