@@ -601,10 +601,10 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)  # Higher resolution for plotting
 
     # Gamma values from the paper
-    gamma_values = [0.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+    gamma_values = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
 
     # Include modes 0 through 7
-    modes = [0, 1, 2, 3, 4, 5, 6, 7]
+    modes = [0, 1, 2, 3, 4, 5]
 
     # Train models
     print("Starting training for all modes and gamma values...")

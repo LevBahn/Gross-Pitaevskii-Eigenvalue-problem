@@ -725,7 +725,7 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type="box", save_dir="tmp"):
 if __name__ == "__main__":
     # Setup parameters
     N_f = 4000  # Number of collocation points
-    epochs = 4001  # Increased epochs for better convergence
+    epochs = 6001  # Increased epochs for better convergence
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
 
     # Gamma values from the paper
