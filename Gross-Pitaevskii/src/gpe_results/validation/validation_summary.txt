@@ -1,5 +1,0 @@
-Validation Summary for Gross-Pitaevskii Solutions
-==================================================
-
-Mode 0:
---------------------
