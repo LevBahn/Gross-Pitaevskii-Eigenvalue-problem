@@ -4,7 +4,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import math
 import numpy as np
 import os
-from scipy.special import hermite
+from scipy.special import airy, hermite
 from distributed_shampoo import AdamGraftingConfig, DistributedShampoo
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -38,51 +38,16 @@ plt.rcParams.update(plot_params)
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, dim, omega_0=1.0):
+    def __init__(self, dim):
         super().__init__()
-        self.omega_0 = omega_0
         self.lin1 = nn.Linear(dim, dim)
         self.lin2 = nn.Linear(dim, dim)
 
-        # Initialize with SIREN approach
-        with torch.no_grad():
-            self.lin1.weight.uniform_(-np.sqrt(6 / dim) / self.omega_0,
-                                      np.sqrt(6 / dim) / self.omega_0)
-            self.lin2.weight.uniform_(-np.sqrt(6 / dim) / self.omega_0,
-                                      np.sqrt(6 / dim) / self.omega_0)
-
     def forward(self, x):
         identity = x
-        out = torch.sin(self.omega_0 * self.lin1(x))
+        out = torch.tanh(self.lin1(x))
         out = self.lin2(out)
-        return torch.sin(self.omega_0 * (out + identity))
-
-
-class SineLayer(nn.Module):
-    """
-    Sine activation layer - much better for representing periodic functions
-    Adapted from SIREN paper: https://arxiv.org/abs/2006.09661
-    """
-
-    def __init__(self, in_features, out_features, omega_0=30, is_first=False):
-        super().__init__()
-        self.omega_0 = omega_0
-        self.is_first = is_first
-        self.linear = nn.Linear(in_features, out_features)
-
-        # Special initialization for sine activation
-        with torch.no_grad():
-            if self.is_first:
-                # First layer initialization
-                self.linear.weight.uniform_(-1 / in_features,
-                                            1 / in_features)
-            else:
-                # Hidden layer initialization
-                self.linear.weight.uniform_(-np.sqrt(6 / in_features) / self.omega_0,
-                                            np.sqrt(6 / in_features) / self.omega_0)
-
-    def forward(self, x):
-        return torch.sin(self.omega_0 * self.linear(x))
+        return torch.tanh(out + identity)
 
 
 class GrossPitaevskiiPINN(nn.Module):
@@ -90,7 +55,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, potential_type = "harmonic", gamma=1.0, L=1.0, use_residual=True):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, potential_type = "harmonic", gamma=1.0, L=1.0, g=1.0, use_residual=True):
         """
         Parameters
         ----------
@@ -108,6 +73,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength parameter.
         L : float, optional
             Length of the box (default is 1.0).
+        g : float, optional
+            Gravitational acceleration parameter (default is 1.0).
         """
         super().__init__()
         self.layers = layers
@@ -119,6 +86,7 @@ class GrossPitaevskiiPINN(nn.Module):
         self.potential_type = potential_type # Type of potential
         self.gamma = gamma  # Interaction strength parameter
         self.L = L  # Length of the box
+        self.g = g # Gravitational acceleration parameter
 
         # Now build the network after all attributes are set
         self.network = self.build_network()
@@ -195,6 +163,60 @@ class GrossPitaevskiiPINN(nn.Module):
         weighted_hermite = norm_factor * torch.exp(-x ** 2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
         return weighted_hermite
 
+    def airy_solution(self, x, n):
+        """
+        Create gravitational trap eigenfunctions using Airy functions according to
+        equations (30-31) from the paper: Ψₙ(x) = Aₙ·Ai(x + xₙ)
+        """
+        # Convert to numpy for calculation
+        x_np = x.detach().cpu().numpy()
+
+        # Initialize wavefunction array - all zeros
+        psi = np.zeros_like(x_np)
+
+        # Airy function zeros (negative values where Ai(x) = 0)
+        airy_zeros = [
+            -2.33811, -4.08795, -5.52056, -6.78671, -7.94413,
+            -9.02265, -10.0401, -11.0085, -11.9361, -12.8288
+        ]
+
+        # For the gravitational trap, use the nth zero
+        if n < len(airy_zeros):
+            x_n = airy_zeros[n]
+        else:
+            # Approximation for higher modes
+            x_n = -(1.5 * np.pi * (n + 0.75)) ** (2 / 3)
+
+        # Only calculate for the positive domain (x >= 0)
+        mask_positive = (x_np >= 0)
+
+        if np.any(mask_positive):
+            x_pos = x_np[mask_positive]
+
+            # Calculate Ai(x + xₙ)
+            airy_vals = airy(x_pos + x_n)[0]
+
+            # Handle sign convention
+            if len(airy_vals) > 0:
+                # For even modes, function should be positive near x=0
+                # For odd modes, function should be negative near x=0
+                if n % 2 == 1 and airy_vals[0] > 0:
+                    airy_vals = -airy_vals
+                elif n % 2 == 0 and airy_vals[0] < 0:
+                    airy_vals = -airy_vals
+
+                # Compute normalization constant
+                dx = float(x[1].detach() - x[0].detach()) if len(x) > 1 else 0.01
+                norm_factor = np.sqrt(np.sum(airy_vals ** 2) * dx)
+
+                if norm_factor > 0:
+                    # Apply normalization
+                    psi[mask_positive] = airy_vals / norm_factor
+
+        # Convert back to tensor
+        solution = torch.tensor(psi, dtype=torch.float32).to(device)
+        return solution
+
     def forward(self, inputs):
         """
         Forward pass through the neural network.
@@ -213,6 +235,8 @@ class GrossPitaevskiiPINN(nn.Module):
 
         if potential_type == "harmonic":
             base_solution = self.weighted_hermite(x, mode)
+        elif potential_type == "gravity well":
+            base_solution = self.airy_solution(x, mode)
         else:
             base_solution = self.box_eigenfunction(x, mode)
         return base_solution + perturbation
@@ -230,6 +254,15 @@ class GrossPitaevskiiPINN(nn.Module):
         elif potential_type == "box":
             # Infinite square well / box potential is zero inside the box
             V = torch.zeros_like(x)
+        elif potential_type == "gravity well":
+            V = torch.zeros_like(x)
+            mask_positive = (x >= 0)
+            mask_negative = (x < 0)
+
+            V[mask_positive] = self.m * self.g * x[mask_positive]
+            V[mask_negative] = 1e8  # Large value to approximate infinity
+
+            return V
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
         return V
@@ -347,6 +380,26 @@ class GrossPitaevskiiPINN(nn.Module):
         full_u = self.get_complete_solution(boundary_points, u_pred)
         return torch.mean((full_u - boundary_values) ** 2)
 
+    def boundary_loss_gravity_well(self, x):
+        """
+        Compute boundary loss to enforce:
+        1. ψ(x) = 0 for x < 0 (gravitational trap)
+        2. ψ(x) → 0 as x → ∞
+        """
+        u_pred = self.forward(x)
+        full_u = self.get_complete_solution(x, u_pred)
+
+        # For x < 0, enforce ψ(x) = 0
+        neg_mask = x < 0
+        neg_loss = torch.mean(full_u[neg_mask] ** 2) if torch.any(neg_mask) else torch.tensor(0.0, device=device)
+
+        # For large x, enforce decay
+        far_mask = x > x.max() * 0.8
+        far_loss = torch.mean(full_u[far_mask] ** 2) if torch.any(far_mask) else torch.tensor(0.0, device=device)
+
+        # Make sure the loss is non-zero to provide a learning signal
+        return 10.0 * neg_loss + 5.0 * far_loss + 0.1
+
     def symmetry_loss(self, collocation_points, potential_type=None):
         """
         Compute the symmetry loss to enforce the correct symmetry based on domain and mode.
@@ -417,7 +470,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
     epochs : int
         Number of training epochs
     potential_type : str
-        Type of potential ('harmonic', 'gaussian', etc.)
+        Type of potential ('harmonic', 'gaussian', 'gravity well', etc.)
     lr : float
         Learning rate
     verbose : bool
@@ -433,9 +486,14 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    L = ub
-    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
-    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
+    if potential_type == "gravity well":
+        L = ub
+        boundary_points = torch.tensor([lb, -lb / 2, 0.0, ub / 2, ub], dtype=torch.float32).reshape(-1, 1).to(device)
+
+    else:
+      L = ub
+      boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
+      boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
     # Track models, chemical potentials, and training history
     models_by_mode = {}
@@ -473,18 +531,18 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                 model.apply(lambda m: advanced_initialization(m, mode))
 
             # Adam optimizer
-            #optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-            optimizer = DistributedShampoo(model.parameters(),
-                                           lr=lr,
-                                           betas=(0.9, 0.999),
-                                           epsilon=1e-12,
-                                           weight_decay=1e-05,
-                                           max_preconditioner_dim=8192,
-                                           start_preconditioning_step=100,
-                                           precondition_frequency=100,
-                                           use_decoupled_weight_decay=False,
-                                           grafting_config=AdamGraftingConfig(beta2=0.999, epsilon=1e-08),
-                                           )
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            # optimizer = DistributedShampoo(model.parameters(),
+            #                                lr=lr,
+            #                                betas=(0.9, 0.999),
+            #                                epsilon=1e-12,
+            #                                weight_decay=1e-05,
+            #                                max_preconditioner_dim=8192,
+            #                                start_preconditioning_step=100,
+            #                                precondition_frequency=100,
+            #                                use_decoupled_weight_decay=False,
+            #                                grafting_config=AdamGraftingConfig(beta2=0.999, epsilon=1e-08),
+            #                                )
 
             # Create scheduler to decrease learning rate during training
             scheduler = CosineAnnealingWarmRestarts(
@@ -503,12 +561,18 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                 u_pred = model.forward(X_tensor)
 
                 # Calculate common constraint losses for all modes
-                boundary_loss = model.boundary_loss(boundary_points, boundary_values)
+                if potential_type == "gravity well":
+                    boundary_loss = model.boundary_loss_gravity_well(boundary_points)
+                else:
+                    boundary_loss = model.boundary_loss(boundary_points, boundary_values)
                 norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
                 sym_loss = model.symmetry_loss(X_tensor)
 
                 # Combined constraint loss
-                constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss + 5.0 * sym_loss
+                if potential_type == "gravity well":
+                    constraint_loss = 50.0 * boundary_loss + 20.0 * norm_loss
+                else:
+                    constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss + 5.0 * sym_loss
 
                 # Decide which loss to use based on mode
                 if mode == 0:
@@ -586,6 +650,20 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
     return models_by_mode, mu_table, training_history
 
 
+def advanced_initialization(m, mode):
+    """Initialize network weights with consideration of the mode number"""
+    if isinstance(m, nn.Linear):
+        # Use Xavier initialization but scale based on mode
+        gain = 1.0 / (1.0 + 0.2 * mode)  # Stronger scaling for higher modes
+        nn.init.xavier_normal_(m.weight, gain=gain)  # Normal instead of uniform
+
+        # More careful bias initialization for higher modes
+        if mode > 3:
+            m.bias.data.fill_(0.001)  # Smaller initial bias for higher modes
+        else:
+            m.bias.data.fill_(0.01)
+
+
 def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type = "box", save_dir="box_plots"):
     """
     Plot wavefunctions (not densities) for different modes and gamma values.
@@ -649,6 +727,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, lb, ub, po
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
+        #plt.show()
 
     # Also create a combined grid figure to show all modes
     plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type, save_dir)
@@ -735,6 +814,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, lb, ub, p
     plt.legend(fontsize=8)
     fig.savefig(os.path.join(save_dir, f"all_modes_combined_wavefunctions_p{p}_{potential_type}.png"), dpi=300)
     plt.close(fig)
+    #plt.show()
 
 
 def plot_mu_vs_gamma(mu_table, modes, p, potential_type="box", save_dir="plots"):
@@ -768,97 +848,7 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type="box", save_dir="plots")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f"mu_vs_gamma_all_modes_p{p}_{potential_type}.png"), dpi=300)
     plt.close()
-
-
-def advanced_initialization(m, mode):
-    """Initialize network weights with consideration of the mode number"""
-    if isinstance(m, nn.Linear):
-        # Use Xavier initialization but scale based on mode
-        gain = 1.0 / (1.0 + 0.2 * mode)  # Stronger scaling for higher modes
-        nn.init.xavier_normal_(m.weight, gain=gain)  # Normal instead of uniform
-
-        # More careful bias initialization for higher modes
-        if mode > 3:
-            m.bias.data.fill_(0.001)  # Smaller initial bias for higher modes
-        else:
-            m.bias.data.fill_(0.01)
-
-
-def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs,  p, potential_type, save_dir="box_plots"):
-    """
-    Plot the training loss history for all modes and all gamma values with each mode in its own subplot.
-
-    Parameters:
-    -----------
-    training_history : dict
-        Dictionary containing training history for all modes and gamma values
-    modes : list
-        List of modes to include in the plot
-    gamma_values : list
-        List of gamma values to include in the plot
-    epochs : int
-        Total number of training epochs
-    save_dir : str
-        Directory to save the plots
-    """
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Determine grid dimensions
-    n_modes = len(modes)
-    n_cols = min(4, n_modes)  # Max 4 columns, matching plot_combined_grid
-    n_rows = (n_modes + n_cols - 1) // n_cols  # Ceiling division
-
-    # Create figure with subplots
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
-
-    # Flatten axes if it's a 2D array
-    if n_rows > 1 or n_cols > 1:
-        axes = axes.flatten()
-    else:
-        axes = [axes]  # Make it iterable
-
-    # Different line styles and colors for different gamma values
-    linestyles = ['-', '--', '-.', ':', '-', '--']
-    colors = ['k', 'b', 'r', 'g', 'm', 'c', 'slategray']
-
-    # Plot each mode in its subplot
-    for i, mode in enumerate(modes):
-        if i >= len(axes) or mode not in training_history:
-            continue
-
-        ax = axes[i]
-
-        # Plot loss for each gamma value
-        for j, gamma in enumerate(gamma_values):
-            if gamma in training_history[mode]:
-                # Get loss history for this mode and gamma
-                loss_history = training_history[mode][gamma]['loss']
-
-                # X-axis values (epoch numbers)
-                epoch_nums = np.linspace(0, epochs, len(loss_history))
-
-                # Plot loss on log scale
-                ax.semilogy(epoch_nums, loss_history,
-                            color=colors[j % len(colors)],
-                            linestyle=linestyles[j % len(linestyles)],
-                            label=f"γ={gamma:.1f}")
-
-        # Configure the subplot
-        ax.set_title(f"mode {mode}", fontsize=12)
-        ax.set_xlabel("Epochs", fontsize=12)
-        ax.set_ylabel("Loss", fontsize=12)
-        ax.grid(True)
-        ax.legend(fontsize=6)
-
-    # Hide any unused subplots
-    for i in range(len(modes), len(axes)):
-        axes[i].axis('off')
-
-    # Finalize and save combined figure
-    fig.suptitle("Training Loss for All Modes", fontsize=16)
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(os.path.join(save_dir, f"all_modes_gamma_loss_subplots_p{p}_{potential_type}.png"), dpi=300)
-    plt.close(fig)
+    #plt.show()
 
 
 def moving_average(values, window_size=10):
@@ -1044,62 +1034,145 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
     plt.close()
 
 
-if __name__ == "__main__":
-    # Setup parameters
-    N_f = 4000  # Number of collocation points
-    epochs = 2001  # Increased epochs for better convergence
-    layers = [1, 64, 64, 64, 1]  # Neural network architecture
+def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs,  p, potential_type, save_dir="box_plots"):
+    """
+    Plot the training loss history for all modes and all gamma values with each mode in its own subplot.
 
-    # Gamma values from the paper
-    gamma_values = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0]
+    Parameters:
+    -----------
+    training_history : dict
+        Dictionary containing training history for all modes and gamma values
+    modes : list
+        List of modes to include in the plot
+    gamma_values : list
+        List of gamma values to include in the plot
+    epochs : int
+        Total number of training epochs
+    save_dir : str
+        Directory to save the plots
+    """
+    os.makedirs(save_dir, exist_ok=True)
 
-    # Include modes 0 through 5
-    modes = [0, 1, 2, 3, 4, 5]
+    # Determine grid dimensions
+    n_modes = len(modes)
+    n_cols = min(4, n_modes)  # Max 4 columns, matching plot_combined_grid
+    n_rows = (n_modes + n_cols - 1) // n_cols  # Ceiling division
 
-    # Nonlinearity powers
-    nonlinearity_powers = [3]
+    # Create figure with subplots
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
 
-    for p in nonlinearity_powers:
+    # Flatten axes if it's a 2D array
+    if n_rows > 1 or n_cols > 1:
+        axes = axes.flatten()
+    else:
+        axes = [axes]  # Make it iterable
 
-        #all_potentials = ['box', 'harmonic']
-        all_potentials = ['box']
+    # Different line styles and colors for different gamma values
+    linestyles = ['-', '--', '-.', ':', '-', '--']
+    colors = ['k', 'b', 'r', 'g', 'm', 'c', 'slategray']
 
-        for potential_type in all_potentials:
+    # Plot each mode in its subplot
+    for i, mode in enumerate(modes):
+        if i >= len(axes) or mode not in training_history:
+            continue
 
-            # Adjust lower and upper bound based on potential type
-            if potential_type == 'box':
-                # The length of the box is self.L, which is 1
-                lb, ub = 0, 1
-            else:
-                lb, ub = -10, 10
+        ax = axes[i]
 
-            # Create uniform grid for training and testing
-            X = np.linspace(lb, ub, N_f).reshape(-1, 1)
-            X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
+        # Plot loss for each gamma value
+        for j, gamma in enumerate(gamma_values):
+            if gamma in training_history[mode]:
+                # Get loss history for this mode and gamma
+                loss_history = training_history[mode][gamma]['loss']
 
-            # Create a specific directory for this p value and potential type
-            p_save_dir = f"plots_p{p}_{potential_type}"
-            os.makedirs(p_save_dir, exist_ok=True)
+                # X-axis values (epoch numbers)
+                epoch_nums = np.linspace(0, epochs, len(loss_history))
 
-            # Train models
-            print(f"\nStarting training for {potential_type} potential for all modes and gamma values with p={p}...")
-            models_by_mode, mu_table, training_history = train_gpe_model(
-                gamma_values, modes, p, X, lb, ub, layers, epochs,
-                potential_type, lr=1e-3, verbose=True
-            )
-            print("Training completed!")
+                # Plot loss on log scale
+                ax.semilogy(epoch_nums, loss_history,
+                            color=colors[j % len(colors)],
+                            linestyle=linestyles[j % len(linestyles)],
+                            label=f"γ={gamma:.1f}")
 
-            # Plot wavefunctions for individual modes
-            print("Generating individual mode plots...")
-            plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type, p_save_dir)
+        # Configure the subplot
+        ax.set_title(f"mode {mode}", fontsize=12)
+        ax.set_xlabel("Epochs", fontsize=12)
+        ax.set_ylabel("Loss", fontsize=12)
+        ax.grid(True)
+        ax.legend(fontsize=6)
 
-            # Plot μ vs γ for all modes
-            print("Generating chemical potential vs. gamma plot...")
-            plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
+    # Hide any unused subplots
+    for i in range(len(modes), len(axes)):
+        axes[i].axis('off')
 
-            # Plot loss history
-            print("Generating loss plots...")
-            plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
-            plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
+    # Finalize and save combined figure
+    fig.suptitle("Training Loss for All Modes", fontsize=16)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(os.path.join(save_dir, f"all_modes_gamma_loss_subplots_p{p}_{potential_type}.png"), dpi=300)
+    plt.close(fig)
+    #plt.show()
 
-            print(f"Completed all calculations for {potential_type} potential\n")
+
+# Setup parameters
+N_f = 4000  # Number of collocation points
+epochs = 2001  # Increased epochs for better convergence
+layers = [1, 64, 64, 64, 1]  # Neural network architecture
+
+# Gamma values from the paper
+gamma_values = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0]
+
+# Include modes 0 through 5
+modes = [0, 1, 2, 3, 4, 5]
+
+# Nonlinearity powers
+nonlinearity_powers = [3]
+
+for p in nonlinearity_powers:
+
+  #all_potentials = ['box', 'harmonic', 'gravity well']
+  all_potentials = ['gravity well']
+
+  for potential_type in all_potentials:
+
+      # Adjust lower and upper bound based on potential type
+      if potential_type == 'box':
+          # The length of the box is self.L, which is 1
+          lb, ub = 0, 1
+      elif potential_type == 'gravity well':
+          lb, ub = -5, 35
+      else:
+          lb, ub = -10, 10
+
+      # Create uniform grid for training and testing
+      X = np.linspace(lb, ub, N_f).reshape(-1, 1)
+      X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
+
+      # Create a specific directory for this p value and potential type
+      p_save_dir = f"plots_p{p}_{potential_type}"
+      os.makedirs(p_save_dir, exist_ok=True)
+
+      # Train models
+      print(f"\nStarting training for {potential_type} potential for all modes and gamma values with p={p}...")
+      models_by_mode, mu_table, training_history = train_gpe_model(
+          gamma_values, modes, p, X, lb, ub, layers, epochs,
+          potential_type, lr=1e-3, verbose=True
+      )
+      print("Training completed!")
+
+      # Create a specific directory for the potential
+      p_save_dir = f"plots_p{p}_{potential_type}"
+      os.makedirs(p_save_dir, exist_ok=True)
+
+      # Plot wavefunctions (not densities) for individual modes
+      print("Generating individual mode plots...")
+      plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type, p_save_dir)
+
+      # Plot μ vs γ for all modes
+      print("Generating chemical potential vs. gamma plot...")
+      plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
+
+      # Plot loss history
+      print("Generating loss plots...")
+      plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
+      plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
+
+      print(f"Completed all calculations for {potential_type} potential\n")

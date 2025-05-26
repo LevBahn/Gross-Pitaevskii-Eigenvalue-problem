@@ -693,7 +693,7 @@ if __name__ == "__main__":
     # Setup parameters
     lb, ub = -15, 15  # Extended domain boundaries for better asymptotic behavior
     N_f = 5000  # Increased number of collocation points for better resolution
-    epochs = 101  # More epochs for better convergence
+    epochs = 1001  # More epochs for better convergence
     max_epochs_per_mode = 10000  # Maximum epochs for each mode/gamma combination
     layers = [1, 128, 128, 128, 128, 1]  # Deeper neural network for better expressivity
 
