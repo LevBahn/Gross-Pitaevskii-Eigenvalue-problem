@@ -9,7 +9,7 @@ from scipy.special import hermite
 from adabelief_pytorch import AdaBelief
 from pytorch_optimizer import QHAdam, AdaHessian, Ranger21, SophiaH, Shampoo
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from distributed_shampoo import AdamGraftingConfig, DistributedShampoo, DefaultEigenvalueCorrectedShampooConfig
+#from distributed_shampoo import AdamGraftingConfig, DistributedShampoo, DefaultEigenvalueCorrectedShampooConfig
 import torch.nn.utils
 
 # import matplotlib
@@ -508,17 +508,6 @@ def train_pinn_with_optimizer(X, N_u, N_f, layers, eta, epochs, lb, ub, weights,
     # Select the optimizer
     optimizers = {
         "Adam": optim.Adam(model.parameters(), lr=1e-3),
-        "Shampoo": DistributedShampoo(model.parameters(),
-                                      lr=0.001,
-                                      betas=(0.9, 0.999),
-                                      epsilon=1e-12,
-                                      weight_decay=1e-05,
-                                      max_preconditioner_dim=8192,
-                                      start_preconditioning_step=100,
-                                      precondition_frequency=100,
-                                      use_decoupled_weight_decay=False,
-                                      grafting_config=AdamGraftingConfig(beta2=0.999, epsilon=1e-08),
-                                      ),
         "Shampoo-Eigen": DistributedShampoo(model.parameters(),
                                             lr=0.001,
                                             betas=(0.9, 0.999),

@@ -9,7 +9,7 @@ from scipy.special import hermite
 from adabelief_pytorch import AdaBelief
 from pytorch_optimizer import QHAdam, AdaHessian, Ranger21, SophiaH, Shampoo
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from distributed_shampoo import AdamGraftingConfig, DistributedShampoo
+#from distributed_shampoo import AdamGraftingConfig, DistributedShampoo
 import torch.nn.utils
 
 # import matplotlib
@@ -552,19 +552,7 @@ def train_pinn_with_optimizer(model, X, N_u, N_f, layers, eta, epochs, lb, ub, w
     optimizers = {
         "Adam": optim.Adam(model.parameters(), lr=1e-3),
         # "Adam": optim.Adam(model.parameters(), lr=5e-3),
-        "AdamW": optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.99)),
-        "Shampoo": DistributedShampoo( model.parameters(),
-                                       lr=0.001,
-                                       betas=(0.9, 0.999),
-                                       epsilon=1e-12,
-                                       weight_decay=1e-05,
-                                       max_preconditioner_dim=8192,
-                                       start_preconditioning_step=100,
-                                       precondition_frequency=100,
-                                       use_decoupled_weight_decay=False,
-                                       grafting_config=AdamGraftingConfig(beta2=0.999,epsilon=1e-08),
-                                       )
-
+        "AdamW": optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.99))
     }
 
     optimizer = optimizers[optimizer_name]
@@ -963,7 +951,7 @@ if __name__ == "__main__":
 
     # Test points
     X_test = np.linspace(lb, ub, N_f).reshape(-1, 1)  # Test points for prediction
-    etas = [0, 10, 20, 30, 40]  # Interaction strengths
+    etas = [0, 10]  # Interaction strengths
 
     # Weights for loss terms
     weights = [50.0, 1.0, 2.0, 100.0, 50.0]
