@@ -75,14 +75,33 @@ class GrossPitaevskiiPINN(nn.Module):
                 layers.append(nn.Tanh())
         return nn.Sequential(*layers)
 
-    def weighted_hermite(self, x, n):
-        """
-        Compute the weighted Hermite polynomial solution for the linear case (gamma = 0).
-        """
-        H_n = hermite(n)(x.cpu().detach().numpy())  # Hermite polynomial evaluated at x
-        norm_factor = (2 ** n * math.factorial(n) * np.sqrt(np.pi)) ** (-0.5)
-        weighted_hermite = norm_factor * torch.exp(-x ** 2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
-        return weighted_hermite
+    def weighted_hermite(self, x: torch.Tensor, n: int) -> torch.Tensor:
+        
+        fact_n = float(math.factorial(n))
+        norm_factor = ( (2.0**n) * fact_n * math.sqrt(math.pi) ) ** (-0.5)
+        
+        # Build H_n(x) via recurrence in torch:
+        # If n = 0 --> H_0(x) = 1
+        #    n = 1 --> H_1(x) = 2 x
+        #    n >= 2: H_k = 2 x H_{k-1} - 2(k-1) H_{k-2}
+        if n == 0:
+            Hn = torch.ones_like(x)
+        elif n == 1:
+            Hn = 2.0 * x
+        else:
+            Hnm2 = torch.ones_like(x)        # H_0(x)
+            Hnm1 = 2.0 * x                   # H_1(x)
+            for k in range(1, n):
+                # k runs from 1 to n-1; when k=1: compute H_2 = 2 x H_1 - 2*1*H_0, etc.
+                Hn = 2.0 * x * Hnm1 - 2.0 * float(k) * Hnm2
+                Hnm2, Hnm1 = Hnm1, Hn       # shift: H_{k-1} <- H_k, H_k <- H_{k+1}
+        
+        
+        weight = torch.exp(-0.5 * x**2)
+        
+        # Combine with the normalization factor:
+        return torch.tensor(norm_factor, dtype=x.dtype, device=x.device) * (Hn * weight)
+
 
     def forward(self, inputs):
         """
@@ -110,7 +129,7 @@ class GrossPitaevskiiPINN(nn.Module):
     def pde_loss(self, inputs, predictions, gamma, potential_type="harmonic", precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
-        μψ = -1/2 ∇²ψ + Vψ + γ|ψ|²ψ
+        μψ = - ∇²ψ + Vψ + γ|ψ|²ψ
         """
         # Get the complete solution (base + perturbation)
         u = self.get_complete_solution(inputs, predictions)
@@ -153,7 +172,7 @@ class GrossPitaevskiiPINN(nn.Module):
         # PDE loss (mean squared residual)
         pde_loss = torch.mean(pde_residual ** 2)
 
-        return pde_loss, pde_residual, lambda_pde, u
+        return pde_loss, lambda_pde
 
 
     def boundary_loss(self, boundary_points, boundary_values):
@@ -174,7 +193,8 @@ class GrossPitaevskiiPINN(nn.Module):
 
 
 
-def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
+def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, 
+                    epochs, tol, perturb_const,
                     potential_type='harmonic', lr=1e-3, verbose=True):
     """
     Train the GPE model for different modes and gamma values.
@@ -217,9 +237,12 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
     models_by_mode = {}
     mu_table = {}
     training_history = {}
+    constant_history = {}
 
     # Sort gamma values
     gamma_values = sorted(gamma_values)
+
+    print(f"Tolerance : {tol}, Perturbation constant : {perturb_const}")    
 
     for mode in modes:
         if verbose:
@@ -228,7 +251,9 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
         mu_logs = []
         models_by_gamma = {}
         history_by_gamma = {}
+        
         prev_model = None
+
 
         for gamma in gamma_values:
             if verbose:
@@ -236,18 +261,18 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
 
             # Initialize model for this mode and gamma
             model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
-
             # If this isn't the first gamma value, initialize with previous model's weights
             if prev_model is not None:
                 model.load_state_dict(prev_model.state_dict())
             else:
                 # Use the advanced initialization that considers mode number
                 model.apply(lambda m: advanced_initialization(m, mode))
-
+                
+              
+                
             # Adam optimizer
             optimizer = torch.optim.Adam(model.parameters(), lr=lr)
             
-
             # Create scheduler to decrease learning rate during training
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer, T_0=200, T_mult=2, eta_min=1e-6
@@ -257,12 +282,24 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
             lambda_history = []
             loss_history = []
             constraint_history = []
+            
+            Loss_criteria = 100
 
             for epoch in range(epochs):
                 optimizer.zero_grad()
 
                 # Forward pass
                 u_pred = model.forward(X_tensor)
+                if epoch == 0 and gamma == 0:
+                    normal_const= torch.max(u_pred).detach().clone()
+                    constant_history[mode]=normal_const
+                    u_pred=u_pred/normal_const
+                    u_pred = perturb_const * u_pred
+                else: 
+                    u_pred = perturb_const* u_pred
+                    u_pred = u_pred/normal_const
+
+           
 
                 # Calculate common constraint losses for all modes
                 boundary_loss = model.boundary_loss(boundary_points, boundary_values)
@@ -274,12 +311,10 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
                 # Decide which loss to use based on mode
             
                 # Use PDE residual for other modes
-                pde_loss, _, lambda_value, full_u = model.pde_loss(X_tensor, u_pred, gamma, potential_type)
+                pde_loss, lambda_value= model.pde_loss(X_tensor, u_pred, gamma, potential_type)
                 physics_loss = pde_loss
                 loss_type = "PDE residual"
 
-                # For PDE residual, we do expect the residual to approach zero
-                monitoring_loss = pde_loss.item()
 
                 # Total loss for optimization
                 total_loss = physics_loss + constraint_loss
@@ -290,24 +325,29 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
                 optimizer.step()
                 scheduler.step(total_loss)
 
+                if Loss_criteria > total_loss:
+                    Loss_criteria = total_loss
+                    models_by_gamma[gamma] = model
+
                 # Record history
                 if epoch % 100 == 0:
                     lambda_history.append(lambda_value.item())
                     loss_history.append(total_loss.item())
-                    constraint_history.append(monitoring_loss)
+                    constraint_history.append(constraint_loss)
 
                     if verbose and epoch % 500 == 0:
-                        if mode == 0:
-                            print(f"Epoch {epoch}, {loss_type}: {physics_loss.item():.6f}, "
-                                  f"Constraints: {monitoring_loss:.6f}, μ: {lambda_value.item():.4f}")
-                        else:
-                            print(
-                                f"Epoch {epoch}, {loss_type}: {physics_loss.item():.6f}, μ: {lambda_value.item():.4f}")
+                        print(f"Epoch {epoch}, μ: {lambda_value.item():.4f}")
+
+                        print(f"{"Total Loss"} : {total_loss.item():.6f}, {loss_type}: {physics_loss.item():.6f}, "
+                             f"Constraints: {constraint_loss:.6f}")
+                
+                if total_loss <= tol:
+                    print(f"Early Stop as we have small enough error : {total_loss}")
+                    break
 
             # Record final chemical potential and save model
             final_mu = lambda_history[-1] if lambda_history else 0
             mu_logs.append((gamma, final_mu))
-            models_by_gamma[gamma] = model
 
             # Save the training history
             history_by_gamma[gamma] = {
@@ -315,19 +355,22 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
                 'constraint': constraint_history,
                 'lambda': lambda_history
             }
-
+            
             # Update prev_model for next gamma value
-            prev_model = model
+            prev_model = models_by_gamma[gamma]
 
         # Store results for this mode
         mu_table[mode] = mu_logs
         models_by_mode[mode] = models_by_gamma
         training_history[mode] = history_by_gamma
+        
 
-    return models_by_mode, mu_table, training_history
+    return models_by_mode, mu_table, training_history, constant_history
 
 
-def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="refine"):
+def plot_wavefunction(models_by_mode, X_test, gamma_values,
+                       modes, constant_history, perturb_const,
+                         save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
     Plot wavefunctions (not densities) for different modes and gamma values.
     """
@@ -355,9 +398,11 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="ref
 
             model = models_by_mode[mode][gamma]
             model.eval()
+            const = constant_history[mode]
 
             with torch.no_grad():
                 u_pred = model.forward(X_tensor)
+                u_pred = u_pred*(perturb_const/const)
                 full_u = model.get_complete_solution(X_tensor, u_pred)
                 u_np = full_u.cpu().numpy().flatten()
 
@@ -388,10 +433,13 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, save_dir="ref
         plt.close()
 
     # Also create a combined grid figure to show all modes
-    plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir)
+    plot_combined_grid(models_by_mode, X_test, gamma_values, modes,
+                         constant_history, perturb_const, save_dir)
 
 
-def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="refine"):
+def plot_combined_grid(models_by_mode, X_test, gamma_values, modes,
+                        constant_history,perturb_const,
+                          save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
     Create a grid of subplots showing all modes.
     """
@@ -430,11 +478,15 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="re
 
             model = models_by_mode[mode][gamma]
             model.eval()
+            const=constant_history[mode]
 
             with torch.no_grad():
                 u_pred = model.forward(X_tensor)
+                u_pred = u_pred*(perturb_const / const)
                 full_u = model.get_complete_solution(X_tensor, u_pred)
                 u_np = full_u.cpu().numpy().flatten()
+
+            
 
                 # Proper normalization
                 u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
@@ -469,7 +521,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, save_dir="re
     plt.close(fig)
 
 
-def plot_mu_vs_gamma(mu_table, modes, save_dir="refine"):
+def plot_mu_vs_gamma(mu_table, modes, save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
     Plot chemical potential vs. interaction strength for different modes.
     """
@@ -486,14 +538,14 @@ def plot_mu_vs_gamma(mu_table, modes, save_dir="refine"):
             continue
 
         gamma_list, mu_list = zip(*mu_table[mode])
-        plt.plot(gamma_list, mu_list,
+        plt.plot(mu_list, gamma_list, 
                  marker=markers[i % len(markers)],
                  color=colors[i % len(colors)],
                  linestyle='-',
                  label=f"Mode {mode}")
 
-    plt.xlabel(r"$\gamma$ (Interaction Strength)", fontsize=18)
-    plt.ylabel(r"$\mu$ (Chemical Potential)", fontsize=18)
+    plt.ylabel(r"$\gamma$ (Interaction Strength)", fontsize=18)
+    plt.xlabel(r"$\mu$ (Chemical Potential)", fontsize=18)
     plt.title("Chemical Potential vs. Interaction Strength for All Modes", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
@@ -516,7 +568,7 @@ def advanced_initialization(m, mode):
             m.bias.data.fill_(0.01)
 
 
-def plot_combined_loss_history(training_history, modes, gamma_values, epochs, save_dir="refine"):
+def plot_combined_loss_history(training_history, modes, gamma_values, epochs, save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
     Plot the training loss history for all modes on a single log-scale plot.
 
@@ -575,7 +627,7 @@ def plot_combined_loss_history(training_history, modes, gamma_values, epochs, sa
         plt.close()
 
 
-def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, save_dir="refine"):
+def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
     Plot the training loss history for all modes and all gamma values with each mode in its own subplot.
 
@@ -652,7 +704,7 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, sav
     plt.close(fig)
 
 
-def plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, save_dir="refine"):
+def plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
     Creates informative visualizations of the training progress.
     """
@@ -755,23 +807,23 @@ if __name__ == "__main__":
     X = np.linspace(lb, ub, N_f).reshape(-1, 1)
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)  # Higher resolution for plotting
 
-    # Gamma values from the paper
+    # Ga mma values from the paper
     gamma_values = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]
 
     # Include modes 0 through 5
-    modes = [0]
+    modes = [0, 1, 2, 3, 4, 5]
 
     # Train models
     print("Starting training for all modes and gamma values...")
-    models_by_mode, mu_table, training_history = train_gpe_model(
-        gamma_values, modes, X, lb, ub, layers, epochs,
-        potential_type='harmonic', lr=1e-3, verbose=True
-    )
+    models_by_mode, mu_table, training_history, constant_history = train_gpe_model(
+        gamma_values, modes, X, lb, ub, layers, epochs, tol=0.00001, perturb_const=0.01, 
+        potential_type='harmonic', lr=1e-3, verbose=True )
     print("Training completed!")
+    print(constant_history[0])
 
     # Plot wavefunctions (not densities) for individual modes
     print("Generating individual mode plots...")
-    plot_wavefunction(models_by_mode, X_test, gamma_values, modes)
+    plot_wavefunction(models_by_mode, X_test, gamma_values, modes, constant_history, perturb_const=0.01)
 
     # Plot μ vs γ for all modes
     print("Generating chemical potential vs. gamma plot...")
