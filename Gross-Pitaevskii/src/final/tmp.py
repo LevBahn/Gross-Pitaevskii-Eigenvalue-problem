@@ -37,191 +37,80 @@ plot_params = {
 plt.rcParams.update(plot_params)
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.lin1 = nn.Linear(dim, dim)
-        self.lin2 = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        identity = x
-        out = torch.tanh(self.lin1(x))
-        out = self.lin2(out)
-        return torch.tanh(out + identity)
-
-
 class GrossPitaevskiiPINN(nn.Module):
     """
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
+    Fixed to match Algorithm 2 from the paper.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, potential_type = "harmonic", gamma=1.0, L=1.0, use_residual=True):
-        """
-        Parameters
-        ----------
-        layers : list of int
-            Neural network architecture, each entry defines the number of neurons in that layer.
-        hbar : float, optional
-            Reduced Planck's constant (default is 1.0).
-        m : float, optional
-            Mass of the particle (default is 1.0).
-        mode : int, optional
-            Mode number (default is 0).
-        potential_type: str, optional
-            Type of potential (default is harmonic)
-        gamma : float, optional
-            Interaction strength parameter.
-        L : float, optional
-            Length of the box (default is 1.0).
-        """
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0):
         super().__init__()
         self.layers = layers
-        self.use_residual = use_residual
         self.network = self.build_network()
-        self.hbar = hbar  # Planck's constant, fixed
-        self.m = m  # Particle mass, fixed
-        self.mode = mode  # Mode number (n)
-        self.potential_type = potential_type # Type of potential
-        self.gamma = gamma  # Interaction strength parameter
-        self.L = L  # Length of the box
-
-        # Now build the network after all attributes are set
-        self.network = self.build_network()
+        self.hbar = hbar
+        self.m = m
+        self.mode = mode
+        self.gamma = gamma
 
     def build_network(self):
-        """
-        Build the neural network with tanh activation functions and residual connections.
-        """
-        if not self.use_residual:
-            # Original architecture without residual blocks
-            layers = []
-            for i in range(len(self.layers) - 1):
-                layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
-                if i < len(self.layers) - 2:
-                    layers.append(nn.Tanh())
-            return nn.Sequential(*layers)
-        else:
-            # New architecture with residual blocks
-            modules = []
-
-            # Input layer
-            input_dim = self.layers[0]
-            hidden_dim = self.layers[1]
-            modules.append(nn.Linear(input_dim, hidden_dim))
-            modules.append(nn.Tanh())
-
-            # Residual blocks in the middle layers
-            num_res_blocks = len(self.layers) - 3  # Subtract input, first hidden, and output
-            for _ in range(num_res_blocks):
-                modules.append(ResidualBlock(hidden_dim))
-
-            # Output layer
-            modules.append(nn.Linear(hidden_dim, self.layers[-1]))
-
-            return nn.Sequential(*modules)
-
-    def box_eigenfunction(self, x, n):
-        """
-        Compute the analytic eigenfunction for a particle in a box.
-
-        For the linear case (gamma = 0), the solution is:
-        phi_n(x) = sqrt(2/L) * sin(n*pi*x/L)
-
-        This corresponds to equation (22) in the paper.
-        """
-        # For mode 0, n=1 in the sine function per equation (22)
-        n_actual = n + 1  # Convert mode number to quantum number (n=0 → first excited state with n_actual=1)
-
-        # Normalization factor
-        norm_factor = torch.sqrt(torch.tensor(2.0 / self.L))
-
-        # Sine function with proper scaling
-        phi_n = norm_factor * torch.sin(n_actual * torch.pi * x / self.L)
-
-        return phi_n
-
-    def energy_eigenvalue(self, n):
-        """
-        Compute the energy eigenvalue for mode n in a box potential.
-
-        E_n = (n²π²ħ²)/(2mL²)
-
-        With ħ=1 and m=1, this simplifies to:
-        E_n = (n²π²)/(2L²)
-        """
-        return (n ** 2 * np.pi ** 2) / (2 * self.L ** 2)
+        """Build the neural network with tanh activation functions."""
+        layers = []
+        for i in range(len(self.layers) - 1):
+            layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
+            if i < len(self.layers) - 2:
+                layers.append(nn.Tanh())
+        return nn.Sequential(*layers)
 
     def weighted_hermite(self, x, n):
-        """
-        Compute the weighted Hermite polynomial solution for the linear case (gamma = 0).
-        """
-        H_n = hermite(n)(x.cpu().detach().numpy())  # Hermite polynomial evaluated at x
+        """Compute the weighted Hermite polynomial solution for the linear case (gamma = 0)."""
+        x_np = x.cpu().detach().numpy()
+        H_n = hermite(n)(x_np)
         norm_factor = (2 ** n * math.factorial(n) * np.sqrt(np.pi)) ** (-0.5)
         weighted_hermite = norm_factor * torch.exp(-x ** 2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
         return weighted_hermite
 
     def forward(self, inputs):
-        """
-        Forward pass through the neural network.
-        """
         return self.network(inputs)
 
-    def get_complete_solution(self, x, perturbation, mode=None, potential_type=None):
-        """
-        Get the complete solution by combining the base Hermite solution with the neural network perturbation.
-        """
+    def get_complete_solution(self, x, perturbation, mode=None):
+        """Get the complete solution by combining the base Hermite solution with the neural network perturbation."""
         if mode is None:
             mode = self.mode
-
-        if potential_type is None:
-            potential_type = self.potential_type
-
-        if potential_type == "harmonic":
-            base_solution = self.weighted_hermite(x, mode)
-        else:
-            base_solution = self.box_eigenfunction(x, mode)
+        base_solution = self.weighted_hermite(x, mode)
         return base_solution + perturbation
 
     def compute_potential(self, x, potential_type="harmonic", **kwargs):
-        """
-        Compute potential function for the 1D domain.
-        """
+        """Compute potential function for the 1D domain."""
         if potential_type == "harmonic":
-            omega = kwargs.get('omega', 1.0)  # Frequency for harmonic potential
+            omega = kwargs.get('omega', 1.0)
             V = 0.5 * omega ** 2 * x ** 2
         elif potential_type == "gaussian":
-            a = kwargs.get('a', 0.0)  # Center of the Gaussian
+            a = kwargs.get('a', 0.0)
             V = torch.exp(-(x - a) ** 2)
-        elif potential_type == "box":
-            # Infinite square well / box potential is zero inside the box
-            V = torch.zeros_like(x)
+        elif potential_type == "periodic":
+            V0 = kwargs.get('V0', 1.0)
+            k = kwargs.get('k', 2 * np.pi / 5.0)
+            V = V0 * torch.cos(k * x) ** 2
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
         return V
 
-    def pde_loss(self, inputs, predictions, gamma, p, potential_type="harmonic", precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, gamma, potential_type="harmonic", precomputed_potential=None):
         """
-        Compute the PDE loss for the Gross-Pitaevskii equation.
-        μψ = -1/2 ∇²ψ + Vψ + γ|ψ|²ψ
+        Compute the PDE loss for the Gross-Pitaevskii equation with CORRECT nonlinearity.
+        μψ = -1/2 ∇²ψ + Vψ + γ|ψ|²ψ  (NOT γ|ψ|^p)
         """
-        # Get the complete solution (base + perturbation)
         u = self.get_complete_solution(inputs, predictions)
 
-        # Compute derivatives with respect to x
+        # Compute derivatives
         u_x = torch.autograd.grad(
-            outputs=u,
-            inputs=inputs,
-            grad_outputs=torch.ones_like(u),
-            create_graph=True,
-            retain_graph=True
+            outputs=u, inputs=inputs, grad_outputs=torch.ones_like(u),
+            create_graph=True, retain_graph=True
         )[0]
 
         u_xx = torch.autograd.grad(
-            outputs=u_x,
-            inputs=inputs,
-            grad_outputs=torch.ones_like(u_x),
-            create_graph=True,
-            retain_graph=True
+            outputs=u_x, inputs=inputs, grad_outputs=torch.ones_like(u_x),
+            create_graph=True, retain_graph=True
         )[0]
 
         # Compute potential
@@ -230,187 +119,163 @@ class GrossPitaevskiiPINN(nn.Module):
         else:
             V = self.compute_potential(inputs, potential_type)
 
-        # Calculate chemical potential
+        # CORRECTED: Use standard GPE nonlinearity γ|ψ|²ψ
         kinetic = -0.5 * u_xx
         potential = V * u
-        #interaction = gamma * u ** 3
-        #interaction = gamma * torch.abs(u) ** (p - 1) * u
-        interaction = gamma * u ** p
+        interaction = gamma * (u.abs() ** 2) * u  # This is |ψ|²ψ
 
+        # Calculate chemical potential using variational principle
         numerator = torch.mean(u * (kinetic + potential + interaction))
         denominator = torch.mean(u ** 2)
         lambda_pde = numerator / denominator
 
-        # Residual of the 1D Gross-Pitaevskii equation
+        # PDE residual
         pde_residual = kinetic + potential + interaction - lambda_pde * u
-
-        # PDE loss (mean squared residual)
         pde_loss = torch.mean(pde_residual ** 2)
 
-        if potential_type == "harmonic":
-            lambda_pde = lambda_pde + self.mode
+        # Add the base energy for the mode
+        lambda_pde = lambda_pde + self.mode + 0.5
 
         return pde_loss, pde_residual, lambda_pde, u
 
-    def riesz_loss(self, inputs, predictions, gamma, p, potential_type="harmonic", precomputed_potential=None):
+    def riesz_loss(self, inputs, predictions, gamma, potential_type="harmonic", precomputed_potential=None):
         """
-        Compute the Riesz energy loss for the Gross-Pitaevskii equation.
-        E[ψ] = ∫[|∇ψ|²/2 + V|ψ|² + γ|ψ|⁴/2]dx
-
-        This corresponds to Algorithm 2 in the paper at https://arxiv.org/pdf/1208.2123
+        Compute the CORRECT Riesz energy loss for the Gross-Pitaevskii equation.
+        E[ψ] = ∫[|∇ψ|²/2 + V|ψ|² + γ|ψ|⁴/2]dx  (NOT generalized p-power)
         """
-        # Get the complete solution (base + perturbation)
         u = self.get_complete_solution(inputs, predictions)
 
-        # Ensure inputs require gradients for autograd
         if not inputs.requires_grad:
             inputs = inputs.clone().detach().requires_grad_(True)
 
-        # Compute derivative with respect to x
         u_x = torch.autograd.grad(
-            outputs=u,
-            inputs=inputs,
-            grad_outputs=torch.ones_like(u),
-            create_graph=True,
-            retain_graph=True
+            outputs=u, inputs=inputs, grad_outputs=torch.ones_like(u),
+            create_graph=True, retain_graph=True
         )[0]
 
-        # Calculate normalization factor for proper numerical integration
-        dx = inputs[1] - inputs[0]  # Grid spacing
+        # Calculate normalization factor
+        dx = inputs[1] - inputs[0]
         norm_factor = torch.sum(u ** 2) * dx
 
-        # Compute each term in the energy functional with proper normalization
-
-        # Kinetic energy term: |∇ψ|²/2 with proper normalization
+        # CORRECTED: Use standard GPE energy functional
         kinetic_term = 0.5 * torch.sum(u_x ** 2) * dx / norm_factor
 
-        # Potential term: V|ψ|² with proper normalization
         if precomputed_potential is not None:
             V = precomputed_potential
         else:
             V = self.compute_potential(inputs, potential_type)
         potential_term = torch.sum(V * u ** 2) * dx / norm_factor
 
-        # Interaction term: γ|ψ|⁴/2 with proper normalization
-        #interaction_term = 0.5 * gamma * torch.sum(u ** 4) * dx / norm_factor
-        interaction_term = (2.0 * gamma / (p + 1)) * torch.sum(u ** (p + 1)) * dx / norm_factor
+        # CORRECTED: Use γ|ψ|⁴/2 (standard GPE)
+        interaction_term = 0.5 * gamma * torch.sum(u ** 4) * dx / norm_factor
 
-        # Total Riesz energy functional
         riesz_energy = kinetic_term + potential_term + interaction_term
 
-        # Calculate chemical potential using variational approach
-        # For the harmonic oscillator ground state (mode 0), μ should be 0.5 when γ = 0
-        lambda_riesz = riesz_energy + self.mode
+        # Chemical potential includes base energy
+        lambda_riesz = riesz_energy + self.mode + 0.5
 
         return riesz_energy, lambda_riesz, u
 
     def boundary_loss(self, boundary_points, boundary_values):
-        """
-        Compute the boundary loss for the boundary conditions.
-        """
+        """Compute the boundary loss for the boundary conditions."""
         u_pred = self.forward(boundary_points)
         full_u = self.get_complete_solution(boundary_points, u_pred)
         return torch.mean((full_u - boundary_values) ** 2)
 
-    def symmetry_loss(self, collocation_points, potential_type=None):
-        """
-        Compute the symmetry loss to enforce the correct symmetry based on domain and mode.
+    def symmetry_loss(self, collocation_points, lb, ub):
+        """Compute the symmetry loss to enforce proper parity."""
+        x_reflected = -collocation_points
 
-        For box potential [0, L]:
-        - Even modes: ψ(x) = ψ(L-x)  (symmetric around L/2)
-        - Odd modes: ψ(x) = -ψ(L-x)  (antisymmetric around L/2)
-
-        For harmonic potential [-∞, ∞]:
-        - Even modes: ψ(x) = ψ(-x)   (symmetric around 0)
-        - Odd modes: ψ(x) = -ψ(-x)   (antisymmetric around 0)
-        """
-
-        if potential_type is None:
-            potential_type = self.potential_type
-
-        if potential_type == "box":
-            # For box potential, reflection is around L/2
-            L = self.L
-            midpoint = L / 2
-            x_reflected = L - collocation_points  # Reflect around L/2
-        else:
-            # For harmonic potential, reflection is around 0
-            x_reflected = -collocation_points  # Reflect around 0
-
-        # Evaluate original and reflected points for the FULL solution
         u_pred_original = self.forward(collocation_points)
-        u_full_original = self.get_complete_solution(collocation_points, u_pred_original, potential_type=potential_type)
+        u_full_original = self.get_complete_solution(collocation_points, u_pred_original)
 
         u_pred_reflected = self.forward(x_reflected)
-        u_full_reflected = self.get_complete_solution(x_reflected, u_pred_reflected, potential_type=potential_type)
+        u_full_reflected = self.get_complete_solution(x_reflected, u_pred_reflected)
 
-        # For odd modes, apply anti-symmetry condition
+        # Apply correct symmetry condition based on mode parity
         if self.mode % 2 == 1:
+            # Odd modes: u(x) = -u(-x)
             sym_loss = torch.mean((u_full_original + u_full_reflected) ** 2)
         else:
+            # Even modes: u(x) = u(-x)
             sym_loss = torch.mean((u_full_original - u_full_reflected) ** 2)
 
         return sym_loss
 
     def normalization_loss(self, u, dx):
-        """
-        Compute normalization loss using proper numerical integration.
-        """
+        """Compute normalization loss using proper numerical integration."""
         integral = torch.sum(u ** 2) * dx
         return (integral - 1.0) ** 2
 
+    def orthogonality_loss(self, u, dx, mode):
+        """
+        Enforce orthogonality with lower modes (especially important for higher modes).
+        """
+        if mode == 0:
+            return torch.tensor(0.0, device=device)
 
-def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
-                    potential_type='harmonic', lr=1e-3, verbose=True):
+        ortho_loss = torch.tensor(0.0, device=device)
+
+        # Check orthogonality with lower modes
+        for lower_mode in range(mode):
+            lower_hermite = self.weighted_hermite(
+                torch.linspace(-10, 10, len(u), device=device).reshape(-1, 1),
+                lower_mode
+            )
+            # Normalize lower_hermite
+            lower_norm = torch.sqrt(torch.sum(lower_hermite ** 2) * dx)
+            lower_hermite = lower_hermite / lower_norm
+
+            # Compute overlap
+            overlap = torch.sum(u * lower_hermite) * dx
+            ortho_loss += overlap ** 2
+
+        return ortho_loss
+
+
+def advanced_initialization(m, mode):
+    """Enhanced initialization considering mode number and network depth."""
+    if isinstance(m, nn.Linear):
+        # Use He initialization with mode-dependent scaling
+        fan_in = m.weight.size(1)
+        std = math.sqrt(2.0 / fan_in)
+
+        # Scale initialization based on mode
+        if mode == 0:
+            scale = 1.0
+        elif mode <= 2:
+            scale = 0.5
+        else:
+            scale = 0.1 / (1 + 0.1 * mode)  # Smaller for higher modes
+
+        m.weight.data.normal_(0, std * scale)
+
+        # Bias initialization
+        if mode > 2:
+            m.bias.data.fill_(0.001)
+        else:
+            m.bias.data.fill_(0.01)
+
+
+def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, epochs,
+                    potential_type='harmonic', lr=1e-3, verbose=True,
+                    min_epochs=3000, patience=500, min_delta=1e-6):
     """
-    Train the GPE model for different modes and gamma values.
-
-    Parameters:
-    -----------
-    gamma_values : list of float
-        List of interaction strengths to train models for
-    modes : list of int
-        List of modes to train (0, 1, 2, 3, etc.)
-    p : int
-        Parameter for nonlinearity power
-    X_train : numpy.ndarray
-        Training points array
-    lb, ub : float
-        Lower and upper boundaries of the domain
-    layers : list of int
-        Network architecture
-    epochs : int
-        Number of training epochs
-    potential_type : str
-        Type of potential ('harmonic', 'gaussian', etc.)
-    lr : float
-        Learning rate
-    verbose : bool
-        Whether to print training progress
-
-    Returns:
-    --------
-    tuple: (models_by_mode, mu_table, training_history)
-        Trained models organized by mode and gamma, chemical potential values, and training histories
+    Enhanced training function with improved loss weighting and convergence strategies.
     """
-    # Convert training data to tensors
-    dx = X_train[1, 0] - X_train[0, 0]  # Assuming uniform grid
+    dx = X_train[1, 0] - X_train[0, 0]
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
-    # Create boundary conditions
-    L = ub
     boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
-    # Track models, chemical potentials, and training history
     models_by_mode = {}
     mu_table = {}
     training_history = {}
 
-    # Sort gamma values
     gamma_values = sorted(gamma_values)
 
-    # Precompute potential for the entire grid
+    # Precompute potential
     temp_model = GrossPitaevskiiPINN(layers).to(device)
     precomputed_potential = temp_model.compute_potential(X_tensor, potential_type).detach()
 
@@ -425,92 +290,86 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
 
         for gamma in gamma_values:
             if verbose:
-                print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}, potential = {potential_type}")
+                print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, potential = {potential_type}")
 
-            # Initialize model for this mode and gamma
-            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L, potential_type=potential_type).to(device)
+            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
 
-            # If this isn't the first gamma value, initialize with previous model's weights
+            # Initialize with previous model if available
             if prev_model is not None:
                 model.load_state_dict(prev_model.state_dict())
             else:
-                # Use the advanced initialization that considers mode number
                 model.apply(lambda m: advanced_initialization(m, mode))
 
-            # Adam optimizer
-            #optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-            optimizer = DistributedShampoo(model.parameters(),
-                                           lr=lr,
-                                           betas=(0.9, 0.999),
-                                           epsilon=1e-12,
-                                           weight_decay=1e-05,
-                                           max_preconditioner_dim=8192,
-                                           start_preconditioning_step=100,
-                                           precondition_frequency=100,
-                                           use_decoupled_weight_decay=False,
-                                           grafting_config=AdamGraftingConfig(beta2=0.999, epsilon=1e-08),
-                                           )
+            # Use different optimizers for different modes
+            if mode <= 1:
+                optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            else:
+                # Lower learning rate for higher modes
+                optimizer = torch.optim.Adam(model.parameters(), lr=lr * 0.5)
 
-            # Create scheduler to decrease learning rate during training
             scheduler = CosineAnnealingWarmRestarts(
-                optimizer, T_0=200, T_mult=2, eta_min=1e-6
+                optimizer, T_0=200, T_mult=2, eta_min=1e-7
             )
 
-            # Track learning history
             lambda_history = []
             loss_history = []
             constraint_history = []
 
+            best_loss = float('inf')
+            epochs_without_improvement = 0
+            best_model_state = None
+
             for epoch in range(epochs):
                 optimizer.zero_grad()
 
-                # Forward pass
                 u_pred = model.forward(X_tensor)
 
-                # Calculate common constraint losses for all modes
-                boundary_loss = model.boundary_loss(boundary_points, boundary_values)
-                norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
-                sym_loss = model.symmetry_loss(X_tensor)
-
-                # Combined constraint loss
-                constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss + 5.0 * sym_loss
-
-                # Decide which loss to use based on mode
+                # Enhanced loss weighting based on mode
                 if mode == 0:
-                    # Use Riesz energy functional for mode 0 as specified in the paper (Algorithm 2)
-                    riesz_energy, lambda_value, full_u = model.riesz_loss(
-                        X_tensor, u_pred, gamma, p, potential_type, precomputed_potential
+                    boundary_weight = 10.0
+                    norm_weight = 20.0
+                    sym_weight = 5.0
+                    ortho_weight = 0.0
+                else:
+                    # Higher weights for constraints in higher modes
+                    boundary_weight = 20.0 * (1 + 0.5 * mode)
+                    norm_weight = 30.0 * (1 + 0.3 * mode)
+                    sym_weight = 10.0 * (1 + 0.2 * mode)
+                    ortho_weight = 50.0  # Strong orthogonality enforcement
+
+                boundary_loss = model.boundary_loss(boundary_points, boundary_values)
+                full_u = model.get_complete_solution(X_tensor, u_pred)
+                norm_loss = model.normalization_loss(full_u, dx)
+                sym_loss = model.symmetry_loss(X_tensor, lb, ub)
+                ortho_loss = model.orthogonality_loss(full_u, dx, mode)
+
+                constraint_loss = (boundary_weight * boundary_loss +
+                                   norm_weight * norm_loss +
+                                   sym_weight * sym_loss +
+                                   ortho_weight * ortho_loss)
+
+                # Choose loss type based on mode
+                if mode == 0:
+                    riesz_energy, lambda_value, _ = model.riesz_loss(
+                        X_tensor, u_pred, gamma, potential_type, precomputed_potential
                     )
-
-                    pde_loss, _, _, _ = model.pde_loss(
-                        X_tensor, u_pred, gamma, p, potential_type, precomputed_potential
-                    )
-
-                    # For mode 0, we want to minimize the energy while satisfying constraints
-                    # Note: We don't expect the energy to go to zero, it should converge to the ground state energy
-                    physics_loss = pde_loss + riesz_energy
-                    #physics_loss = pde_loss
-                    loss_type = "Riesz energy"
-
-                    # Track the constraints separately for monitoring
+                    physics_loss = riesz_energy
                     monitoring_loss = constraint_loss.item()
                 else:
-                    # Use PDE residual for other modes
-                    pde_loss, _, lambda_value, full_u = model.pde_loss(
-                        X_tensor, u_pred, gamma, p, potential_type, precomputed_potential
+                    pde_loss, _, lambda_value, _ = model.pde_loss(
+                        X_tensor, u_pred, gamma, potential_type, precomputed_potential
                     )
                     physics_loss = pde_loss
-                    loss_type = "PDE residual"
-
-                    # For PDE residual, we do expect the residual to approach zero
                     monitoring_loss = pde_loss.item()
 
-                # Total loss for optimization
                 total_loss = physics_loss + constraint_loss
 
-                # Backpropagate
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
+
+                # Gradient clipping (more aggressive for higher modes)
+                clip_value = 1.0 if mode <= 2 else 0.5
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+
                 optimizer.step()
                 scheduler.step(total_loss)
 
@@ -521,37 +380,54 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                     constraint_history.append(monitoring_loss)
 
                     if verbose and epoch % 500 == 0:
-                        if mode == 0:
-                            print(f"Epoch {epoch}, {loss_type}: {physics_loss.item():.6f}, "
-                                  f"Constraints: {monitoring_loss:.6f}, μ: {lambda_value.item():.4f}")
-                        else:
-                            print(
-                                f"Epoch {epoch}, {loss_type}: {physics_loss.item():.6f}, μ: {lambda_value.item():.4f}")
+                        print(f"Epoch {epoch}, Physics Loss: {physics_loss.item():.6f}, "
+                              f"Constraint: {constraint_loss.item():.6f}, μ: {lambda_value.item():.4f}")
 
-            # Record final chemical potential and save model
+                # Early stopping logic
+                if epoch >= min_epochs:
+                    current_loss = total_loss.item()
+                    if current_loss < best_loss - min_delta:
+                        best_loss = current_loss
+                        epochs_without_improvement = 0
+                        best_model_state = model.state_dict().copy()
+                    else:
+                        epochs_without_improvement += 1
+
+                    if epochs_without_improvement >= patience:
+                        if verbose:
+                            print(f"    Early stopping at epoch {epoch}")
+                        break
+                else:
+                    current_loss = total_loss.item()
+                    if current_loss < best_loss:
+                        best_loss = current_loss
+                        best_model_state = model.state_dict().copy()
+
+            # Load best model state
+            if best_model_state is not None:
+                model.load_state_dict(best_model_state)
+
             final_mu = lambda_history[-1] if lambda_history else 0
             mu_logs.append((gamma, final_mu))
             models_by_gamma[gamma] = model
 
-            # Save the training history
             history_by_gamma[gamma] = {
                 'loss': loss_history,
                 'constraint': constraint_history,
-                'lambda': lambda_history
+                'lambda': lambda_history,
+                'final_epoch': epoch + 1,
+                'best_loss': best_loss
             }
 
-            # Update prev_model for next gamma value
             prev_model = model
 
-        # Store results for this mode
         mu_table[mode] = mu_logs
         models_by_mode[mode] = models_by_gamma
         training_history[mode] = history_by_gamma
 
     return models_by_mode, mu_table, training_history
 
-
-def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type = "box", save_dir="box_plots"):
+def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type = "box", save_dir="harmonic_plots"):
     """
     Plot wavefunctions (not densities) for different modes and gamma values.
     """
@@ -607,10 +483,6 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, lb, ub, po
         plt.grid(True)
         plt.legend(fontsize=12)
         plt.xlim(lb, ub)  # Set x limits to match domain
-        if potential_type == "box" and mode == 0:
-            plt.ylim(-0.2, 1.6)
-        elif potential_type == "box":
-            plt.ylim(-1.6, 1.6)  # Set y limits to match Figure 5 in paper
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
@@ -619,7 +491,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, lb, ub, po
     plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type, save_dir)
 
 
-def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type="box", save_dir="box_plots"):
+def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, lb, ub, potential_type="box", save_dir="harmonic_plots"):
     """
     Create a grid of subplots showing all modes.
     """
@@ -685,10 +557,6 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, lb, ub, p
         ax.grid(True)
         ax.legend(fontsize=8)
         ax.set_xlim(lb, ub)
-        if potential_type == "box" and mode == 0:
-            plt.ylim(-0.2, 1.6)
-        elif potential_type == "box":
-            plt.ylim(-1.6, 1.6)  # Set y limits to match Figure 5 in paper
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
@@ -702,7 +570,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p, lb, ub, p
     plt.close(fig)
 
 
-def plot_mu_vs_gamma(mu_table, modes, p, potential_type="box", save_dir="plots"):
+def plot_mu_vs_gamma(mu_table, modes, p, potential_type="box", save_dir="harmonic_plots"):
     """
     Plot chemical potential vs. interaction strength for different modes.
     """
@@ -999,9 +867,9 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
                         trend_y = np.exp(np.array([start_loss, end_loss]))
                         plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)
 
-    plt.title("Ultra-Smooth Training Progress - All Modes", fontsize=20)
+    plt.title("Training Progress for All Modes", fontsize=20)
     plt.xlabel("Epochs", fontsize=18)
-    plt.ylabel("Loss (Log Scale)", fontsize=18)
+    plt.ylabel("Loss", fontsize=18)
     plt.grid(True, which="both", linestyle="--", alpha=0.6)
     plt.legend(fontsize=12)
     plt.tight_layout()
@@ -1011,9 +879,13 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
 
 if __name__ == "__main__":
     # Setup parameters
-    N_f = 4000  # Number of collocation points
-    epochs = 1001  # Increased epochs for better convergence
-    layers = [1, 64, 64, 64, 1]  # Neural network architecture
+    lb, ub = -10, 10
+    N_f = 4000
+    epochs = 6000
+    layers = [1, 64, 64, 64, 64, 1]  # Deeper network for higher modes
+    # Create uniform grid for training and testing
+    X = np.linspace(lb, ub, N_f).reshape(-1, 1)
+    X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)  # Higher resolution for plotting
 
     # Gamma values from the paper
     gamma_values = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0]
@@ -1022,35 +894,24 @@ if __name__ == "__main__":
     modes = [0, 1, 2, 3, 4, 5]
 
     # Nonlinearity powers
-    nonlinearity_powers = [2]
+    nonlinearity_powers = [3]
 
     for p in nonlinearity_powers:
 
-        #all_potentials = ['box', 'harmonic']
-        all_potentials = ['box']
+        # all_potentials = ['box', 'harmonic']
+        all_potentials = ['harmonic']
 
         for potential_type in all_potentials:
 
-            # Adjust lower and upper bound based on potential type
-            if potential_type == 'box':
-                # The length of the box is self.L, which is 1
-                lb, ub = 0, 1
-            else:
-                lb, ub = -10, 10
-
-            # Create uniform grid for training and testing
-            X = np.linspace(lb, ub, N_f).reshape(-1, 1)
-            X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
-
             # Create a specific directory for this p value and potential type
-            p_save_dir = f"plots_p{p}_{potential_type}"
+            p_save_dir = f"plots_p{p}_{potential_type}_tmp"
             os.makedirs(p_save_dir, exist_ok=True)
 
             # Train models
             print(f"\nStarting training for {potential_type} potential for all modes and gamma values with p={p}...")
             models_by_mode, mu_table, training_history = train_gpe_model(
-                gamma_values, modes, p, X, lb, ub, layers, epochs,
-                potential_type, lr=1e-3, verbose=True
+                gamma_values, modes, X, lb, ub, layers, epochs,
+                potential_type='harmonic', lr=1e-3, verbose=True
             )
             print("Training completed!")
 
@@ -1064,7 +925,14 @@ if __name__ == "__main__":
 
             # Plot loss history
             print("Generating loss plots...")
-            plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
+            plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type,
+                                             p_save_dir)
             plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
 
             print(f"Completed all calculations for {potential_type} potential\n")
+
+            print("\nChemical potentials at γ=0 (should be n+0.5):")
+            for mode in modes:
+                mu_at_gamma_0 = mu_table[mode][0][1]  # First gamma (0.0), mu value
+                expected = mode + 0.5
+                print(f"Mode {mode}: μ = {mu_at_gamma_0:.4f} (expected {expected:.1f})")

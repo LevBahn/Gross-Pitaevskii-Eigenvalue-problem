@@ -262,9 +262,10 @@ class GrossPitaevskiiPINN(nn.Module):
 
 
 def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
-                    potential_type='harmonic', lr=1e-3, verbose=True):
+                    potential_type='harmonic', lr=1e-3, verbose=True,
+                    min_epochs=3000, patience=500, min_delta=1e-6):
     """
-    Train the GPE model for different modes and gamma values.
+    Train the GPE model for different modes and gamma values with early stopping.
 
     Parameters:
     -----------
@@ -281,13 +282,19 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
     layers : list of int
         Network architecture
     epochs : int
-        Number of training epochs
+        Maximum number of training epochs
     potential_type : str
         Type of potential ('harmonic', 'gaussian', etc.)
     lr : float
         Learning rate
     verbose : bool
         Whether to print training progress
+    min_epochs : int
+        Minimum number of epochs before early stopping can trigger (default: 3000)
+    patience : int
+        Number of epochs to wait for improvement before stopping (default: 500)
+    min_delta : float
+        Minimum change in loss to qualify as an improvement (default: 1e-6)
 
     Returns:
     --------
@@ -325,7 +332,8 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
 
         for gamma in gamma_values:
             if verbose:
-                print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}, potential = {potential_type}")
+                print(
+                    f"\nTraining for γ = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}, potential = {potential_type}")
 
             # Initialize model for this mode and gamma
             model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
@@ -338,18 +346,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                 model.apply(lambda m: advanced_initialization(m, mode))
 
             # Adam optimizer
-            #optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-            optimizer = DistributedShampoo(model.parameters(),
-                                           lr=lr,
-                                           betas=(0.9, 0.999),
-                                           epsilon=1e-12,
-                                           weight_decay=1e-05,
-                                           max_preconditioner_dim=8192,
-                                           start_preconditioning_step=100,
-                                           precondition_frequency=100,
-                                           use_decoupled_weight_decay=False,
-                                           grafting_config=AdamGraftingConfig(beta2=0.999, epsilon=1e-08),
-                                           )
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
             # Create scheduler to decrease learning rate during training
             scheduler = CosineAnnealingWarmRestarts(
@@ -360,6 +357,11 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
             lambda_history = []
             loss_history = []
             constraint_history = []
+
+            # Early stopping variables
+            best_loss = float('inf')
+            epochs_without_improvement = 0
+            best_model_state = None
 
             for epoch in range(epochs):
                 optimizer.zero_grad()
@@ -387,9 +389,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                     )
 
                     # For mode 0, we want to minimize the energy while satisfying constraints
-                    # Note: We don't expect the energy to go to zero, it should converge to the ground state energy
-                    physics_loss = riesz_energy + pde_loss
-                    #physics_loss = pde_loss
+                    physics_loss = pde_loss
                     loss_type = "Riesz energy"
 
                     # Track the constraints separately for monitoring
@@ -428,6 +428,40 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                             print(
                                 f"Epoch {epoch}, {loss_type}: {physics_loss.item():.6f}, μ: {lambda_value.item():.4f}")
 
+                # Early stopping logic (only after minimum epochs)
+                if epoch >= min_epochs:
+                    current_loss = total_loss.item()
+
+                    # Check if this is the best loss so far
+                    if current_loss < best_loss - min_delta:
+                        best_loss = current_loss
+                        epochs_without_improvement = 0
+                        # Save the best model state
+                        best_model_state = model.state_dict().copy()
+                        if verbose and epoch % 500 == 0:
+                            print(f"    New best loss: {best_loss:.6f}")
+                    else:
+                        epochs_without_improvement += 1
+
+                    # Check if we should stop early
+                    if epochs_without_improvement >= patience:
+                        if verbose:
+                            print(f"    Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
+                            print(f"    Best loss: {best_loss:.6f}")
+                        break
+                else:
+                    # Before min_epochs, just track the best loss without early stopping
+                    current_loss = total_loss.item()
+                    if current_loss < best_loss:
+                        best_loss = current_loss
+                        best_model_state = model.state_dict().copy()
+
+            # Load the best model state if we have one
+            if best_model_state is not None:
+                model.load_state_dict(best_model_state)
+                if verbose:
+                    print(f"    Loaded best model state with loss: {best_loss:.6f}")
+
             # Record final chemical potential and save model
             final_mu = lambda_history[-1] if lambda_history else 0
             mu_logs.append((gamma, final_mu))
@@ -437,7 +471,9 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
             history_by_gamma[gamma] = {
                 'loss': loss_history,
                 'constraint': constraint_history,
-                'lambda': lambda_history
+                'lambda': lambda_history,
+                'final_epoch': epoch + 1,  # Add information about when training stopped
+                'best_loss': best_loss
             }
 
             # Update prev_model for next gamma value
@@ -891,9 +927,9 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
                         trend_y = np.exp(np.array([start_loss, end_loss]))
                         plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)
 
-    plt.title("Ultra-Smooth Training Progress - All Modes", fontsize=20)
+    plt.title("Training Progress for All Modes", fontsize=20)
     plt.xlabel("Epochs", fontsize=18)
-    plt.ylabel("Loss (Log Scale)", fontsize=18)
+    plt.ylabel("Loss", fontsize=18)
     plt.grid(True, which="both", linestyle="--", alpha=0.6)
     plt.legend(fontsize=12)
     plt.tight_layout()
@@ -905,7 +941,7 @@ if __name__ == "__main__":
     # Setup parameters
     lb, ub = -10, 10  # Domain boundaries
     N_f = 4000  # Number of collocation points
-    epochs = 2001  # Increased epochs for better convergence
+    epochs = 5001  # Increased epochs for better convergence
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
 
     # Create uniform grid for training and testing
