@@ -195,7 +195,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
 def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, 
                     epochs, tol, perturb_const,
-                    potential_type='harmonic', lr=1e-3, verbose=True):
+                    potential_type='harmonic', lr=1e-5, verbose=True):
     """
     Train the GPE model for different modes and gamma values.
 
@@ -256,6 +256,7 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers,
 
 
         for gamma in gamma_values:
+            
             if verbose:
                 print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}")
 
@@ -284,6 +285,8 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers,
             constraint_history = []
             
             Loss_criteria = 100
+
+            
 
             for epoch in range(epochs):
                 optimizer.zero_grad()
@@ -325,9 +328,21 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers,
                 optimizer.step()
                 scheduler.step(total_loss)
 
+
                 if Loss_criteria > total_loss:
                     Loss_criteria = total_loss
                     models_by_gamma[gamma] = model
+                    count =0
+                    
+                if Loss_criteria <= total_loss:
+                    count = count + 1
+
+                if count == 1000:
+                    print(f"Training is stopped as there was no improvement for last 1000 epochs with error {Loss_criteria}")
+                    break
+
+        
+                
 
                 # Record history
                 if epoch % 100 == 0:
@@ -342,12 +357,13 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers,
                              f"Constraints: {constraint_loss:.6f}")
                 
                 if total_loss <= tol:
-                    print(f"Early Stop as we have small enough error : {total_loss}")
+                    print(f"Early Stop as we have small enough error : {total_loss} with {epoch} epochs")
                     break
 
             # Record final chemical potential and save model
             final_mu = lambda_history[-1] if lambda_history else 0
             mu_logs.append((gamma, final_mu))
+            
 
             # Save the training history
             history_by_gamma[gamma] = {
@@ -357,7 +373,7 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers,
             }
             
             # Update prev_model for next gamma value
-            prev_model = models_by_gamma[gamma]
+            prev_model = model
 
         # Store results for this mode
         mu_table[mode] = mu_logs
@@ -396,6 +412,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
             if gamma not in models_by_mode[mode]:
                 continue
 
+
             model = models_by_mode[mode][gamma]
             model.eval()
             const = constant_history[mode]
@@ -416,10 +433,11 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                     u_np = np.abs(u_np)
 
                 # Plot wavefunction (not density)
-                plt.plot(X_test.flatten(), u_np,
-                         linestyle=linestyles[j % len(linestyles)],
-                         color=colors[j % len(colors)],
-                         label=f"γ={gamma:.1f}")
+                if gamma % 20 == 0:
+                    plt.plot(X_test.flatten(), u_np,
+                            linestyle=linestyles[j % len(linestyles)],
+                            color=colors[j % len(colors)],
+                            label=f"γ={gamma:.1f}")
 
         # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
@@ -497,10 +515,11 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes,
                     u_np = np.abs(u_np)
 
                 # Plot the wavefunction (not density)
-                ax.plot(X_test.flatten(), u_np,
-                        linestyle=linestyles[j % len(linestyles)],
-                        color=colors[j % len(colors)],
-                        label=f"γ={gamma:.1f}")
+                if gamma % 20 == 0:
+                    ax.plot(X_test.flatten(), u_np,
+                            linestyle=linestyles[j % len(linestyles)],
+                            color=colors[j % len(colors)],
+                            label=f"γ={gamma:.1f}")
 
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
@@ -681,10 +700,11 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, sav
                 epoch_nums = np.linspace(0, epochs, len(loss_history))
 
                 # Plot loss on log scale
-                ax.semilogy(epoch_nums, loss_history,
-                            color=colors[j % len(colors)],
-                            linestyle=linestyles[j % len(linestyles)],
-                            label=f"γ={gamma:.1f}")
+                if gamma % 20 == 0:
+                    ax.semilogy(epoch_nums, loss_history,
+                                color=colors[j % len(colors)],
+                                linestyle=linestyles[j % len(linestyles)],
+                                label=f"γ={gamma:.1f}")
 
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
@@ -808,22 +828,28 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)  # Higher resolution for plotting
 
     # Ga mma values from the paper
-    gamma_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    gamma_values = [k*(0.5) for k in range(201)]
 
     # Include modes 0 through 5
-    modes = [0, 1, 2, 3]
+    modes = [5]
+
+    # Set the perturbation constant
+    perturb_const = 0.01
+    
+    # Set the tolerance
+    tol = 0.00001
 
     # Train models
     print("Starting training for all modes and gamma values...")
     models_by_mode, mu_table, training_history, constant_history = train_gpe_model(
-        gamma_values, modes, X, lb, ub, layers, epochs, tol=0.00001, perturb_const=0.01, 
-        potential_type='harmonic', lr=1e-3, verbose=True )
+        gamma_values, modes, X, lb, ub, layers, epochs, tol, perturb_const, 
+        potential_type='harmonic', lr=1e-2, verbose=True )
     print("Training completed!")
-    print(constant_history[0])
+
 
     # Plot wavefunctions (not densities) for individual modes
     print("Generating individual mode plots...")
-    plot_wavefunction(models_by_mode, X_test, gamma_values, modes, constant_history, perturb_const=0.01)
+    plot_wavefunction(models_by_mode, X_test, gamma_values, modes, constant_history, perturb_const)
 
     # Plot μ vs γ for all modes
     print("Generating chemical potential vs. gamma plot...")

@@ -5,7 +5,7 @@ import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-from scipy.special import hermite
+from scipy.special import airy, hermite
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -41,7 +41,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, potential_type='gravity well'):
         """
         Parameters
         ----------
@@ -59,8 +59,6 @@ class GrossPitaevskiiPINN(nn.Module):
         super().__init__()
         self.layers = layers
         self.network = self.build_network()
-        self.hbar = hbar  # Planck's constant, fixed
-        self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
         self.gamma = gamma  # Interaction strength parameter
 
@@ -75,32 +73,45 @@ class GrossPitaevskiiPINN(nn.Module):
                 layers.append(nn.Tanh())
         return nn.Sequential(*layers)
 
-    def weighted_hermite(self, x: torch.Tensor, n: int) -> torch.Tensor:
-        
-        fact_n = float(math.factorial(n))
-        norm_factor = ( (2.0**n) * fact_n * math.sqrt(math.pi) ) ** (-0.5)
-        
-        # Build H_n(x) via recurrence in torch:
-        # If n = 0 --> H_0(x) = 1
-        #    n = 1 --> H_1(x) = 2 x
-        #    n >= 2: H_k = 2 x H_{k-1} - 2(k-1) H_{k-2}
-        if n == 0:
-            Hn = torch.ones_like(x)
-        elif n == 1:
-            Hn = 2.0 * x
+
+    def airy_solution(self, x: torch.Tensor, n: int) -> torch.Tensor:
+        """
+        Gravitational‐well basis Ψₙ(x)=Aₙ·Ai(x + zₙ) for x>=0, zero elsewhere.
+        Dimensionless units: ξ = x.
+        """
+        # Nth zero of Ai(z)=0:
+        airy_zeros = [
+            -2.33810741, -4.08794944, -5.52055983, -6.78670809, -7.94413359,
+            -9.02265085, -10.0401743, -11.0085243, -11.9360157, -12.8287767
+        ]
+
+        # 1) detach & cpu → numpy 1D
+        x_np = x.detach().cpu().numpy().ravel()
+
+        # 2) pick the nth zero
+        if n < len(airy_zeros):
+            z_n = airy_zeros[n]
         else:
-            Hnm2 = torch.ones_like(x)        # H_0(x)
-            Hnm1 = 2.0 * x                   # H_1(x)
-            for k in range(1, n):
-                # k runs from 1 to n-1; when k=1: compute H_2 = 2 x H_1 - 2*1*H_0, etc.
-                Hn = 2.0 * x * Hnm1 - 2.0 * float(k) * Hnm2
-                Hnm2, Hnm1 = Hnm1, Hn       # shift: H_{k-1} <- H_k, H_k <- H_{k+1}
-        
-        
-        weight = torch.exp(-0.5 * x**2)
-        
-        # Combine with the normalization factor:
-        return torch.tensor(norm_factor, dtype=x.dtype, device=x.device) * (Hn * weight)
+            z_n = -((1.5 * np.pi * (n + 0.75)) ** (2.0 / 3.0))
+
+        # 3) prepare output
+        psi_np = np.zeros_like(x_np, dtype=np.float32)
+
+        # 4) only for x>=0
+        mask = (x_np >= 0)
+        if mask.any():
+            vals = airy(x_np[mask] + z_n)[0]
+
+            # 5) normalize over x>=0
+            dx = float((x[1] - x[0]).item()) if x.numel() > 1 else 0.01
+            norm = np.sqrt(np.sum(vals**2) * dx)
+            if norm > 1e-12:
+                vals /= norm
+
+            psi_np[mask] = vals
+
+        # 6) back to torch, same device & dtype
+        return torch.tensor(psi_np).to(device=x.device, dtype=x.dtype)
 
 
     def forward(self, inputs):
@@ -115,18 +126,17 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         if mode is None:
             mode = self.mode
-        base_solution = self.weighted_hermite(x, mode)
+        base_solution = self.airy_solution(x, mode)
         return base_solution + perturbation
 
-    def compute_potential(self, x, potential_type="harmonic", **kwargs):
+    def compute_potential(self, x, potential_type="gravity well", **kwargs):
         """
-        Compute potential function for the 1D domain.
+        V(x) = x for x>=0, ≈∞ for x<0 (hard wall).
         """
-        if potential_type == "harmonic":
-            V = x ** 2
-        return V
+        return x
+        
 
-    def pde_loss(self, inputs, predictions, gamma, potential_type="harmonic", precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, gamma, potential_type='gravity well', precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
         μψ = - ∇²ψ + Vψ + γ|ψ|²ψ
@@ -195,7 +205,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
 def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers, 
                     epochs, tol, perturb_const,
-                    potential_type='harmonic', lr=1e-3, verbose=True):
+                    potential_type='gravity well', lr=1e-3, verbose=True):
     """
     Train the GPE model for different modes and gamma values.
 
@@ -257,10 +267,10 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers,
 
         for gamma in gamma_values:
             if verbose:
-                print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}")
+                print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, potential = {potential_type}")
 
             # Initialize model for this mode and gamma
-            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
+            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, potential_type=potential_type).to(device)
             # If this isn't the first gamma value, initialize with previous model's weights
             if prev_model is not None:
                 model.load_state_dict(prev_model.state_dict())
@@ -273,7 +283,7 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers,
             # Adam optimizer
             optimizer = torch.optim.Adam(model.parameters(), lr=lr)
             
-            # Create scheduler to decrease learning rate during training
+            # Cr teate schedulero decrease learning rate during training
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer, T_0=200, T_mult=2, eta_min=1e-6
             )
@@ -357,7 +367,7 @@ def train_gpe_model(gamma_values, modes, X_train, lb, ub, layers,
             }
             
             # Update prev_model for next gamma value
-            prev_model = models_by_gamma[gamma]
+            prev_model = model
 
         # Store results for this mode
         mu_table[mode] = mu_logs
@@ -427,7 +437,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
         plt.ylabel(r"$\psi(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(-10, 10)  # Match paper's range
+        plt.xlim(0, 20)  # Match paper's range
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction.png"), dpi=300)
         plt.close()
@@ -798,9 +808,9 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
 
 if __name__ == "__main__":
     # Setup parameters
-    lb, ub = -10, 10  # Domain boundaries
+    lb, ub = 0, 35  # Domain boundaries
     N_f = 4000  # Number of collocation points
-    epochs = 5001  # Increased epochs for better convergence
+    epochs = 1  # Increased epochs for better convergence
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
 
     # Create uniform grid for training and testing
@@ -808,22 +818,24 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)  # Higher resolution for plotting
 
     # Ga mma values from the paper
-    gamma_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    gamma_values = [0.0]
 
     # Include modes 0 through 5
-    modes = [0, 1, 2, 3]
+    modes = [0]
 
     # Train models
+
+    potential_type='gravity well'
     print("Starting training for all modes and gamma values...")
     models_by_mode, mu_table, training_history, constant_history = train_gpe_model(
-        gamma_values, modes, X, lb, ub, layers, epochs, tol=0.00001, perturb_const=0.01, 
-        potential_type='harmonic', lr=1e-3, verbose=True )
+        gamma_values, modes, X, lb, ub, layers, epochs, tol=0.00001, perturb_const=0, 
+        potential_type='gravity well', lr=1e-2, verbose=True )
     print("Training completed!")
     print(constant_history[0])
 
     # Plot wavefunctions (not densities) for individual modes
     print("Generating individual mode plots...")
-    plot_wavefunction(models_by_mode, X_test, gamma_values, modes, constant_history, perturb_const=0.01)
+    plot_wavefunction(models_by_mode, X_test, gamma_values, modes, constant_history, perturb_const=0)
 
     # Plot μ vs γ for all modes
     print("Generating chemical potential vs. gamma plot...")
