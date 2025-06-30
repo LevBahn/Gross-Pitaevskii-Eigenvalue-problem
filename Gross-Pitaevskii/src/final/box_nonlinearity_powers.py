@@ -488,8 +488,8 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
 
                     # For mode 0, we want to minimize the energy while satisfying constraints
                     # Note: We don't expect the energy to go to zero, it should converge to the ground state energy
-                    #physics_loss = pde_loss + riesz_energy
-                    physics_loss = pde_loss
+                    physics_loss = pde_loss + riesz_energy
+                    #physics_loss = pde_loss
                     loss_type = "Riesz energy"
 
                     # Track the constraints separately for monitoring
