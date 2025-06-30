@@ -241,28 +241,34 @@ class GrossPitaevskiiPINN(nn.Module):
             potential_type = self.potential_type
 
         if potential_type == "gravity well":
-            # MAJOR FIX: For gravity well, use the NN output directly as the main solution
-            # Apply proper boundary condition through multiplication
-            x_squeezed = x.squeeze()
-
-            # Boundary condition: ψ(x) = 0 for x < 0, smooth transition at x = 0
-            boundary_factor = torch.where(
-                x_squeezed >= 0,
-                torch.ones_like(x_squeezed),
-                torch.zeros_like(x_squeezed)
-            ).unsqueeze(-1) if len(x.shape) > 1 else torch.where(
-                x_squeezed >= 0,
-                torch.ones_like(x_squeezed),
-                torch.zeros_like(x_squeezed)
-            )
-
-            # For x >= 0, use NN output with proper scaling for decay at infinity
-            # Add exponential decay factor for large x to enforce boundary condition at infinity
-            decay_factor = torch.exp(-0.1 * torch.relu(x_squeezed - 10))
-            if len(x.shape) > 1:
-                decay_factor = decay_factor.unsqueeze(-1)
-
-            return boundary_factor * decay_factor * perturbation
+            # # MAJOR FIX: For gravity well, use the NN output directly as the main solution
+            # # Apply proper boundary condition through multiplication
+            # x_squeezed = x.squeeze()
+            #
+            # # Boundary condition: ψ(x) = 0 for x < 0, smooth transition at x = 0
+            # boundary_factor = torch.where(
+            #     x_squeezed >= 0,
+            #     torch.ones_like(x_squeezed),
+            #     torch.zeros_like(x_squeezed)
+            # ).unsqueeze(-1) if len(x.shape) > 1 else torch.where(
+            #     x_squeezed >= 0,
+            #     torch.ones_like(x_squeezed),
+            #     torch.zeros_like(x_squeezed)
+            # )
+            #
+            # # For x >= 0, use NN output with proper scaling for decay at infinity
+            # # Add exponential decay factor for large x to enforce boundary condition at infinity
+            # decay_factor = torch.exp(-0.1 * torch.relu(x_squeezed - 10))
+            # if len(x.shape) > 1:
+            #     decay_factor = decay_factor.unsqueeze(-1)
+            #
+            # constrained_solution = boundary_factor * decay_factor * perturbation
+            #
+            # if mode == 0:
+            #     constrained_solution = torch.abs(constrained_solution)
+            #
+            # return constrained_solution
+            base_solution = self.airy_solution(x, mode)
 
         elif potential_type == "harmonic":
             base_solution = self.weighted_hermite(x, mode)
@@ -346,27 +352,27 @@ class GrossPitaevskiiPINN(nn.Module):
         # Nonlinear interaction term: γ|ψ|^(p-1)ψ
         interaction = gamma * (torch.abs(u) ** (p - 1)) * u
 
-        # FIXED: Chemical potential calculation for gravity well
-        if potential_type == "gravity well":
-            # Only integrate over the physical domain x >= 0
-            x_squeezed = inputs.squeeze() if len(inputs.shape) > 1 else inputs
-            pos_mask = (x_squeezed >= 0)
-
-            if torch.any(pos_mask):
-                u_pos = u[pos_mask] if len(u.shape) > 1 else u[pos_mask]
-                kinetic_pos = kinetic[pos_mask] if len(kinetic.shape) > 1 else kinetic[pos_mask]
-                potential_pos = potential[pos_mask] if len(potential.shape) > 1 else potential[pos_mask]
-                interaction_pos = interaction[pos_mask] if len(interaction.shape) > 1 else interaction[pos_mask]
-
-                numerator = torch.mean(u_pos * (kinetic_pos + potential_pos + interaction_pos))
-                denominator = torch.mean(u_pos ** 2)
-            else:
-                numerator = torch.tensor(0.0, device=device)
-                denominator = torch.tensor(1.0, device=device)
-        else:
-            # Standard calculation for other potentials
-            numerator = torch.mean(u * (kinetic + potential + interaction))
-            denominator = torch.mean(u ** 2)
+        # # FIXED: Chemical potential calculation for gravity well
+        # if potential_type == "gravity well":
+        #     # Only integrate over the physical domain x >= 0
+        #     x_squeezed = inputs.squeeze() if len(inputs.shape) > 1 else inputs
+        #     pos_mask = (x_squeezed >= 0)
+        #
+        #     if torch.any(pos_mask):
+        #         u_pos = u[pos_mask] if len(u.shape) > 1 else u[pos_mask]
+        #         kinetic_pos = kinetic[pos_mask] if len(kinetic.shape) > 1 else kinetic[pos_mask]
+        #         potential_pos = potential[pos_mask] if len(potential.shape) > 1 else potential[pos_mask]
+        #         interaction_pos = interaction[pos_mask] if len(interaction.shape) > 1 else interaction[pos_mask]
+        #
+        #         numerator = torch.mean(u_pos * (kinetic_pos + potential_pos + interaction_pos))
+        #         denominator = torch.mean(u_pos ** 2)
+        #     else:
+        #         numerator = torch.tensor(0.0, device=device)
+        #         denominator = torch.tensor(1.0, device=device)
+        # else:
+        # Standard calculation for other potentials
+        numerator = torch.mean(u * (kinetic + potential + interaction))
+        denominator = torch.mean(u ** 2)
 
         # Chemical potential with regularization
         lambda_pde = numerator / (denominator + 1e-12)
@@ -375,17 +381,17 @@ class GrossPitaevskiiPINN(nn.Module):
         pde_residual = kinetic + potential + interaction - lambda_pde * u
 
         # PDE loss (mean squared residual)
-        if potential_type == "gravity well":
-            # Only compute loss over physical domain
-            x_squeezed = inputs.squeeze() if len(inputs.shape) > 1 else inputs
-            pos_mask = (x_squeezed >= 0)
-            if torch.any(pos_mask):
-                residual_pos = pde_residual[pos_mask] if len(pde_residual.shape) > 1 else pde_residual[pos_mask]
-                pde_loss = torch.mean(residual_pos ** 2)
-            else:
-                pde_loss = torch.tensor(0.0, device=device)
-        else:
-            pde_loss = torch.mean(pde_residual ** 2)
+        # if potential_type == "gravity well":
+        #     # Only compute loss over physical domain
+        #     x_squeezed = inputs.squeeze() if len(inputs.shape) > 1 else inputs
+        #     pos_mask = (x_squeezed >= 0)
+        #     if torch.any(pos_mask):
+        #         residual_pos = pde_residual[pos_mask] if len(pde_residual.shape) > 1 else pde_residual[pos_mask]
+        #         pde_loss = torch.mean(residual_pos ** 2)
+        #     else:
+        #         pde_loss = torch.tensor(0.0, device=device)
+        # else:
+        pde_loss = torch.mean(pde_residual ** 2)
 
         return pde_loss, pde_residual, lambda_pde, u
 
@@ -534,7 +540,6 @@ class GrossPitaevskiiPINN(nn.Module):
         return (integral - 1.0) ** 2
 
 
-# FIXED training function with better hyperparameters for gravity well
 def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                     potential_type='harmonic', lr=1e-3, verbose=True):
     """
@@ -550,14 +555,14 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    if potential_type == "gravity well":
-        L = ub
-        # More boundary points for gravity well
-        boundary_points = torch.tensor([lb, -2.0, -1.0, -0.5, 0.0, 0.5], dtype=torch.float32).reshape(-1, 1).to(device)
-    else:
-        L = ub
-        boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
-        boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
+    # if potential_type == "gravity well":
+    #     L = ub
+    #     # More boundary points for gravity well
+    #     boundary_points = torch.tensor([lb, -2.0, -1.0, -0.5, 0.0, 0.5], dtype=torch.float32).reshape(-1, 1).to(device)
+    # else:
+    L = ub
+    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
     # Track models, chemical potentials, and training history
     models_by_mode = {}
@@ -647,7 +652,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                     sym_loss = torch.tensor(0.0, device=device)
 
                     # Adjusted weights for gravity well
-                    constraint_loss = 200.0 * boundary_loss + 50.0 * norm_loss
+                    constraint_loss = 100.0 * boundary_loss + 50.0 * norm_loss
                 else:
                     boundary_loss = model.boundary_loss(boundary_points, boundary_values)
                     norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
@@ -667,7 +672,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
 
                     # For gravity well, focus more on PDE residual
                     if potential_type == "gravity well":
-                        physics_loss = pde_loss + 0.1 * riesz_energy
+                        physics_loss = pde_loss #+ 0.1 * riesz_energy
                     else:
                         physics_loss = pde_loss
 
@@ -689,10 +694,10 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
                 total_loss.backward()
 
                 # Gradient clipping - more aggressive for gravity well
-                if potential_type == "gravity well":
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                # if potential_type == "gravity well":
+                #     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                # else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
                 optimizer.step()
                 scheduler.step()
@@ -736,14 +741,21 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers, epochs,
 
 
 def gravity_well_initialization(m, mode):
-    """Special initialization for gravity well problems"""
+    """
+    Improved initialization for gravity well problems with mode-specific setup
+    """
     if isinstance(m, nn.Linear):
-        # Use smaller initial weights for gravity well
-        gain = 0.01 / (1.0 + 0.05 * mode)  # Much smaller initial weights
-        nn.init.xavier_normal_(m.weight, gain=gain)
-
-        # Very small bias initialization
-        m.bias.data.fill_(1e-4)
+        # Use different initialization strategies based on the mode
+        if mode == 0:
+            # For ground state, use small positive bias to encourage positive solutions
+            gain = 0.05
+            nn.init.xavier_normal_(m.weight, gain=gain)
+            m.bias.data.fill_(0.01)  # Small positive bias
+        else:
+            # For excited states, use slightly larger weights but zero bias
+            gain = 0.02 / (1.0 + 0.1 * mode)
+            nn.init.xavier_normal_(m.weight, gain=gain)
+            m.bias.data.fill_(0.0)  # Zero bias for excited states
 
 
 def advanced_initialization(m, mode):
@@ -1111,8 +1123,8 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, 
 # MAIN EXECUTION WITH IMPROVED PARAMETERS
 if __name__ == "__main__":
     # Setup parameters - IMPROVED for gravity well
-    N_f = 8000  # Increased collocation points for gravity well
-    epochs = 3001  # More epochs for gravity well convergence
+    N_f = 5000  # Increased collocation points for gravity well
+    epochs = 2001  # More epochs for gravity well convergence
     layers = [1, 64, 64, 64, 1]  # Optimized network architecture
 
     # Gamma values from the paper
@@ -1138,19 +1150,19 @@ if __name__ == "__main__":
                 lb, ub = -10, 10
 
             # Create uniform grid with better resolution for gravity well
-            if potential_type == 'gravity well':
-                # Use non-uniform grid with higher density near x=0
-                x_neg = np.linspace(lb, 0, N_f // 8)  # Negative domain
-                x_pos = np.linspace(0, ub, 7 * N_f // 8)  # Positive domain (higher density)
-                X = np.concatenate([x_neg[:-1], x_pos]).reshape(-1, 1)  # Remove duplicate at x=0
-
-                # Test grid
-                x_test_neg = np.linspace(lb, 0, 100)
-                x_test_pos = np.linspace(0, ub, 900)
-                X_test = np.concatenate([x_test_neg[:-1], x_test_pos]).reshape(-1, 1)
-            else:
-                X = np.linspace(lb, ub, N_f).reshape(-1, 1)
-                X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
+            # if potential_type == 'gravity well':
+            #     # Use non-uniform grid with higher density near x=0
+            #     x_neg = np.linspace(lb, 0, N_f // 8)  # Negative domain
+            #     x_pos = np.linspace(0, ub, 7 * N_f // 8)  # Positive domain (higher density)
+            #     X = np.concatenate([x_neg[:-1], x_pos]).reshape(-1, 1)  # Remove duplicate at x=0
+            #
+            #     # Test grid
+            #     x_test_neg = np.linspace(lb, 0, 100)
+            #     x_test_pos = np.linspace(0, ub, 900)
+            #     X_test = np.concatenate([x_test_neg[:-1], x_test_pos]).reshape(-1, 1)
+            # else:
+            X = np.linspace(lb, ub, N_f).reshape(-1, 1)
+            X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
             # Create specific directory
             p_save_dir = f"plots_p{p}_{potential_type}_fixed"
