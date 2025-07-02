@@ -132,6 +132,8 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         if potential_type == "harmonic":
             V = x ** 2
+        else:
+            raise ValueError(f"Unknown potential type: {potential_type}")
         return V
 
     def pde_loss(self, inputs, predictions, gamma, p, potential_type="harmonic", precomputed_potential=None):
@@ -751,7 +753,7 @@ def moving_average(values, window_size=10):
 
 
 def save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history,
-                filename="gpe_models.pkl"):
+                filename="gpe_models.pkl", save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """Save all training results to a single file."""
     # Convert models to CPU and save state dicts to avoid device issues
     models_state_dicts = {}
@@ -775,14 +777,17 @@ def save_models(models_by_mode, mu_table, training_history, constant_history, ep
         'epochs_history': epochs_history
     }
 
-    with open(filename, 'wb') as f:
+    filepath = os.path.join(save_dir, filename)
+    with open(filepath, 'wb') as f:
         pickle.dump(data, f)
-    print(f"Models saved to {filename}")
+    print(f"Models saved to {filepath}")
 
 
-def load_models(filename="gpe_models.pkl"):
+def load_models(filename="gpe_models.pkl", save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """Load all training results from file and reconstruct models properly."""
-    with open(filename, 'rb') as f:
+
+    filepath = os.path.join(save_dir, filename)
+    with open(filepath, 'rb') as f:
         data = pickle.load(f)
 
     # Reconstruct models from state dicts
@@ -979,8 +984,12 @@ if __name__ == "__main__":
         potential_type = "harmonic"
 
         # Train neural network or load existing models
-        train_new = True  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}.pkl"
+        train_new = False  # Set to True to train, False to load
+        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
+
+        # Create plotting and model saving directory
+        p_save_dir = f"plots_p{p}_{potential_type}_paper_test"
+        os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
             # Train models
@@ -990,15 +999,11 @@ if __name__ == "__main__":
                 potential_type='harmonic', lr=1e-3, verbose=True)
 
             # Save results
-            save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history, filename)
+            save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history, filename, p_save_dir)
         else:
             # Load existing models
             print("Loading existing models...")
-            models_by_mode, mu_table, training_history, constant_history, epochs_history = load_models(filename)
-
-        # Create plotting directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test"
-        os.makedirs(p_save_dir, exist_ok=True)
+            models_by_mode, mu_table, training_history, constant_history, epochs_history = load_models(filename, p_save_dir)
 
         # Plot wavefunctions for individual modes
         print("Generating individual mode plots...")
