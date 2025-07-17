@@ -76,40 +76,40 @@ class GrossPitaevskiiPINN(nn.Module):
                 layers.append(nn.Tanh())
         return nn.Sequential(*layers)
 
-    # def weighted_hermite(self, x: torch.Tensor, n: int) -> torch.Tensor:
-    #
-    #     fact_n = float(math.factorial(n))
-    #     norm_factor = ((2.0 ** n) * fact_n * math.sqrt(math.pi)) ** (-0.5)
-    #
-    #     # Build H_n(x) via recurrence in torch:
-    #     # If n = 0 --> H_0(x) = 1
-    #     #    n = 1 --> H_1(x) = 2 x
-    #     #    n >= 2: H_k = 2 x H_{k-1} - 2(k-1) H_{k-2}
-    #     if n == 0:
-    #         Hn = torch.ones_like(x)
-    #     elif n == 1:
-    #         Hn = 2.0 * x
-    #     else:
-    #         Hnm2 = torch.ones_like(x)  # H_0(x)
-    #         Hnm1 = 2.0 * x  # H_1(x)
-    #         for k in range(1, n):
-    #             # k runs from 1 to n-1; when k=1: compute H_2 = 2 x H_1 - 2*1*H_0, etc.
-    #             Hn = 2.0 * x * Hnm1 - 2.0 * float(k) * Hnm2
-    #             Hnm2, Hnm1 = Hnm1, Hn  # shift: H_{k-1} <- H_k, H_k <- H_{k+1}
-    #
-    #     weight = torch.exp(-0.5 * x ** 2)
-    #
-    #     # Combine with the normalization factor:
-    #     return torch.tensor(norm_factor, dtype=x.dtype, device=x.device) * (Hn * weight)
+    def weighted_hermite(self, x: torch.Tensor, n: int) -> torch.Tensor:
 
-    def weighted_hermite(self, x, n):
-        """
-        Compute the weighted Hermite polynomial solution for the linear case (gamma = 0).
-        """
-        H_n = hermite(n)(x.cpu().detach().numpy())  # Hermite polynomial evaluated at x
-        norm_factor = (2 ** n * math.factorial(n) * np.sqrt(np.pi)) ** (-0.5)
-        weighted_hermite = norm_factor * torch.exp(-x ** 2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
-        return weighted_hermite
+        fact_n = float(math.factorial(n))
+        norm_factor = ((2.0 ** n) * fact_n * math.sqrt(math.pi)) ** (-0.5)
+
+        # Build H_n(x) via recurrence in torch:
+        # If n = 0 --> H_0(x) = 1
+        #    n = 1 --> H_1(x) = 2 x
+        #    n >= 2: H_k = 2 x H_{k-1} - 2(k-1) H_{k-2}
+        if n == 0:
+            Hn = torch.ones_like(x)
+        elif n == 1:
+            Hn = 2.0 * x
+        else:
+            Hnm2 = torch.ones_like(x)  # H_0(x)
+            Hnm1 = 2.0 * x  # H_1(x)
+            for k in range(1, n):
+                # k runs from 1 to n-1; when k=1: compute H_2 = 2 x H_1 - 2*1*H_0, etc.
+                Hn = 2.0 * x * Hnm1 - 2.0 * float(k) * Hnm2
+                Hnm2, Hnm1 = Hnm1, Hn  # shift: H_{k-1} <- H_k, H_k <- H_{k+1}
+
+        weight = torch.exp(-0.5 * x ** 2)
+
+        # Combine with the normalization factor:
+        return torch.tensor(norm_factor, dtype=x.dtype, device=x.device) * (Hn * weight)
+
+    # def weighted_hermite(self, x, n):
+    #     """
+    #     Compute the weighted Hermite polynomial solution for the linear case (gamma = 0).
+    #     """
+    #     H_n = hermite(n)(x.cpu().detach().numpy())  # Hermite polynomial evaluated at x
+    #     norm_factor = (2 ** n * math.factorial(n) * np.sqrt(np.pi)) ** (-0.5)
+    #     weighted_hermite = norm_factor * torch.exp(-x ** 2 / 2) * torch.tensor(H_n, dtype=torch.float32).to(device)
+    #     return weighted_hermite
 
     def forward(self, inputs):
         """
@@ -962,9 +962,9 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 5.0
+    alpha = 1.0
     #gamma_values = [k * alpha for k in range(201)]
-    gamma_values = [k * alpha for k in range(21)]
+    gamma_values = [k * alpha for k in range(101)]
 
     # Include modes 0 through 5
     modes = [0, 1, 2, 3, 4, 5]
@@ -984,7 +984,7 @@ if __name__ == "__main__":
         potential_type = "harmonic"
 
         # Train neural network or load existing models
-        train_new = False  # Set to True to train, False to load
+        train_new = True  # Set to True to train, False to load
         filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
 
         # Create plotting and model saving directory
@@ -996,7 +996,7 @@ if __name__ == "__main__":
             print("Starting training...")
             models_by_mode, mu_table, training_history, constant_history, epochs_history = train_gpe_model(
                 gamma_values, modes, p, X, lb, ub, layers, epochs, tol, perturb_const,
-                potential_type='harmonic', lr=1e-3, verbose=True)
+                potential_type='harmonic', lr=1e-4, verbose=True)
 
             # Save results
             save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history, filename, p_save_dir)
