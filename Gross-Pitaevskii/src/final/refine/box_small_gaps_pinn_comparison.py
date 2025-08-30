@@ -61,71 +61,74 @@ class ResidualBlock(nn.Module):
         return self.activation(out + identity)
 
 
+class SiLUResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.lin1 = nn.Linear(dim, dim)
+        self.lin2 = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        identity = x
+        out = torch.nn.functional.silu(self.lin1(x))
+        out = self.lin2(out)
+        return torch.nn.functional.silu(out + identity)
+
+
 class GrossPitaevskiiPINN(nn.Module):
     """
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
-
     def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=1.0, use_residual=True):
-        """
-        Parameters
-        ----------
-        layers : list of int
-            Neural network architecture, each entry defines the number of neurons in that layer.
-        hbar : float, optional
-            Reduced Planck's constant (default is 1.0).
-        m : float, optional
-            Mass of the particle (default is 1.0).
-        mode : int, optional
-            Mode number (default is 0).
-        gamma : float, optional
-            Interaction strength parameter.
-        L : float, optional
-            Length of the box (default is 1.0).
-        """
         super().__init__()
         self.layers = layers
         self.use_residual = use_residual
-        self.network = self.build_network()
         self.hbar = hbar  # Planck's constant, fixed
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
         self.gamma = gamma  # Interaction strength parameter
         self.L = L  # Length of the box
 
-        # Now build the network after all attributes are set
+        # Build network after all attributes are set
         self.network = self.build_network()
 
     def build_network(self):
         """
-        Build the neural network with tanh activation functions and residual connections.
+        Build the neural network with mode-dependent activation functions.
         """
         if not self.use_residual:
-            # Original architecture without residual blocks
             layers = []
             for i in range(len(self.layers) - 1):
                 layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
                 if i < len(self.layers) - 2:
-                    layers.append(nn.SineActivation())
+                    # Use SiLU for higher modes, SineActivation for lower modes
+                    if self.mode >= 3:
+                        layers.append(nn.SiLU())
+                    else:
+                        layers.append(SineActivation())
             return nn.Sequential(*layers)
         else:
-            # New architecture with residual blocks
+            # For residual blocks, also make mode-dependent
             modules = []
-
-            # Input layer
             input_dim = self.layers[0]
             hidden_dim = self.layers[1]
             modules.append(nn.Linear(input_dim, hidden_dim))
-            modules.append(nn.Tanh())
 
-            # Residual blocks in the middle layers
-            num_res_blocks = len(self.layers) - 3  # Subtract input, first hidden, and output
+            # Mode-dependent activation for first layer
+            if self.mode >= 3:
+                modules.append(nn.SiLU())
+            else:
+                modules.append(SineActivation())
+
+            # Residual blocks
+            num_res_blocks = len(self.layers) - 3
             for _ in range(num_res_blocks):
-                modules.append(ResidualBlock(hidden_dim))
+                if self.mode >= 3:
+                    modules.append(SiLUResidualBlock(hidden_dim))
+                else:
+                    modules.append(ResidualBlock(hidden_dim))  # Uses SineActivation
 
             # Output layer
             modules.append(nn.Linear(hidden_dim, self.layers[-1]))
-
             return nn.Sequential(*modules)
 
     def box_eigenfunction(self, x, n):
@@ -161,7 +164,13 @@ class GrossPitaevskiiPINN(nn.Module):
         if mode is None:
             mode = self.mode
         base_solution = self.box_eigenfunction(x, mode)
-        return base_solution + perturbation
+
+        # Reduce base solution weight for higher modes
+        if mode >= 3:
+            base_weight = 0.5
+            return base_weight * base_solution + perturbation
+        else:
+            return base_solution + perturbation
 
     def compute_potential(self, x, potential_type="box", **kwargs):
         """
@@ -298,6 +307,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
     print(f"Tolerance : {tol}, Perturbation constant : {perturb_const}")
 
     for mode in modes:
+        layers = get_architecture_for_mode(mode)
         if verbose:
             print(f"\n===== Training for mode {mode} =====")
 
@@ -314,7 +324,11 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}")
 
             # Initialize model for this mode and gamma
-            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L).to(device)
+            if mode >= 3:
+                model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L, use_residual=False).to(device)
+            else:
+                model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L, use_residual=True).to(device)
+
             # If this isn't the first gamma value, initialize with previous model's weights
             if prev_model is not None:
                 model.load_state_dict(prev_model.state_dict())
@@ -323,7 +337,10 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 model.apply(lambda m: advanced_initialization(m, mode))
 
             # Adam optimizer
-            mode_lr = lr / (1 + 0.3 * mode)  # Lower LR for higher modes
+            if mode >= 3:
+                mode_lr = lr / (10.0 * mode)  # Lower learning rate
+            else:
+                mode_lr = lr / (1 + 0.3 * mode)
             optimizer = torch.optim.Adam(model.parameters(), lr=mode_lr)
 
             # Create scheduler to decrease learning rate during training
@@ -348,14 +365,11 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
 
                 # Forward pass
                 u_pred = model.forward(X_tensor)
-                if epoch == 0 and gamma == 0:
-                    normal_const = torch.max(u_pred).detach().clone()
+                if gamma == 0 and epoch == 0:
+                    normal_const = torch.max(torch.abs(u_pred)).detach().clone()
                     constant_history[mode] = normal_const
-                    u_pred = u_pred / normal_const
-                    u_pred = perturb_const * u_pred
-                else:
-                    u_pred = perturb_const * u_pred
-                    u_pred = u_pred / normal_const
+
+                u_pred = perturb_const * u_pred / constant_history[mode]
 
                 # Calculate common constraint losses for all modes
                 boundary_loss = model.boundary_loss(boundary_points, boundary_values)
@@ -363,7 +377,14 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
 
                 # Combined constraint loss
                 norm_weight = 20.0 * (1 + 0.5 * mode)  # Stronger normalization for higher modes
-                constraint_loss = 10.0 * boundary_loss + norm_weight * norm_loss
+                if mode >= 3:
+                    boundary_weight = 10000.0  # 1000x stronger
+                    norm_weight = 1000.0 * (1 + mode)
+                else:
+                    boundary_weight = 1000.0  # 100x stronger
+                    norm_weight = 100.0 * (1 + 0.5 * mode)
+
+                constraint_loss = boundary_weight * boundary_loss + norm_weight * norm_loss
 
                 # Use PDE residual for all modes
                 pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, potential_type)
@@ -371,7 +392,13 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 loss_type = "PDE residual"
 
                 # Total loss for optimization
-                total_loss = physics_loss + constraint_loss
+                if gamma > 0:
+                    # Start with stronger constraints, gradually shift to physics
+                    constraint_weight = max(0.1, 1.0 - epoch / (epochs * 0.8))
+                    physics_weight = min(1.0, epoch / (epochs * 0.2))
+                    total_loss = physics_weight * physics_loss + constraint_weight * constraint_loss
+                else:
+                    total_loss = physics_loss + constraint_loss
 
                 # Backpropagate
                 total_loss.backward()
@@ -445,6 +472,8 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
         models_by_mode[mode] = models_by_gamma
         training_history[mode] = history_by_gamma
         epochs_history[mode] = epochs_by_gamma
+
+        diagnose_mode(model, mode, X_test, constant_history[mode], perturb_const)
 
     return models_by_mode, mu_table, training_history, constant_history, epochs_history
 
@@ -1028,7 +1057,7 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
         # Scale perturbation
         if epoch == 0:
             normal_const = torch.max(u_pred).detach().clone()
-        mode_perturb = perturb_const / (1 + 0.5 * mode)  # Smaller for higher modes
+        mode_perturb = (5.0 * (mode + 1))
         u_pred = mode_perturb * u_pred / normal_const
 
         # Calculate losses
@@ -2004,6 +2033,56 @@ def create_latex_table(results_df, save_path=None):
     return latex_table
 
 
+def get_architecture_for_mode(mode):
+    if mode <= 2:
+        return [1, 64, 64, 64, 1]  # Current working architecture
+    elif mode <= 4:
+        return [1, 128, 128, 128, 128, 1]  # Wider for modes 3-4
+    else:
+        return [1, 256, 256, 256, 256, 256, 1]  # Much wider for mode 5
+
+
+def diagnose_mode(model, mode, X_test, constant, perturb_const):
+    model.eval()
+    X_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
+    dx = X_test[1, 0] - X_test[0, 0]
+
+    with torch.no_grad():
+        # Get the raw network output
+        u_pred = model.forward(X_tensor)
+
+        # Apply the same scaling used in training
+        u_pred_scaled = u_pred * (perturb_const / constant)
+
+        # Get base solution and full solution
+        base_solution = model.box_eigenfunction(X_tensor, mode)
+        full_solution = base_solution + u_pred_scaled
+
+        # Normalize the full solution (as done in evaluation)
+        full_solution_norm = full_solution / torch.sqrt(torch.sum(full_solution ** 2) * dx)
+
+        print(f"Mode {mode} Diagnostics:")
+        print(f"  Raw network output range: {torch.min(u_pred).item():.2e} to {torch.max(u_pred).item():.2e}")
+        print(f"  Normalization constant: {constant.item():.2e}")
+        print(f"  Perturbation constant: {perturb_const:.2e}")
+        print(f"  Scaled perturbation magnitude: {torch.max(torch.abs(u_pred_scaled)).item():.2e}")
+        print(f"  Base solution magnitude: {torch.max(torch.abs(base_solution)).item():.2e}")
+        print(
+            f"  Perturbation/Base ratio: {(torch.max(torch.abs(u_pred_scaled)) / torch.max(torch.abs(base_solution))).item():.2e}")
+        print(f"  Full solution range: {torch.min(full_solution).item():.2e} to {torch.max(full_solution).item():.2e}")
+        print(f"  Boundary values: left={full_solution[0].item():.2e}, right={full_solution[-1].item():.2e}")
+        print(f"  Normalization integral: {(torch.sum(full_solution_norm ** 2) * dx).item():.6f}")
+
+        # Check if perturbation is reasonable
+        ratio = (torch.max(torch.abs(u_pred_scaled)) / torch.max(torch.abs(base_solution))).item()
+        if ratio > 0.1:
+            print(f"  ⚠️  WARNING: Perturbation is {ratio:.1%} of base - too large!")
+        elif ratio < 1e-6:
+            print(f"  ⚠️  WARNING: Perturbation is {ratio:.2e} of base - too small!")
+        else:
+            print(f"  ✓ Perturbation magnitude looks reasonable")
+
+
 if __name__ == "__main__":
     # Setup parameters
     lb, ub = 0, 1 # Domain boundaries
@@ -2016,9 +2095,11 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 2.0
+    # alpha = 2.0
+    alpha = 5.0
     #gamma_values = [k * alpha for k in range(201)]
-    gamma_values = [k * alpha for k in range(51)]
+    # gamma_values = [k * alpha for k in range(51)]
+    gamma_values = [k * alpha for k in range(21)]
 
     # Include modes 0 through 5
     modes = [0, 1, 2, 3, 4, 5]

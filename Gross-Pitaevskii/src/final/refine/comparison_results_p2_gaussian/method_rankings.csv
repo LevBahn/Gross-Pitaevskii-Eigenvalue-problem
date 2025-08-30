@@ -1,0 +1,4 @@
+Mode,Method,Abs_Error_Rank,Rel_Error_Rank
+0,Regular PINN,3,3
+0,Curriculum Training,2,2
+0,PL-PINN (ours),1,1
