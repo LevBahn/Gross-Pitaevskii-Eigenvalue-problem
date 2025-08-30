@@ -1,0 +1,14 @@
+\begin{table}[htbp]
+\centering
+\caption{Comparison of PINN Methods for Gross-Pitaevskii Equation}
+\label{tab:pinn_comparison}
+\begin{tabular}{llcc}
+\toprule
+Mode & Method & Abs. Error & Rel. Error \\
+\midrule
+Mode 0 & Regular PINN & 8.16e+10 & 8162176212880.479\% \\
+ & Curriculum Training & 1.60e+07 & 1603970087.500\% \\
+ & PL-PINN (ours) & \textbf{6.62e-01} & \textbf{66.223\%} \\
+\bottomrule
+\end{tabular}
+\end{table}

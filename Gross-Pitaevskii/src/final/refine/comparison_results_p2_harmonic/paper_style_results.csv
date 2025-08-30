@@ -1,0 +1,19 @@
+Mode,Method,abs_err,rel_err
+Mode 0,Regular PINN,1.98e+00,197.528%
+Mode 0,Curriculum Training,2.16e+00,215.599%
+Mode 0,PL-PINN (ours),**3.38e-02**,**3.403%**
+Mode 1,Regular PINN,3.95e+00,395.385%
+Mode 1,Curriculum Training,2.03e+00,203.034%
+Mode 1,PL-PINN (ours),**3.67e-01**,**36.754%**
+Mode 2,Regular PINN,1.52e+00,152.162%
+Mode 2,Curriculum Training,2.39e+00,239.265%
+Mode 2,PL-PINN (ours),**3.08e-01**,**30.820%**
+Mode 3,Regular PINN,1.59e+02,15923.374%
+Mode 3,Curriculum Training,1.83e+00,183.424%
+Mode 3,PL-PINN (ours),**6.82e-01**,**68.194%**
+Mode 4,Regular PINN,1.06e+02,10599.456%
+Mode 4,Curriculum Training,2.10e+00,209.845%
+Mode 4,PL-PINN (ours),**8.26e-01**,**82.580%**
+Mode 5,Regular PINN,9.62e-01,96.260%
+Mode 5,Curriculum Training,1.65e+00,164.592%
+Mode 5,PL-PINN (ours),**3.87e-01**,**38.735%**

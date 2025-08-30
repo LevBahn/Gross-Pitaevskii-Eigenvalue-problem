@@ -1988,7 +1988,7 @@ if __name__ == "__main__":
     tol = 0.00001
 
     # Nonlinearity powers
-    nonlinearity_powers = [3]
+    nonlinearity_powers = [8]
 
     for p in nonlinearity_powers:
 
@@ -1996,7 +1996,7 @@ if __name__ == "__main__":
         potential_type = "harmonic"
 
         # Train neural network or load existing models
-        train_new = False  # Set to True to train, False to load
+        train_new = True  # Set to True to train, False to load
         filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
 
         # Create plotting and model saving directory
