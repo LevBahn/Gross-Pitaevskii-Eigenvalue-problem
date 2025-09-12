@@ -512,12 +512,12 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
-                             label=f"γ={gamma:.1f}")
+                             label=f"η={gamma:.1f}")
 
         # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
         plt.xlabel("x", fontsize=18)
-        plt.ylabel(r"$\psi(x)$", fontsize=18)
+        plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
         plt.xlim(0, 1)
@@ -718,7 +718,7 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, 
                     ax.semilogy(epoch_nums, loss_history,
                                 color=colors[j % len(colors)],
                                 linestyle=linestyles[j % len(linestyles)],
-                                label=f"γ={gamma:.1f}")
+                                label=f"η={gamma:.1f}")
 
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
@@ -1701,10 +1701,10 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
             if mode in pl_pinn_models and gamma in pl_pinn_models[mode]:
                 model = pl_pinn_models[mode][gamma]
                 const = pl_constant_history[mode]
-                abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "PL-PINN (ours)",
+                abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "PL-PINN",
                                                           perturb_const, L=ub)
                 results.append({
-                    'Method': 'PL-PINN (ours)',
+                    'Method': 'PL-PINN',
                     'Mode': mode,
                     'Gamma': gamma,
                     'Abs Error': abs_err,
@@ -1727,7 +1727,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
     print("\nPAPER-STYLE COMPARISON TABLE")
     print("-" * 60)
 
-    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN (ours)']
+    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN']
 
     # Print header
     print(f"{'Method':<20} {'abs. err':<12} {'rel. err':<10}")
@@ -1885,7 +1885,7 @@ def plot_comparison_results(results_df, save_dir="comparison_results"):
     modes = sorted(results_df['Mode'].unique())
 
     # Set up colors for methods
-    colors = {'Regular PINN': 'red', 'Curriculum Training': 'blue', 'PL-PINN (ours)': 'green'}
+    colors = {'Regular PINN': 'red', 'Curriculum Training': 'blue', 'PL-PINN': 'green'}
 
     # 1. Plot absolute error comparison
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
@@ -1973,7 +1973,7 @@ def create_latex_table(results_df, save_path=None):
     latex_lines.append("\\midrule")
 
     modes = sorted(results_df['Mode'].unique())
-    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN (ours)']
+    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN']
 
     for mode in modes:
         mode_data = results_df[results_df['Mode'] == mode]
@@ -2027,9 +2027,9 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 2.0
-    #gamma_values = [k * alpha for k in range(201)]
-    gamma_values = [k * alpha for k in range(51)]
+    alpha = 0.25
+    gamma_values = [k * alpha for k in range(401)]
+    #gamma_values = [k * alpha for k in range(51)]
 
     # Include modes 0 through 5
     modes = [0, 1, 2, 3, 4, 5]

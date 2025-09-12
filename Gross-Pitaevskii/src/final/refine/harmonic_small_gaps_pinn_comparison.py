@@ -452,12 +452,12 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
-                             label=f"γ={gamma:.1f}")
+                             label=f"η={gamma:.1f}")
 
         # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
         plt.xlabel("x", fontsize=18)
-        plt.ylabel(r"$\psi(x)$", fontsize=18)
+        plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
         plt.xlim(-10, 10)
@@ -537,7 +537,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
         ax.set_xlabel("x", fontsize=12)
-        ax.set_ylabel(r"$\psi(x)$", fontsize=12)
+        ax.set_ylabel(r"$u(x)$", fontsize=12)
         ax.grid(True)
         ax.legend(fontsize=6)
         ax.set_xlim(-10, 10)
@@ -576,8 +576,8 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
                  linestyle='-',
                  label=f"Mode {mode}")
 
-    plt.ylabel(r"$\gamma$ (Interaction Strength)", fontsize=18)
-    plt.xlabel(r"$\mu$ (Chemical Potential)", fontsize=18)
+    plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
+    plt.xlabel(r"$\lambda$ (Chemical Potential)", fontsize=18)
     plt.title(f"Chemical Potential vs. Interaction Strength for All Modes (p={p})", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
@@ -848,7 +848,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
                          markersize=4,
                          label=f"Mode {mode}")
 
-    plt.xlabel(r"$\gamma$ (Interaction Strength)", fontsize=14)
+    plt.xlabel(r"$\eta$ (Interaction Strength)", fontsize=14)
     plt.ylabel("Epochs Until Early Stopping", fontsize=14)
     plt.title("Training Efficiency: Epochs Until Convergence", fontsize=16)
     plt.grid(True, alpha=0.3)
@@ -885,7 +885,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
 
     plt.xticks(range(len(gamma_labels)), gamma_labels, rotation=45, ha='right')
     plt.yticks(range(len(mode_labels)), mode_labels)
-    plt.xlabel(r"$\gamma$ (Interaction Strength)", fontsize=14)
+    plt.xlabel(r"$\eta$ (Interaction Strength)", fontsize=14)
     plt.ylabel("Mode", fontsize=14)
     plt.title("Training Efficiency Heatmap", fontsize=16)
     cbar = plt.colorbar(im)
@@ -918,7 +918,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
         if epochs_for_gamma:
             plt.plot(valid_modes, epochs_for_gamma,
                      marker='o', linestyle='-', linewidth=2,
-                     label=f"γ={gamma}")
+                     label=f"η={gamma}")
 
     plt.xlabel("Mode Number", fontsize=14)
     plt.ylabel("Epochs Until Early Stopping", fontsize=14)
@@ -1648,10 +1648,10 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
             if mode in pl_pinn_models and gamma in pl_pinn_models[mode]:
                 model = pl_pinn_models[mode][gamma]
                 const = pl_constant_history[mode]
-                abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "PL-PINN (ours)",
+                abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "PL-PINN",
                                                           perturb_const)
                 results.append({
-                    'Method': 'PL-PINN (ours)',
+                    'Method': 'PL-PINN',
                     'Mode': mode,
                     'Gamma': gamma,
                     'Abs Error': abs_err,
@@ -1674,7 +1674,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
     print("\nPAPER-STYLE COMPARISON TABLE")
     print("-" * 60)
     
-    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN (ours)']
+    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN']
     
     # Print header
     print(f"{'Method':<20} {'abs. err':<12} {'rel. err':<10}")
@@ -1832,7 +1832,7 @@ def plot_comparison_results(results_df, save_dir="comparison_results"):
     modes = sorted(results_df['Mode'].unique())
     
     # Set up colors for methods
-    colors = {'Regular PINN': 'red', 'Curriculum Training': 'blue', 'PL-PINN (ours)': 'green'}
+    colors = {'Regular PINN': 'red', 'Curriculum Training': 'blue', 'PL-PINN': 'green'}
     
     # 1. Plot absolute error comparison
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
@@ -1920,7 +1920,7 @@ def create_latex_table(results_df, save_path=None):
     latex_lines.append("\\midrule")
     
     modes = sorted(results_df['Mode'].unique())
-    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN (ours)']
+    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN']
     
     for mode in modes:
         mode_data = results_df[results_df['Mode'] == mode]
@@ -1974,9 +1974,9 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 5.0
-    #gamma_values = [k * alpha for k in range(201)]
-    gamma_values = [k * alpha for k in range(21)]
+    alpha = 0.5
+    gamma_values = [k * alpha for k in range(201)]
+    #gamma_values = [k * alpha for k in range(21)]
 
     # Include modes 0 through 5
     modes = [0, 1, 2, 3, 4, 5]
@@ -1996,7 +1996,7 @@ if __name__ == "__main__":
         potential_type = "harmonic"
 
         # Train neural network or load existing models
-        train_new = True  # Set to True to train, False to load
+        train_new = False  # Set to True to train, False to load
         filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
 
         # Create plotting and model saving directory

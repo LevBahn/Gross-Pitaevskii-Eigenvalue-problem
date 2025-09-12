@@ -878,7 +878,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
     sampled_gammas = [g for g in gamma_values if g % 10 == 0]  # Every 10th gamma value
 
     for gamma in sampled_gammas:
-        gamma_labels.append(f"γ={gamma}")
+        gamma_labels.append(f"η={gamma}")
         row = []
         for mode in modes:
             if mode in epochs_history and gamma in epochs_history[mode]:
@@ -927,7 +927,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
         if epochs_for_gamma:
             plt.plot(valid_modes, epochs_for_gamma,
                      marker='o', linestyle='-', linewidth=2,
-                     label=f"γ={gamma}")
+                     label=f"η={gamma}")
 
     plt.xlabel("Mode Number", fontsize=14)
     plt.ylabel("Epochs Until Early Stopping", fontsize=14)
