@@ -142,7 +142,7 @@ class GrossPitaevskiiPINN(nn.Module):
     def pde_loss(self, inputs, predictions, gamma, p, potential_type="harmonic", precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
-        μÏˆ = - âˆ‡Â²Ïˆ + VÏˆ + γ|Ïˆ|Â²Ïˆ
+        Î¼Ïˆ = - âˆ‡Â²Ïˆ + VÏˆ + η|Ïˆ|Â²Ïˆ
         """
         # Get the complete solution (base + perturbation)
         u = self.get_complete_solution(inputs, predictions)
@@ -276,7 +276,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
         for gamma in reversed(gamma_values):
 
             if verbose:
-                print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}")
+                print(f"\nTraining for η = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}")
 
             # Initialize model for this mode and gamma
             model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
@@ -310,28 +310,16 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
             for epoch in range(epochs):
                 optimizer.zero_grad()
 
-                # # Forward pass
-                # u_pred = model.forward(X_tensor)
-                # if epoch == 0 and gamma == 0:
-                #     normal_const = torch.max(u_pred).detach().clone()
-                #     constant_history[mode] = normal_const
-                #     u_pred = u_pred / normal_const
-                #     u_pred = perturb_const * u_pred
-                # else:
-                #     u_pred = perturb_const * u_pred
-                #     u_pred = u_pred / normal_const
-
                 # Forward pass
                 u_pred = model.forward(X_tensor)
-                if epoch == 0:  # <-- Remove the "and gamma == 0" condition
+                if epoch == 0 and gamma == 0:
                     normal_const = torch.max(u_pred).detach().clone()
-                    if mode not in constant_history:  # <-- Only set once per mode
-                        constant_history[mode] = normal_const
+                    constant_history[mode] = normal_const
+                    u_pred = u_pred / normal_const
+                    u_pred = perturb_const * u_pred
                 else:
-                    normal_const = constant_history[mode]  # <-- Use stored value
-
-                # Apply consistent scaling
-                u_pred = perturb_const * u_pred / normal_const
+                    u_pred = perturb_const * u_pred
+                    u_pred = u_pred / normal_const
 
                 # Calculate common constraint losses for all modes
                 boundary_loss = model.boundary_loss(boundary_points, boundary_values)
@@ -375,7 +363,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                     constraint_history.append(constraint_loss.item())
 
                     if verbose and epoch % 500 == 0:
-                        print(f"Epoch {epoch}, μ: {lambda_value.item():.4f}")
+                        print(f"Epoch {epoch}, λ: {lambda_value.item():.4f}")
                         print(f"Total Loss: {current_loss:.6f}, {loss_type}: {physics_loss.item():.6f}, "
                               f"Constraints: {constraint_loss.item():.6f}")
 
@@ -471,11 +459,11 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                     u_np = np.abs(u_np)
 
                 # Plot wavefunctions
-                if abs(gamma) % 20 == 0:
+                if abs(gamma) % 4 == 0:
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
-                             label=f"γ={gamma:.1f}")
+                             label=f"η={gamma:.1f}")
 
         # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
@@ -551,11 +539,11 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
                     u_np = np.abs(u_np)
 
                 # Plot the wavefunction (not density)
-                if abs(gamma) % 20 == 0:
+                if abs(gamma) % 4 == 0:
                     ax.plot(X_test.flatten(), u_np,
                             linestyle=linestyles[j % len(linestyles)],
                             color=colors[j % len(colors)],
-                            label=f"γ={gamma:.1f}")
+                            label=f"η={gamma:.1f}")
 
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
@@ -587,7 +575,7 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
     markers = ['o', 's', '^', 'v', 'D', 'x', '*', '+']
     colors = ['k', 'b', 'r', 'g', 'm', 'c', 'orange', 'purple']
 
-    # Plot μ vs γ for each mode
+    # Plot λ vs η for each mode
     for i, mode in enumerate(modes):
         if mode not in mu_table:
             continue
@@ -599,8 +587,8 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
                  linestyle='-',
                  label=f"Mode {mode}")
 
-    plt.ylabel(r"$\gamma$ (Interaction Strength)", fontsize=18)
-    plt.xlabel(r"$\mu$ (Chemical Potential)", fontsize=18)
+    plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
+    plt.xlabel(r"$\lambda$ (Chemical Potential)", fontsize=18)
     plt.title(f"Chemical Potential vs. Interaction Strength for All Modes (p={p})", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
@@ -678,11 +666,11 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, 
                 epoch_nums = np.linspace(0, epochs, len(loss_history))
 
                 # Plot loss on log scale
-                if abs(gamma) % 20 == 0:
+                if abs(gamma) % 4 == 0:
                     ax.semilogy(epoch_nums, loss_history,
                                 color=colors[j % len(colors)],
                                 linestyle=linestyles[j % len(linestyles)],
-                                label=f"γ={gamma:.1f}")
+                                label=f"η={gamma:.1f}")
 
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
@@ -716,7 +704,7 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
     colors = [colormap(i / max_mode) for i in modes]
 
     for i, mode in enumerate(modes):
-        for gamma in [0.0]:  # Focus on γ=0 for clarity
+        for gamma in [0.0]:  # Focus on η=0 for clarity
             if mode in training_history and gamma in training_history[mode]:
                 loss_history = training_history[mode][gamma]['loss']
 
@@ -892,7 +880,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
     sampled_gammas = [g for g in gamma_values if g % 10 == 0]  # Every 10th gamma value
 
     for gamma in sampled_gammas:
-        gamma_labels.append(f"γ={gamma}")
+        gamma_labels.append(f"η={gamma}")
         row = []
         for mode in modes:
             if mode in epochs_history and gamma in epochs_history[mode]:
@@ -941,7 +929,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
         if epochs_for_gamma:
             plt.plot(valid_modes, epochs_for_gamma,
                      marker='o', linestyle='-', linewidth=2,
-                     label=f"γ={gamma}")
+                     label=f"η={gamma}")
 
     plt.xlabel("Mode Number", fontsize=14)
     plt.ylabel("Epochs Until Early Stopping", fontsize=14)
@@ -1028,11 +1016,11 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
 
         if current_loss <= tol or patience_counter >= patience:
             if verbose:
-                print(f"Regular PINN - Mode {mode}, γ={gamma}, stopped at epoch {epoch}, loss: {current_loss:.6f}")
+                print(f"Regular PINN - Mode {mode}, η={gamma}, stopped at epoch {epoch}, loss: {current_loss:.6f}")
             break
 
         if verbose and epoch % 500 == 0:
-            print(f"Regular PINN - Mode {mode}, γ={gamma}, Epoch {epoch}, Loss: {current_loss:.6f}")
+            print(f"Regular PINN - Mode {mode}, η={gamma}, Epoch {epoch}, Loss: {current_loss:.6f}")
 
     return model, normal_const
 
@@ -1060,7 +1048,7 @@ def train_curriculum_pinn(modes, gamma_values, p, X_train, lb, ub, layers, epoch
 
         for i, gamma in enumerate(sorted_gammas):
             if verbose:
-                print(f"  Training γ={gamma}")
+                print(f"  Training η={gamma}")
 
             # Initialize model
             model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
@@ -1324,7 +1312,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
 
 
 def save_regular_pinn_models(regular_models, regular_constants, modes, gamma_values, p, potential_type,
-                             save_dir="comparison_results"):
+                             save_dir="comparison_results_neg_int_strength"):
     """
     Save only the Regular PINN models.
     """
@@ -1366,7 +1354,7 @@ def save_regular_pinn_models(regular_models, regular_constants, modes, gamma_val
     return filename
 
 
-def load_regular_pinn_models(filename, save_dir="comparison_results"):
+def load_regular_pinn_models(filename, save_dir="comparison_results_neg_int_strength"):
     """
     Load only the Regular PINN models.
     """
@@ -1401,7 +1389,7 @@ def load_regular_pinn_models(filename, save_dir="comparison_results"):
 
 
 def save_curriculum_pinn_models(curriculum_models, curriculum_constants, modes, gamma_values, p, potential_type,
-                                save_dir="comparison_results"):
+                                save_dir="comparison_results_neg_int_strength"):
     """
     Save only the Curriculum PINN models.
     """
@@ -1443,7 +1431,7 @@ def save_curriculum_pinn_models(curriculum_models, curriculum_constants, modes, 
     return filename
 
 
-def load_curriculum_pinn_models(filename, save_dir="comparison_results"):
+def load_curriculum_pinn_models(filename, save_dir="comparison_results_neg_int_strength"):
     """
     Load only the Curriculum PINN models.
     """
@@ -1478,7 +1466,7 @@ def load_curriculum_pinn_models(filename, save_dir="comparison_results"):
 
 
 def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers, epochs,
-                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="harmonic",
+                                save_dir="comparison_results_neg_int_strength", tol=1e-5, perturb_const=0.01, potential_type="harmonic",
                                 force_retrain=False):
     """
     Train Regular PINNs or load from cache if available.
@@ -1510,7 +1498,7 @@ def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers,
     for mode in modes:
         regular_models[mode] = {}
         for gamma in gamma_values:
-            print(f"Training Regular PINN - Mode {mode}, γ={gamma}")
+            print(f"Training Regular PINN - Mode {mode}, η={gamma}")
             model, const = train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, tol=tol,
                                               perturb_const=perturb_const, verbose=False)
             regular_models[mode][gamma] = model
@@ -1524,7 +1512,7 @@ def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers,
 
 
 def train_or_load_curriculum_pinns(modes, gamma_values, p, X_train, lb, ub, layers, epochs,
-                                   save_dir="comparison_results", tol=1e-5, perturb_const=0.01,
+                                   save_dir="comparison_results_neg_int_strength", tol=1e-5, perturb_const=0.01,
                                    potential_type="harmonic",
                                    force_retrain=False):
     """
@@ -1563,7 +1551,7 @@ def train_or_load_curriculum_pinns(modes, gamma_values, p, X_train, lb, ub, laye
 
 
 def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, X_test, lb, ub, layers, epochs,
-                                               save_dir="comparison_results", tol=1e-5, perturb_const=0.01,
+                                               save_dir="comparison_results_neg_int_strength", tol=1e-5, perturb_const=0.01,
                                                force_retrain_regular=False, force_retrain_curriculum=False,
                                                potential_type="harmonic"):
     """
@@ -1645,7 +1633,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
                     'Abs Error': abs_err,
                     'Rel Error': rel_err
                 })
-                print(f"Regular PINN - Mode {mode}, γ={gamma} -> Abs Error: {abs_err:.2e}, Rel Error: {rel_err:.3f}%")
+                print(f"Regular PINN - Mode {mode}, η={gamma} -> Abs Error: {abs_err:.2e}, Rel Error: {rel_err:.3f}%")
 
     # Evaluate Curriculum PINNs
     print("Evaluating Curriculum PINNs...")
@@ -1663,7 +1651,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
                     'Abs Error': abs_err,
                     'Rel Error': rel_err
                 })
-                print(f"Curriculum - Mode {mode}, γ={gamma} -> Abs Error: {abs_err:.2e}, Rel Error: {rel_err:.3f}%")
+                print(f"Curriculum - Mode {mode}, η={gamma} -> Abs Error: {abs_err:.2e}, Rel Error: {rel_err:.3f}%")
 
     # Evaluate PL-PINNs
     print("Evaluating PL-PINNs...")
@@ -1681,7 +1669,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
                     'Abs Error': abs_err,
                     'Rel Error': rel_err
                 })
-                print(f"PL-PINN - Mode {mode}, γ={gamma} -> Abs Error: {abs_err:.2e}, Rel Error: {rel_err:.3f}%")
+                print(f"PL-PINN - Mode {mode}, η={gamma} -> Abs Error: {abs_err:.2e}, Rel Error: {rel_err:.3f}%")
 
     # Create DataFrame and continue with analysis
     df = pd.DataFrame(results)
@@ -1846,7 +1834,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
     return df, paper_style_data, best_results
 
 
-def plot_comparison_results(results_df, save_dir="comparison_results"):
+def plot_comparison_results(results_df, save_dir="comparison_results_neg_int_strength"):
     """
     Create visualization plots comparing the different methods.
     """
@@ -1998,9 +1986,9 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 5.0
+    alpha = 0.25
     # gamma_values = [k * alpha for k in range(201)]
-    gamma_values = [-k * alpha for k in range(9)]
+    gamma_values = [-k * alpha for k in range(81)]
 
     # Include modes 0 through 5
     modes = [0, 1, 2, 3, 4, 5]
@@ -2048,7 +2036,7 @@ if __name__ == "__main__":
         plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
                           potential_type, p_save_dir)
 
-        # Plot μ vs γ for all modes
+        # Plot λ vs η for all modes
         print("Generating chemical potential vs. gamma plot...")
         plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
 
@@ -2075,7 +2063,7 @@ if __name__ == "__main__":
             print(f"  Epochs per method: {comparison_epochs}")
 
             # Create comparison save directory
-            comparison_save_dir = f"comparison_results_p{p}_{potential_type}"
+            comparison_save_dir = f"comparison_results_neg_int_strength_p{p}_{potential_type}"
 
             # Run comparison with individual caching
             results_df, paper_results, best_results = create_comparison_table_individual_caching(

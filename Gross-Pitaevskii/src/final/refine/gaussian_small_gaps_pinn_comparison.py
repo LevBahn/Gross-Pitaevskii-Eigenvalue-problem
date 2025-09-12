@@ -490,12 +490,12 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
-                             label=f"γ={gamma:.1f}")
+                             label=f"η={gamma:.1f}")
 
         # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
         plt.xlabel("x", fontsize=18)
-        plt.ylabel(r"$\psi(x)$", fontsize=18)
+        plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
         plt.xlim(0, 1)
@@ -575,7 +575,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
         ax.set_xlabel("x", fontsize=12)
-        ax.set_ylabel(r"$\psi(x)$", fontsize=12)
+        ax.set_ylabel(r"$u(x)$", fontsize=12)
         ax.grid(True)
         ax.legend(fontsize=6)
         ax.set_xlim(0, 1)
@@ -614,8 +614,8 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
                  linestyle='-',
                  label=f"Mode {mode}")
 
-    plt.ylabel(r"$\gamma$ (Interaction Strength)", fontsize=18)
-    plt.xlabel(r"$\mu$ (Chemical Potential)", fontsize=18)
+    plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
+    plt.xlabel(r"$\lambda$ (Chemical Potential)", fontsize=18)
     plt.title(f"Chemical Potential vs. Interaction Strength for All Modes (p={p})", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
@@ -886,7 +886,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
                          markersize=4,
                          label=f"Mode {mode}")
 
-    plt.xlabel(r"$\gamma$ (Interaction Strength)", fontsize=14)
+    plt.xlabel(r"$\eta$ (Interaction Strength)", fontsize=14)
     plt.ylabel("Epochs Until Early Stopping", fontsize=14)
     plt.title("Training Efficiency: Epochs Until Convergence", fontsize=16)
     plt.grid(True, alpha=0.3)
@@ -907,7 +907,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
     sampled_gammas = [g for g in gamma_values if g % 10 == 0]  # Every 10th gamma value
 
     for gamma in sampled_gammas:
-        gamma_labels.append(f"γ={gamma}")
+        gamma_labels.append(f"η={gamma}")
         row = []
         for mode in modes:
             if mode in epochs_history and gamma in epochs_history[mode]:
@@ -923,7 +923,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
 
     plt.xticks(range(len(gamma_labels)), gamma_labels, rotation=45, ha='right')
     plt.yticks(range(len(mode_labels)), mode_labels)
-    plt.xlabel(r"$\gamma$ (Interaction Strength)", fontsize=14)
+    plt.xlabel(r"$\eta$ (Interaction Strength)", fontsize=14)
     plt.ylabel("Mode", fontsize=14)
     plt.title("Training Efficiency Heatmap", fontsize=16)
     cbar = plt.colorbar(im)
@@ -956,7 +956,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
         if epochs_for_gamma:
             plt.plot(valid_modes, epochs_for_gamma,
                      marker='o', linestyle='-', linewidth=2,
-                     label=f"γ={gamma}")
+                     label=f"η={gamma}")
 
     plt.xlabel("Mode Number", fontsize=14)
     plt.ylabel("Epochs Until Early Stopping", fontsize=14)
@@ -2298,11 +2298,10 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    # alpha = 2.0
-    alpha = 5.0
-    #gamma_values = [k * alpha for k in range(201)]
+    alpha = 0.5
+    gamma_values = [k * alpha for k in range(201)]
     # gamma_values = [k * alpha for k in range(51)]
-    gamma_values = [k * alpha for k in range(21)]
+    #gamma_values = [k * alpha for k in range(21)]
 
     # Include modes 0 through 5
     modes = [0]
@@ -2314,7 +2313,7 @@ if __name__ == "__main__":
     tol = 0.00001
 
     # Nonlinearity powers
-    nonlinearity_powers = [32]
+    nonlinearity_powers = [16]
 
     for p in nonlinearity_powers:
 
@@ -2322,7 +2321,7 @@ if __name__ == "__main__":
         potential_type = "gaussian"
 
         # Train neural network or load existing models
-        train_new = True  # Set to True to train, False to load
+        train_new = False  # Set to True to train, False to load
         filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
 
         # Create plotting and model saving directory
