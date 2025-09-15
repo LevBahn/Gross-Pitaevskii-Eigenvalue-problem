@@ -1212,6 +1212,9 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     loss_history = []
     improvement_window = 50
 
+    # Get the mode from the model object
+    mode = model.mode
+
     for epoch in range(epochs):
         optimizer.zero_grad()
 
@@ -2049,7 +2052,7 @@ if __name__ == "__main__":
         potential_type = "box"
 
         # Train neural network or load existing models
-        train_new = True  # Set to True to train, False to load
+        train_new = False  # Set to True to train, False to load
         filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
 
         # Create plotting and model saving directory
