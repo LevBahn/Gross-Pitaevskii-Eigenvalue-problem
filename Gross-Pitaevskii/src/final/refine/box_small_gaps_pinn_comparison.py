@@ -77,7 +77,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=1.0, use_residual=True):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=1.0, use_residual=True, use_perturbation=True):
         """
         Parameters
         ----------
@@ -93,6 +93,9 @@ class GrossPitaevskiiPINN(nn.Module):
             Interaction strength parameter.
         L : float, optional
             Length of the box (default is 1.0).
+        use_perturbation: boolean, optional
+            Get the complete solution by combining the base solution with the neural network perturbation. Default is
+            True.
         """
         super().__init__()
         self.layers = layers
@@ -103,6 +106,7 @@ class GrossPitaevskiiPINN(nn.Module):
         self.mode = mode  # Mode number (n)
         self.gamma = gamma  # Interaction strength parameter
         self.L = L  # Length of the box
+        self.use_perturbation = use_perturbation  # Combine the base solution with the neural network perturbation
 
         # Now build the network after all attributes are set
         self.network = self.build_network()
@@ -189,8 +193,11 @@ class GrossPitaevskiiPINN(nn.Module):
         Compute the PDE loss for the Gross-Pitaevskii equation.
         μψ = - ∇²ψ + Vψ + γ|ψ|²ψ
         """
-        # Get the complete solution (base + perturbation)
-        u = self.get_complete_solution(inputs, predictions)
+        # Get the complete solution (base + perturbation) for PL-PINN. Else, use the neural network predicton
+        if self.use_perturbation:
+            u = self.get_complete_solution(inputs, predictions)  # PL-PINN algorithm
+        else:
+            u = predictions  # Vanilla PINN / Curriculum learning
 
         # Compute derivatives with respect to x
         u_x = torch.autograd.grad(
@@ -238,7 +245,13 @@ class GrossPitaevskiiPINN(nn.Module):
         Compute the boundary loss for the boundary conditions.
         """
         u_pred = self.forward(boundary_points)
-        full_u = self.get_complete_solution(boundary_points, u_pred)
+
+        # Get the complete solution (base + perturbation) for PL-PINN. Else, use the neural network predicton
+        if self.use_perturbation:
+            full_u = self.get_complete_solution(boundary_points, u_pred)  # PL-PINN algorithm
+        else:
+            full_u = u_pred  # Vanilla PINN / Curriculum learning
+
         return torch.mean((full_u - boundary_values) ** 2)
 
     def normalization_loss(self, u, dx):
@@ -659,6 +672,61 @@ def advanced_initialization(m, mode):
             m.bias.data.fill_(0.01)
 
 
+def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, verbose=True):
+    """Pre-train network to output the analytical eigenfunction for a particle in a box."""
+    model.train()
+    X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
+
+    with torch.no_grad():
+        analytical_target = model.box_eigenfunction(X_tensor.squeeze(), mode).unsqueeze(-1).detach()
+
+    # Use both Adam and LBFGS for better convergence
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    closure = None  # Define closure outside the loop
+
+    for epoch in range(epochs):
+        if epoch < epochs - 500:
+            # Adam phase
+            optimizer.zero_grad()
+            prediction = model.forward(X_tensor)
+            loss = torch.mean((prediction - analytical_target) ** 2)
+            loss.backward()
+            optimizer.step()
+        else:
+            # Switch to LBFGS for final refinement
+            if epoch == epochs - 500:
+                optimizer = torch.optim.LBFGS(model.parameters(), lr=lr * 0.1, max_iter=20)
+
+                def closure():
+                    optimizer.zero_grad()
+                    pred = model.forward(X_tensor)
+                    l = torch.mean((pred - analytical_target) ** 2)
+                    l.backward()
+                    return l
+
+                if verbose:
+                    print(f"  Switching to LBFGS at epoch {epoch}")
+
+            # LBFGS phase
+            loss = optimizer.step(closure)
+
+        # Logging
+        if verbose and epoch % 500 == 0:
+            print(f"  Pre-training epoch {epoch}, loss: {loss.item():.2e}")
+
+        # Early stopping
+        if loss.item() < 1e-12:
+            if verbose:
+                print(f"  Pre-training converged at epoch {epoch}, loss: {loss.item():.2e}")
+            break
+
+    if verbose:
+        print(f"  Pre-training finished, final loss: {loss.item():.2e}")
+
+    return model
+
+
 def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type,
                               save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
@@ -1017,8 +1085,15 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
     # Initialize model
-    model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L).to(device)
-    model.apply(lambda m: advanced_initialization(m, mode))
+    model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L, use_perturbation=False).to(device)
+
+    # Key change: Pre-train on analytical solution for gamma=0
+    if gamma == 0.0:
+        if verbose:
+            print(f"    Pre-training Regular PINN on analytical solution for mode {mode}")
+        model = pretrain_on_analytical_solution(model, mode, X_train, epochs=2000, lr=1e-3, verbose=verbose)
+    else:
+        model.apply(lambda m: advanced_initialization(m, mode))
 
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -1079,7 +1154,7 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
 def train_curriculum_pinn(modes, gamma_values, p, X_train, lb, ub, layers, epochs, lr=1e-3, tol=1e-5,
                           perturb_const=0.01, verbose=False):
     """
-    Improved curriculum learning approach with better transfer strategies and epoch allocation.
+    Curriculum learning with analytical initialization at gamma=0.
     """
     models_by_mode = {}
     constants_by_mode = {}
@@ -1089,73 +1164,61 @@ def train_curriculum_pinn(modes, gamma_values, p, X_train, lb, ub, layers, epoch
 
     for mode in modes:
         if verbose:
-            print(f"Training improved curriculum for mode {mode}")
+            print(f"Training curriculum for mode {mode}")
 
         models_by_gamma = {}
         prev_model = None
-
-        # Adaptive epoch allocation - give more epochs to harder problems
-        total_epochs_for_mode = epochs * len(sorted_gammas)  # Same total as training each separately
 
         for i, gamma in enumerate(sorted_gammas):
             if verbose:
                 print(f"  Training γ={gamma}")
 
             # Initialize model
-            L = ub
-            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L).to(device)
+            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, use_perturbation=False).to(device)
 
-            if prev_model is not None and i > 0:
-                # Transfer Learning
+            if i == 0 and gamma == 0.0:
+                # Key change: Start with analytical initialization for gamma=0
+                if verbose:
+                    print(f"    Pre-training Curriculum PINN on analytical solution for mode {mode}")
+                model = pretrain_on_analytical_solution(model, mode, X_train, epochs=2000, lr=1e-3, verbose=verbose)
+            elif prev_model is not None and i > 0:
+                # Transfer Learning from previous model
                 prev_state = prev_model.state_dict()
                 model_state = model.state_dict()
 
-                # Strategy 1: Full network transfer with adaptive strength
-                # Higher transfer strength for similar problems (small gamma increments)
-                gamma_increment = gamma - sorted_gammas[i - 1]
-                max_increment = max([sorted_gammas[j] - sorted_gammas[j - 1] for j in range(1, len(sorted_gammas))])
+                # Full network transfer with adaptive strength
+                transfer_strength = 0.95
 
-                # Stronger transfer for smaller increments
-                transfer_strength = 0.9 - 0.4 * (gamma_increment / max_increment)
-                transfer_strength = max(0.5, transfer_strength)  # Minimum 50% transfer
-
-                # Transfer all layers, not just first two
+                # Transfer all layers
                 for layer_name in model_state.keys():
                     if layer_name in prev_state:
                         model_state[layer_name] = (transfer_strength * prev_state[layer_name] +
                                                    (1 - transfer_strength) * model_state[layer_name])
 
                 model.load_state_dict(model_state)
-
-                if verbose:
-                    print(f"    Applied full transfer with strength {transfer_strength:.2f}")
-
-                # Strategy 2: Use warm-start with lower learning rate initially
                 initial_lr = lr * 0.1  # Start with lower LR for transferred model
-
             else:
-                # First gamma: use normal initialization
+                # Use normal initialization
                 model.apply(lambda m: advanced_initialization(m, mode))
                 initial_lr = lr
 
-            # Give more epochs to later (harder) gamma values
+            # Adaptive epoch allocation
             if i == 0:
-                epochs_for_this_gamma = epochs // 2  # Less for easy case
+                epochs_for_this_gamma = epochs // 2
             else:
-                # Distribute remaining epochs among harder cases
                 remaining_epochs = epochs - (epochs // 2)
                 remaining_gammas = len(sorted_gammas) - 1
                 epochs_for_this_gamma = int(remaining_epochs / remaining_gammas * (1.0 + 0.2 * i))
 
-            epochs_for_this_gamma = min(epochs_for_this_gamma, epochs)  # Cap at max epochs
+            epochs_for_this_gamma = min(epochs_for_this_gamma, epochs)
 
             if verbose:
                 print(f"    Allocated {epochs_for_this_gamma} epochs")
 
             model, const = train_single_model(
                 model, gamma, p, X_train, lb, ub,
-                epochs_for_this_gamma, initial_lr, lr, tol, perturb_const,
-                verbose=False, use_warmstart=(prev_model is not None)
+                epochs_for_this_gamma, initial_lr if i > 0 else lr, lr, tol, perturb_const,
+                verbose=False, use_warmstart=(prev_model is not None and i > 0)
             )
 
             models_by_gamma[gamma] = model
@@ -1176,7 +1239,6 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    L = ub
     boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
@@ -1212,25 +1274,16 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     loss_history = []
     improvement_window = 50
 
-    # Get the mode from the model object
-    mode = model.mode
-
     for epoch in range(epochs):
         optimizer.zero_grad()
 
         # Forward pass
         u_pred = model.forward(X_tensor)
 
-        # Scale perturbation
-        if epoch == 0:
-            normal_const = torch.max(u_pred).detach().clone()
-        u_pred = perturb_const * u_pred / normal_const
-
         # Calculate losses
         boundary_loss = model.boundary_loss(boundary_points, boundary_values)
-        norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
-        norm_weight = 20.0 * (1 + 0.5 * mode)  # Stronger normalization for higher modes
-        constraint_loss = 10.0 * boundary_loss + norm_weight * norm_loss
+        norm_loss = model.normalization_loss(u_pred, dx)
+        constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
         pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "box")
         total_loss = pde_loss + constraint_loss
@@ -1306,10 +1359,15 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
     dx = X_test[1, 0] - X_test[0, 0]
 
     with torch.no_grad():
-        # All methods use the same approach for evaluation
-        u_pred = model.forward(X_tensor)
-        u_pred = u_pred * (perturb_const / constant)
-        full_u = model.get_complete_solution(X_tensor, u_pred)
+        if method_name == "PL-PINN":
+            # Perturbative approach
+            u_pred = model.forward(X_tensor)
+            u_pred = u_pred * (perturb_const / constant)
+            full_u = model.get_complete_solution(X_tensor, u_pred)
+        else:
+            # Use the network output as the solution
+            full_u = model.forward(X_tensor)
+
         u_np = full_u.cpu().numpy().flatten()
 
         # Normalize the solution
@@ -1330,9 +1388,12 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
         # For cases without analytical solution, compute PDE residual as quality metric
         X_tensor_eval = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
 
-        u_pred_eval = model.forward(X_tensor_eval)
-        u_pred_eval = u_pred_eval * (perturb_const / constant)
-        u_eval = model.get_complete_solution(X_tensor_eval, u_pred_eval)
+        if method_name == "PL-PINN":
+            u_pred_eval = model.forward(X_tensor_eval)
+            u_pred_eval = u_pred_eval * (perturb_const / constant)
+            u_eval = model.get_complete_solution(X_tensor_eval, u_pred_eval)
+        else:
+            u_eval = model.forward(X_tensor_eval)
 
         # Compute PDE residual
         u_x = torch.autograd.grad(u_eval, X_tensor_eval, torch.ones_like(u_eval),
@@ -1351,7 +1412,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
         pde_loss = torch.mean(residual ** 2)
 
         abs_error = pde_loss.item()
-        rel_error = abs_error * 100  # Convert to percentage-like metric
+        rel_error = abs_error * 100
 
     return abs_error, rel_error
 
@@ -1422,7 +1483,8 @@ def load_regular_pinn_models(filename, save_dir="comparison_results"):
                 hbar=model_data['hbar'],
                 m=model_data['m'],
                 mode=model_data['mode'],
-                gamma=model_data['gamma']
+                gamma=model_data['gamma'],
+                use_perturbation=False
             ).to(device)
             model.load_state_dict(model_data['state_dict'])
             model.eval()
@@ -1499,7 +1561,8 @@ def load_curriculum_pinn_models(filename, save_dir="comparison_results"):
                 hbar=model_data['hbar'],
                 m=model_data['m'],
                 mode=model_data['mode'],
-                gamma=model_data['gamma']
+                gamma=model_data['gamma'],
+                use_perturbation=False
             ).to(device)
             model.load_state_dict(model_data['state_dict'])
             model.eval()
@@ -1545,7 +1608,7 @@ def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers,
         for gamma in gamma_values:
             print(f"Training Regular PINN - Mode {mode}, γ={gamma}")
             model, const = train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, tol=tol,
-                                              perturb_const=perturb_const, verbose=False)
+                                              perturb_const=perturb_const, verbose=True)
             regular_models[mode][gamma] = model
             regular_constants[mode] = const
 
@@ -2030,7 +2093,7 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 0.25
+    alpha = 0.5
     gamma_values = [k * alpha for k in range(401)]
     #gamma_values = [k * alpha for k in range(51)]
 
@@ -2112,8 +2175,8 @@ if __name__ == "__main__":
                 comparison_modes, comparison_gammas, p, X, X_test, lb, ub, layers,
                 comparison_epochs, save_dir=comparison_save_dir, tol=tol,
                 perturb_const=perturb_const,
-                force_retrain_regular=False,  # Set to True to retrain Regular PINNs
-                force_retrain_curriculum=False,  # Set to True to retrain Curriculum PINNs
+                force_retrain_regular=True,  # Set to True to retrain Regular PINNs
+                force_retrain_curriculum=True,  # Set to True to retrain Curriculum PINNs
                 potential_type=potential_type
             )
 
