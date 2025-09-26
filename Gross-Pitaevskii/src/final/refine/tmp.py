@@ -38,178 +38,127 @@ plot_params = {
 plt.rcParams.update(plot_params)
 
 
-class ImprovedResidualBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.lin1 = nn.Linear(dim, dim)
-        self.lin2 = nn.Linear(dim, dim)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.activation = nn.GELU()
-
-    def forward(self, x):
-        identity = x
-        out = self.activation(self.norm1(self.lin1(x)))
-        out = self.norm2(self.lin2(out))
-        return self.activation(out + identity)
-
-
-class SineActivation(nn.Module):
-    def __init__(self, w0=1.0):
-        super().__init__()
-        self.w0 = w0
-
-    def forward(self, x):
-        return torch.sin(self.w0 * x)
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.lin1 = nn.Linear(dim, dim)
-        self.lin2 = nn.Linear(dim, dim)
-        self.activation = SineActivation()
-
-    def forward(self, x):
-        identity = x
-        out = self.activation(self.lin1(x))
-        out = self.lin2(out)
-        return self.activation(out + identity)
-
-
-class SiLUResidualBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.lin1 = nn.Linear(dim, dim)
-        self.lin2 = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        identity = x
-        out = torch.nn.functional.silu(self.lin1(x))
-        out = self.lin2(out)
-        return torch.nn.functional.silu(out + identity)
-
-
 class GrossPitaevskiiPINN(nn.Module):
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=1.0, use_residual=True):
+    """
+    Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
+    """
+
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, use_perturbation=True):
+        """
+        Parameters
+        ----------
+        layers : list of int
+            Neural network architecture, each entry defines the number of neurons in that layer.
+        hbar : float, optional
+            Reduced Planck's constant (default is 1.0).
+        m : float, optional
+            Mass of the particle (default is 1.0).
+        mode : int, optional
+            Mode number (default is 0).
+        gamma : float, optional
+            Interaction strength parameter.
+        use_perturbation: boolean, optional
+            Get the complete solution by combining the base solution with the neural network perturbation. Default is
+            True.
+        """
         super().__init__()
         self.layers = layers
-        self.use_residual = use_residual
-        self.hbar = hbar
-        self.m = m
-        self.mode = mode
-        self.gamma = gamma
-        self.L = L
+        self.network = self.build_network()
+        self.hbar = hbar  # Planck's constant, fixed
+        self.m = m  # Particle mass, fixed
+        self.mode = mode  # Mode number (n)
+        self.gamma = gamma  # Interaction strength parameter
+        self.use_perturbation = use_perturbation # Combine the base solution with the neural network perturbation
 
-        # Add Fourier features for better representation
-        self.fourier_scale = 10.0 * (mode + 1)  # Scale with mode number
-        fourier_dim = 64  # Number of Fourier features
-        self.register_buffer('B', torch.randn(fourier_dim, 1) * self.fourier_scale)
+    def build_network(self):
+        """
+        Build the neural network with tanh activation functions between layers.
+        """
+        layers = []
+        for i in range(len(self.layers) - 1):
+            layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
+            if i < len(self.layers) - 2:
+                layers.append(nn.Tanh())
+        return nn.Sequential(*layers)
 
-        # Modify first layer to accept Fourier features
-        modified_layers = [2 * fourier_dim] + layers[1:]  # 2*fourier_dim for sin+cos
-        self.network = self.build_network(modified_layers)
+    def weighted_hermite(self, x: torch.Tensor, n: int) -> torch.Tensor:
 
-        # Learnable chemical potential for better optimization
-        initial_mu = 10.0 * (mode + 1) ** 2  # Better initial guess
-        self.chemical_potential = nn.Parameter(torch.tensor(initial_mu))
+        fact_n = float(math.factorial(n))
+        norm_factor = ((2.0 ** n) * fact_n * math.sqrt(math.pi)) ** (-0.5)
 
-    def fourier_features(self, x):
-        """Apply Fourier feature mapping"""
-        x_proj = 2 * np.pi * x @ self.B.T
-        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-
-    def build_network(self, layers):
-        """Build network with better activations and normalization"""
-        if not self.use_residual:
-            modules = []
-            for i in range(len(layers) - 1):
-                modules.append(nn.Linear(layers[i], layers[i + 1]))
-                if i < len(layers) - 2:
-                    # Use GELU instead of SiLU/Sine for better smoothness
-                    modules.append(nn.GELU())
-                    # Add layer normalization for stability
-                    if i > 0:  # Skip normalization on first layer
-                        modules.append(nn.LayerNorm(layers[i + 1]))
-            return nn.Sequential(*modules)
+        # Build H_n(x) via recurrence in torch:
+        # If n = 0 --> H_0(x) = 1
+        #    n = 1 --> H_1(x) = 2 x
+        #    n >= 2: H_k = 2 x H_{k-1} - 2(k-1) H_{k-2}
+        if n == 0:
+            Hn = torch.ones_like(x)
+        elif n == 1:
+            Hn = 2.0 * x
         else:
-            # Keep your existing residual structure but improve it
-            modules = []
-            input_dim = layers[0]
-            hidden_dim = layers[1]
-            modules.append(nn.Linear(input_dim, hidden_dim))
-            modules.append(nn.GELU())  # Better than SiLU/Sine
+            Hnm2 = torch.ones_like(x)  # H_0(x)
+            Hnm1 = 2.0 * x  # H_1(x)
+            for k in range(1, n):
+                # k runs from 1 to n-1; when k=1: compute H_2 = 2 x H_1 - 2*1*H_0, etc.
+                Hn = 2.0 * x * Hnm1 - 2.0 * float(k) * Hnm2
+                Hnm2, Hnm1 = Hnm1, Hn  # shift: H_{k-1} <- H_k, H_k <- H_{k+1}
 
-            num_res_blocks = len(layers) - 3
-            for _ in range(num_res_blocks):
-                modules.append(ImprovedResidualBlock(hidden_dim))
+        weight = torch.exp(-0.5 * x ** 2)
 
-            modules.append(nn.Linear(hidden_dim, layers[-1]))
-            return nn.Sequential(*modules)
+        # Combine with the normalization factor:
+        return torch.tensor(norm_factor, dtype=x.dtype, device=x.device) * (Hn * weight)
 
     def forward(self, inputs):
-        """Forward pass with Fourier features"""
-        # Apply Fourier feature mapping
-        fourier_x = self.fourier_features(inputs)
-        return self.network(fourier_x)
-
-    def box_eigenfunction(self, x, n):
         """
-        Compute the analytic eigenfunction for a particle in a box.
-        For the linear case (gamma = 0), the solution is:
-        phi_n(x) = sqrt(2/L) * sin(n*pi*x/L)
+        Forward pass through the neural network.
         """
-        # For mode 0, n=1 in the sine function per equation (22)
-        n_actual = n + 1  # Convert mode number to quantum number
+        return self.network(inputs)
 
-        # Normalization factor
-        norm_factor = torch.sqrt(torch.tensor(2.0 / self.L))
+    def get_complete_solution(self, x, perturbation, mode=None):
+        """
+        Get the complete solution by combining the base Hermite solution with the neural network perturbation.
+        """
+        if mode is None:
+            mode = self.mode
+        base_solution = self.weighted_hermite(x, mode)
+        return base_solution + perturbation
 
-        # Sine function with proper scaling
-        phi_n = norm_factor * torch.sin(n_actual * torch.pi * x / self.L)
-
-        return phi_n
-
-    def compute_potential(self, x, potential_type="box", **kwargs):
+    def compute_potential(self, x, potential_type="harmonic", **kwargs):
         """
         Compute potential function for the 1D domain.
         """
-        if potential_type == "box":
-            V = torch.zeros_like(x)
+        if potential_type == "harmonic":
+            V = x ** 2
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
         return V
 
-    def distance_function(self, x):
-        """Hard boundary condition enforcement"""
-        # For box: ensures u(0) = u(1) = 0
-        return x * (1 - x)
-
-    def get_complete_solution(self, x, perturbation, mode=None):
-        """Get complete solution with hard boundary enforcement"""
-        if mode is None:
-            mode = self.mode
-
-        base_solution = self.box_eigenfunction(x, mode)
-
-        # Apply distance function for hard boundary conditions
-        constrained_perturbation = self.distance_function(x) * perturbation
-
-        # Better mixing strategy
-        if mode >= 3:
-            base_weight = 0.3  # Reduced base weight for higher modes
-            return base_weight * base_solution + constrained_perturbation
+    def pde_loss(self, inputs, predictions, gamma, p, potential_type="harmonic", precomputed_potential=None):
+        """
+        Compute the PDE loss for the Gross-Pitaevskii equation.
+        μψ = - ∇²ψ + Vψ + γ|ψ|²ψ
+        """
+        # Get the complete solution (base + perturbation) for PL-PINN. Else, use the neural network predicton
+        if self.use_perturbation:
+            u = self.get_complete_solution(inputs, predictions) # PL-PINN algorithm
         else:
-            return base_solution + constrained_perturbation
+            u = predictions # Vanilla PINN / Curriculum learning
 
-    def pde_loss(self, inputs, predictions, gamma, p, potential_type="box", precomputed_potential=None):
-        """Improved PDE loss with learnable chemical potential"""
-        # Get the complete solution (base + perturbation)
-        u = self.get_complete_solution(inputs, predictions)
+        # Compute derivatives with respect to x
+        u_x = torch.autograd.grad(
+            outputs=u,
+            inputs=inputs,
+            grad_outputs=torch.ones_like(u),
+            create_graph=True,
+            retain_graph=True
+        )[0]
 
-        # Compute derivatives
-        u_x = torch.autograd.grad(u, inputs, torch.ones_like(u), create_graph=True, retain_graph=True)[0]
-        u_xx = torch.autograd.grad(u_x, inputs, torch.ones_like(u_x), create_graph=True, retain_graph=True)[0]
+        u_xx = torch.autograd.grad(
+            outputs=u_x,
+            inputs=inputs,
+            grad_outputs=torch.ones_like(u_x),
+            create_graph=True,
+            retain_graph=True
+        )[0]
 
         # Compute potential
         if precomputed_potential is not None:
@@ -217,75 +166,103 @@ class GrossPitaevskiiPINN(nn.Module):
         else:
             V = self.compute_potential(inputs, potential_type)
 
-        # GPE terms
+        # Calculate chemical potential
         kinetic = -u_xx
         potential = V * u
-        interaction = gamma * torch.abs(u) ** (p - 1) * u
+        # interaction = gamma * u ** 3
+        interaction = gamma * u ** p
 
-        # Use learnable chemical potential instead of Rayleigh quotient
-        pde_residual = kinetic + potential + interaction - self.chemical_potential * u
+        numerator = torch.mean(u * (kinetic + potential + interaction))
+        denominator = torch.mean(u ** 2)
+        lambda_pde = numerator / denominator
+
+        # Residual of the 1D Gross-Pitaevskii equation
+        pde_residual = kinetic + potential + interaction - lambda_pde * u
+
+        # PDE loss (mean squared residual)
         pde_loss = torch.mean(pde_residual ** 2)
 
-        return pde_loss, self.chemical_potential
+        return pde_loss, lambda_pde
 
     def boundary_loss(self, boundary_points, boundary_values):
-        """This should return near zero with distance function"""
+        """
+        Compute the boundary loss for the boundary conditions.
+        """
         u_pred = self.forward(boundary_points)
-        # Use the unconstrained prediction to check boundary enforcement
-        full_u = self.get_complete_solution(boundary_points, u_pred)
+
+        # Get the complete solution (base + perturbation) for PL-PINN. Else, use the neural network predicton
+        if self.use_perturbation:
+            full_u = self.get_complete_solution(boundary_points, u_pred)  # PL-PINN algorithm
+        else:
+            full_u = u_pred # Vanilla PINN / Curriculum learning
+
         return torch.mean((full_u - boundary_values) ** 2)
 
     def normalization_loss(self, u, dx):
-        """Improved normalization with better numerical integration"""
+        """
+        Compute normalization loss using proper numerical integration.
+        """
         integral = torch.sum(u ** 2) * dx
         return (integral - 1.0) ** 2
 
 
 def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
-                    epochs, tol, perturb_const,
-                    potential_type='box', lr=1e-5, verbose=True):
+                       epochs, tol, perturb_const, potential_type='harmonic',
+                       lr=1e-3, verbose=True):
     """
-    Train the GPE model for different modes and gamma values for the PL-PINN implementation.
+    Pure PL-PINN implementation following the paper's Algorithm 1 exactly.
 
-    Parameters:
-    -----------
-    gamma_values : list of float
-        List of interaction strengths to train models for
-    modes : list of int
-        List of modes to train (0, 1, 2, 3, etc.)
+    Key differences from hybrid approach:
+    1. Single neural network per mode trained across ALL gamma values sequentially
+    2. No model copying - weights evolve continuously through parameter space
+    3. Network always outputs small perturbations, never full solutions
+    4. Relies on continuous dependence of loss landscape on parameters
+
+    Parameters
+    ----------
+    gamma_values : list
+        Interaction strength values to train on (η in paper notation)
+    modes : list
+        Mode numbers to compute (0, 1, 2, ...)
     p : int
-        Parameter for nonlinearity power
-    X_train : numpy.ndarray
-        Training points array
+        Nonlinearity power in |u|^(p-1)u term
+    X_train : ndarray
+        Training collocation points
     lb, ub : float
-        Lower and upper boundaries of the domain
-    layers : list of int
-        Network architecture
+        Domain boundaries
+    layers : list
+        Neural network architecture
     epochs : int
-        Number of training epochs
-    potential_type : str
-        Type of potential ('harmonic', 'box', 'gaussian', etc.)
+        Total epochs per gamma value
     tol : float
-        The desired tolerance for early stopping
+        Convergence tolerance
     perturb_const : float
-        A small constant representing the perturbation parameter
+        Perturbation scaling constant (δ in paper)
+    potential_type : str
+        Type of potential ('harmonic', 'box', etc.)
     lr : float
         Learning rate
     verbose : bool
-        Whether to print training progress
+        Print training progress
 
-    Returns:
-    --------
-    tuple: (models_by_mode, mu_table, training_history)
-        Trained models organized by mode and gamma, chemical potential values, and training histories
+    Returns
+    -------
+    models_by_mode : dict
+        Single trained model per mode (not per gamma!)
+    mu_table : dict
+        Chemical potential values
+    training_history : dict
+        Training loss history
+    constant_history : dict
+        Normalization constants
+    epochs_history : dict
+        Epochs until convergence per gamma
     """
-    # Convert training data to tensors
-    # Convert training data to tensors
+
     dx = X_train[1, 0] - X_train[0, 0]
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    L = ub
     boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
@@ -295,116 +272,99 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
     constant_history = {}
     epochs_history = {}
 
-    gamma_values = sorted(gamma_values)
-    print(f"Tolerance : {tol}, Perturbation constant : {perturb_const}")
+    # Sort gamma values for proper curriculum (paper's parameter discretization)
+    sorted_gammas = sorted(gamma_values)
 
     for mode in modes:
-        layers = get_architecture_for_mode(mode)
         if verbose:
-            print(f"\n===== Training for mode {mode} =====")
+            print(f"\n===== Pure PL-PINN Training for Mode {mode} =====")
 
+        # Initialize ONE model for this mode (will be trained across all gammas)
+        model = GrossPitaevskiiPINN(layers, mode=mode, use_perturbation=True).to(device)
+        model.apply(lambda m: advanced_initialization(m, mode))
+
+        # Step 1: Pre-train on analytical solution for γ=0 (paper's v = u(p₀))
+        if verbose:
+            print(f"Pre-training on analytical solution (γ=0) for mode {mode}")
+        model = pretrain_on_analytical_solution(model, mode, X_train, epochs=2000, lr=1e-3, verbose=verbose)
+
+        # Step 2: Force initial perturbation to be small (paper's ψ ← δ ψ/||ψ||_L2)
+        with torch.no_grad():
+            # Get initial network output
+            u_initial = model.forward(X_tensor)
+            # Compute L2 norm for normalization
+            l2_norm = torch.sqrt(torch.mean(u_initial ** 2) * dx)
+            # Store normalization constant
+            if l2_norm > 0:
+                normal_const = l2_norm.detach().clone()
+            else:
+                normal_const = torch.tensor(1.0).to(device)
+            constant_history[mode] = normal_const
+
+        # Initialize optimizer (same optimizer used throughout all gammas)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=200, T_mult=2, eta_min=1e-6)
+
+        # Track results for this mode across all gammas
         mu_logs = []
-        models_by_gamma = {}
         history_by_gamma = {}
         epochs_by_gamma = {}
-        prev_model = None
+        models_by_gamma = {}  # Store model states at each gamma
 
-        for gamma in gamma_values:
+        # Step 3: Sequential training through parameter space (paper's main loop)
+        for i, gamma in enumerate(sorted_gammas):
             if verbose:
-                print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}")
+                print(f"\nTraining same network for γ = {gamma:.2f}, mode = {mode}")
 
-            # Initialize model
-            if mode >= 3:
-                model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L, use_residual=False).to(device)
-            else:
-                model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L, use_residual=True).to(device)
-
-            # Transfer learning from previous gamma
-            if prev_model is not None:
-                # Only transfer the network weights, not the chemical potential
-                prev_state = prev_model.state_dict()
-                current_state = model.state_dict()
-
-                for key in current_state.keys():
-                    if key != 'chemical_potential' and key in prev_state:
-                        current_state[key] = 0.8 * prev_state[key] + 0.2 * current_state[key]
-
-                model.load_state_dict(current_state)
-            else:
-                model.apply(lambda m: improved_initialization(m, mode))
-
-            # Separate optimizers for network and chemical potential
-            network_params = [p for name, p in model.named_parameters() if 'chemical_potential' not in name]
-            mu_params = [model.chemical_potential]
-
-            mode_lr = lr / (1 + 0.1 * mode)  # Slightly reduce LR for higher modes
-            optimizer = torch.optim.AdamW(network_params, lr=mode_lr, weight_decay=1e-4)
-            mu_optimizer = torch.optim.AdamW(mu_params, lr=mode_lr * 5)  # Higher LR for mu
-
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=500, verbose=False)
-
-            # Training loop with improved loss weighting
+            # Training loop for current gamma (paper's minimize L(p^k, ψ))
             lambda_history = []
             loss_history = []
             constraint_history = []
+
+            # Early stopping variables
             best_loss = float('inf')
-            best_model_state = None
             patience_counter = 0
             patience = 2000
-            final_epoch = epochs
 
             for epoch in range(epochs):
                 optimizer.zero_grad()
-                mu_optimizer.zero_grad()
 
-                # Forward pass
-                u_pred = model.forward(X_tensor)
-                if gamma == 0 and epoch == 0:
-                    normal_const = torch.max(torch.abs(u_pred)).detach().clone()
-                    constant_history[mode] = normal_const
+                # Forward pass - network outputs perturbation
+                u_perturbation = model.forward(X_tensor)
 
-                u_pred = perturb_const * u_pred / constant_history[mode]
+                # Scale perturbation to keep it small (paper's δ scaling)
+                u_perturbation = perturb_const * u_perturbation / normal_const
 
-                # Calculate losses with adaptive weighting
+                # Get complete solution: u = v + ψ (paper's key equation)
+                # This is the core of PL-PINN: base solution + small perturbation
+                full_solution = model.get_complete_solution(X_tensor, u_perturbation)
+
+                # Compute constraint losses
                 boundary_loss = model.boundary_loss(boundary_points, boundary_values)
-                norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
-                pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, potential_type)
+                norm_loss = model.normalization_loss(full_solution, dx)
+                constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
-                # Adaptive loss weighting based on training progress
-                if epoch < epochs // 4:  # Early training: focus on constraints
-                    boundary_weight = 1000.0 * (1 + mode)
-                    norm_weight = 100.0 * (1 + mode)
-                    physics_weight = 0.1
-                elif epoch < epochs // 2:  # Mid training: balance
-                    boundary_weight = 100.0 * (1 + mode)
-                    norm_weight = 50.0 * (1 + mode)
-                    physics_weight = 1.0
-                else:  # Late training: focus on physics
-                    boundary_weight = 10.0 * (1 + mode)
-                    norm_weight = 10.0 * (1 + mode)
-                    physics_weight = 10.0
+                # PDE residual loss L(p^k, ψ) where p^k = γ
+                pde_loss, lambda_value = model.pde_loss(X_tensor, u_perturbation, gamma, p, potential_type)
 
-                constraint_loss = boundary_weight * boundary_loss + norm_weight * norm_loss
-                total_loss = physics_weight * pde_loss + constraint_loss
+                # Total loss for this parameter value
+                total_loss = pde_loss + constraint_loss
 
-                # Backpropagate
+                # Backpropagate and update SAME network
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # Stricter clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                mu_optimizer.step()
                 scheduler.step(total_loss)
 
-                # Record and early stopping logic
+                # Early stopping logic
                 current_loss = total_loss.item()
-
                 if current_loss < best_loss:
                     best_loss = current_loss
-                    best_model_state = model.state_dict().copy()
                     patience_counter = 0
                 else:
                     patience_counter += 1
 
+                # Record history
                 if epoch % 10 == 0:
                     loss_history.append(current_loss)
 
@@ -413,46 +373,42 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                     constraint_history.append(constraint_loss.item())
 
                     if verbose and epoch % 500 == 0:
-                        print(f"Epoch {epoch}, μ: {lambda_value.item():.4f}")
-                        print(f"Total Loss: {current_loss:.6f}, PDE: {pde_loss.item():.6f}, "
-                              f"Constraints: {constraint_loss.item():.6f}")
+                        print(f"  Epoch {epoch}, γ={gamma:.2f}, μ: {lambda_value.item():.4f}, Loss: {current_loss:.6f}")
 
-                # Early stopping
-                if current_loss <= tol:
+                # Early stopping or tolerance reached
+                if current_loss <= tol or patience_counter >= patience:
                     if verbose:
-                        print(f"Early stop: tolerance reached at epoch {epoch}, loss: {current_loss}")
-                    final_epoch = epoch
+                        print(f"  Converged at epoch {epoch}, loss: {current_loss:.6f}")
                     break
 
-                if patience_counter >= patience:
-                    if verbose:
-                        print(
-                            f"Early stop: no improvement for {patience} epochs at epoch {epoch}, best loss: {best_loss}")
-                    final_epoch = epoch
-                    break
-
-            # Load best model
-            if best_model_state is not None:
-                model.load_state_dict(best_model_state)
-
-            # Save results
-            final_mu = lambda_history[-1] if lambda_history else 0
+            # Store results for this gamma
+            final_mu = lambda_history[-1] if lambda_history else lambda_value.item()
             mu_logs.append((gamma, final_mu))
-            models_by_gamma[gamma] = model
+
+            # Save model state at this gamma (key difference from paper's Algorithm 1)
+            # The network has evolved to represent the solution at this specific gamma
+            models_by_gamma[gamma] = type(model)(model.layers, mode=model.mode).to(device)
+            models_by_gamma[gamma].load_state_dict(model.state_dict())
+
             history_by_gamma[gamma] = {
                 'loss': loss_history,
                 'constraint': constraint_history,
                 'lambda': lambda_history
             }
-            epochs_by_gamma[gamma] = final_epoch
-            prev_model = model
+            epochs_by_gamma[gamma] = epoch + 1
 
-        # Store results for this mode
+            if verbose:
+                print(f"  Completed γ={gamma:.2f}, final μ={final_mu:.4f}, model state saved")
+
+        # Store final results for this mode
+        # Return the evolved models at each gamma value
+        models_by_mode[mode] = models_by_gamma  # Dictionary of models by gamma
         mu_table[mode] = mu_logs
-        models_by_mode[mode] = models_by_gamma
         training_history[mode] = history_by_gamma
         epochs_history[mode] = epochs_by_gamma
-        diagnose_mode(model, mode, X_test, constant_history[mode], perturb_const)
+
+        if verbose:
+            print(f"Completed mode {mode} - network evolved through {len(sorted_gammas)} gamma values")
 
     return models_by_mode, mu_table, training_history, constant_history, epochs_history
 
@@ -461,7 +417,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                       modes, p, constant_history, perturb_const, potential_type,
                       save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
-    Plot wavefunctions (not densities) for different modes and gamma values.
+    Plot wavefunctions for different modes and gamma values.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -476,7 +432,6 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
         X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
         dx = X_test[1, 0] - X_test[0, 0]  # Spatial step size
 
-        # Different line styles and colors
         linestyles = ['-', '--', '-.', ':', '-', '--']
         colors = ['k', 'b', 'r', 'g', 'm', 'c', 'slategray']
 
@@ -498,7 +453,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                 # Normalization
                 u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                # For mode 0, ensure all wavefunctions are positive
+                # For mode 0, enforce all wavefunctions to be positive
                 if mode == 0:
                     # Take absolute value to ensure positive values
                     # This is valid for ground state (mode 0) which should be nodeless
@@ -509,15 +464,15 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
-                             label=f"γ={gamma:.1f}")
+                             label=f"η={gamma:.1f}")
 
         # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
         plt.xlabel("x", fontsize=18)
-        plt.ylabel(r"$\psi(x)$", fontsize=18)
+        plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(0, 1)
+        plt.xlim(-10, 10)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
@@ -594,10 +549,10 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
         ax.set_xlabel("x", fontsize=12)
-        ax.set_ylabel(r"$\psi(x)$", fontsize=12)
+        ax.set_ylabel(r"$u(x)$", fontsize=12)
         ax.grid(True)
         ax.legend(fontsize=6)
-        ax.set_xlim(0, 1)
+        ax.set_xlim(-10, 10)
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
@@ -633,9 +588,9 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
                  linestyle='-',
                  label=f"Mode {mode}")
 
-    plt.ylabel(r"$\gamma$ (Interaction Strength)", fontsize=18)
-    plt.xlabel(r"$\mu$ (Chemical Potential)", fontsize=18)
-    plt.title(f"Chemical Potential vs. Interaction Strength for All Modes (p={p})", fontsize=18)
+    plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
+    plt.xlabel(r"$\lambda$ (Eigenvalue)", fontsize=18)
+    plt.title(f"Chemical Potential vs. Interaction Strength for Modes 0-5", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
     plt.tight_layout()
@@ -643,18 +598,73 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
     plt.close()
 
 
-def improved_initialization(m, mode):
-    """Better initialization considering mode number and Fourier features"""
+def advanced_initialization(m, mode):
+    """Initialize network weights with consideration of the mode number"""
     if isinstance(m, nn.Linear):
-        fan_in = m.weight.size(1)
-        fan_out = m.weight.size(0)
+        # Use Xavier initialization but scale based on mode
+        gain = 1.0 / (1.0 + 0.2 * mode)  # Stronger scaling for higher modes
+        nn.init.xavier_normal_(m.weight, gain=gain)  # Normal instead of uniform
 
-        # Xavier initialization with mode-dependent scaling
-        bound = np.sqrt(6.0 / (fan_in + fan_out)) / (1.0 + 0.1 * mode)
-        nn.init.uniform_(m.weight, -bound, bound)
+        # More careful bias initialization for higher modes
+        if mode > 3:
+            m.bias.data.fill_(0.001)  # Smaller initial bias for higher modes
+        else:
+            m.bias.data.fill_(0.01)
 
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
+
+def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, verbose=False):
+    """Pre-train network to output the analytical harmonic oscillator solution."""
+    model.train()
+    X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
+
+    with torch.no_grad():
+        analytical_target = model.weighted_hermite(X_tensor.squeeze(), mode).unsqueeze(-1).detach()
+
+    # Use both Adam and LBFGS for better convergence
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    closure = None  # Define closure outside the loop
+
+    for epoch in range(epochs):
+        if epoch < epochs - 500:
+            # Adam phase
+            optimizer.zero_grad()
+            prediction = model.forward(X_tensor)
+            loss = torch.mean((prediction - analytical_target) ** 2)
+            loss.backward()
+            optimizer.step()
+        else:
+            # Switch to LBFGS for final refinement
+            if epoch == epochs - 500:
+                optimizer = torch.optim.LBFGS(model.parameters(), lr=lr * 0.1, max_iter=20)
+
+                def closure():
+                    optimizer.zero_grad()
+                    pred = model.forward(X_tensor)
+                    l = torch.mean((pred - analytical_target) ** 2)
+                    l.backward()
+                    return l
+
+                if verbose:
+                    print(f"  Switching to LBFGS at epoch {epoch}")
+
+            # LBFGS phase
+            loss = optimizer.step(closure)
+
+        # Logging
+        if verbose and epoch % 500 == 0:
+            print(f"  Pre-training epoch {epoch}, loss: {loss.item():.2e}")
+
+        # Early stopping
+        if loss.item() < 1e-12:
+            if verbose:
+                print(f"  Pre-training converged at epoch {epoch}, loss: {loss.item():.2e}")
+            break
+
+    if verbose:
+        print(f"  Pre-training finished, final loss: {loss.item():.2e}")
+
+    return model
 
 
 def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type,
@@ -905,7 +915,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
                          markersize=4,
                          label=f"Mode {mode}")
 
-    plt.xlabel(r"$\gamma$ (Interaction Strength)", fontsize=14)
+    plt.xlabel(r"$\eta$ (Interaction Strength)", fontsize=14)
     plt.ylabel("Epochs Until Early Stopping", fontsize=14)
     plt.title("Training Efficiency: Epochs Until Convergence", fontsize=16)
     plt.grid(True, alpha=0.3)
@@ -942,7 +952,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
 
     plt.xticks(range(len(gamma_labels)), gamma_labels, rotation=45, ha='right')
     plt.yticks(range(len(mode_labels)), mode_labels)
-    plt.xlabel(r"$\gamma$ (Interaction Strength)", fontsize=14)
+    plt.xlabel(r"$\eta$ (Interaction Strength)", fontsize=14)
     plt.ylabel("Mode", fontsize=14)
     plt.title("Training Efficiency Heatmap", fontsize=16)
     cbar = plt.colorbar(im)
@@ -975,7 +985,7 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
         if epochs_for_gamma:
             plt.plot(valid_modes, epochs_for_gamma,
                      marker='o', linestyle='-', linewidth=2,
-                     label=f"γ={gamma}")
+                     label=f"η={gamma}")
 
     plt.xlabel("Mode Number", fontsize=14)
     plt.ylabel("Epochs Until Early Stopping", fontsize=14)
@@ -1003,20 +1013,25 @@ def plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential
 def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3, tol=1e-5, perturb_const=0.01,
                        verbose=False):
     """
-    Train a regular PINN for a single mode and gamma value.
-    This is the baseline comparison method - trains from scratch for every gamma.
+    Train a regular PINN for a single mode and gamma value with analytical initialization for gamma=0.
     """
     dx = X_train[1, 0] - X_train[0, 0]
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    L = ub
     boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
     # Initialize model
-    model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L).to(device)
-    model.apply(lambda m: advanced_initialization(m, mode))
+    model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, use_perturbation=False).to(device)
+
+    # Key change: Pre-train on analytical solution for gamma=0
+    if gamma == 0.0:
+        if verbose:
+            print(f"    Pre-training Regular PINN on analytical solution for mode {mode}")
+        model = pretrain_on_analytical_solution(model, mode, X_train, epochs=2000, lr=1e-3, verbose=verbose)
+    else:
+        model.apply(lambda m: advanced_initialization(m, mode))
 
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -1034,19 +1049,13 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
         # Forward pass
         u_pred = model.forward(X_tensor)
 
-        # Scale perturbation
-        if epoch == 0:
-            normal_const = torch.max(u_pred).detach().clone()
-        mode_perturb = (5.0 * (mode + 1))
-        u_pred = mode_perturb * u_pred / normal_const
-
         # Calculate losses
         boundary_loss = model.boundary_loss(boundary_points, boundary_values)
-        norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
-        norm_weight = 20.0 * (1 + 0.5 * mode)  # Stronger normalization for higher modes
-        constraint_loss = 10.0 * boundary_loss + norm_weight * norm_loss
+        norm_loss = model.normalization_loss(u_pred, dx)
+        constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
-        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "box")
+        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "harmonic")
+
         total_loss = pde_loss + constraint_loss
 
         # Backpropagate
@@ -1077,7 +1086,7 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
 def train_curriculum_pinn(modes, gamma_values, p, X_train, lb, ub, layers, epochs, lr=1e-3, tol=1e-5,
                           perturb_const=0.01, verbose=False):
     """
-    Improved curriculum learning approach with better transfer strategies and epoch allocation.
+    Curriculum learning with analytical initialization at gamma=0.
     """
     models_by_mode = {}
     constants_by_mode = {}
@@ -1087,73 +1096,61 @@ def train_curriculum_pinn(modes, gamma_values, p, X_train, lb, ub, layers, epoch
 
     for mode in modes:
         if verbose:
-            print(f"Training improved curriculum for mode {mode}")
+            print(f"Training curriculum for mode {mode}")
 
         models_by_gamma = {}
         prev_model = None
-
-        # Adaptive epoch allocation - give more epochs to harder problems
-        total_epochs_for_mode = epochs * len(sorted_gammas)  # Same total as training each separately
 
         for i, gamma in enumerate(sorted_gammas):
             if verbose:
                 print(f"  Training γ={gamma}")
 
             # Initialize model
-            L = ub
-            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L).to(device)
+            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, use_perturbation=False).to(device)
 
-            if prev_model is not None and i > 0:
-                # Transfer Learning
+            if i == 0 and gamma == 0.0:
+                # Key change: Start with analytical initialization for gamma=0
+                if verbose:
+                    print(f"    Pre-training Curriculum PINN on analytical solution for mode {mode}")
+                model = pretrain_on_analytical_solution(model, mode, X_train, epochs=2000, lr=1e-3, verbose=verbose)
+            elif prev_model is not None and i > 0:
+                # Transfer Learning from previous model
                 prev_state = prev_model.state_dict()
                 model_state = model.state_dict()
 
-                # Strategy 1: Full network transfer with adaptive strength
-                # Higher transfer strength for similar problems (small gamma increments)
-                gamma_increment = gamma - sorted_gammas[i - 1]
-                max_increment = max([sorted_gammas[j] - sorted_gammas[j - 1] for j in range(1, len(sorted_gammas))])
+                # Full network transfer with adaptive strength
+                transfer_strength = 0.95
 
-                # Stronger transfer for smaller increments
-                transfer_strength = 0.9 - 0.4 * (gamma_increment / max_increment)
-                transfer_strength = max(0.5, transfer_strength)  # Minimum 50% transfer
-
-                # Transfer all layers, not just first two
+                # Transfer all layers
                 for layer_name in model_state.keys():
                     if layer_name in prev_state:
                         model_state[layer_name] = (transfer_strength * prev_state[layer_name] +
                                                    (1 - transfer_strength) * model_state[layer_name])
 
                 model.load_state_dict(model_state)
-
-                if verbose:
-                    print(f"    Applied full transfer with strength {transfer_strength:.2f}")
-
-                # Strategy 2: Use warm-start with lower learning rate initially
                 initial_lr = lr * 0.1  # Start with lower LR for transferred model
-
             else:
-                # First gamma: use normal initialization
+                # Use normal initialization
                 model.apply(lambda m: advanced_initialization(m, mode))
                 initial_lr = lr
 
-            # Give more epochs to later (harder) gamma values
+            # Adaptive epoch allocation
             if i == 0:
-                epochs_for_this_gamma = epochs // 2  # Less for easy case
+                epochs_for_this_gamma = epochs // 2
             else:
-                # Distribute remaining epochs among harder cases
                 remaining_epochs = epochs - (epochs // 2)
                 remaining_gammas = len(sorted_gammas) - 1
                 epochs_for_this_gamma = int(remaining_epochs / remaining_gammas * (1.0 + 0.2 * i))
 
-            epochs_for_this_gamma = min(epochs_for_this_gamma, epochs)  # Cap at max epochs
+            epochs_for_this_gamma = min(epochs_for_this_gamma, epochs)
 
             if verbose:
                 print(f"    Allocated {epochs_for_this_gamma} epochs")
 
             model, const = train_single_model(
                 model, gamma, p, X_train, lb, ub,
-                epochs_for_this_gamma, initial_lr, lr, tol, perturb_const,
-                verbose=False, use_warmstart=(prev_model is not None)
+                epochs_for_this_gamma, initial_lr if i > 0 else lr, lr, tol, perturb_const,
+                verbose=False, use_warmstart=(prev_model is not None and i > 0)
             )
 
             models_by_gamma[gamma] = model
@@ -1174,7 +1171,6 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    L = ub
     boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
@@ -1216,18 +1212,12 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
         # Forward pass
         u_pred = model.forward(X_tensor)
 
-        # Scale perturbation
-        if epoch == 0:
-            normal_const = torch.max(u_pred).detach().clone()
-        u_pred = perturb_const * u_pred / normal_const
-
         # Calculate losses
         boundary_loss = model.boundary_loss(boundary_points, boundary_values)
-        norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
-        norm_weight = 20.0 * (1 + 0.5 * mode)  # Stronger normalization for higher modes
-        constraint_loss = 10.0 * boundary_loss + norm_weight * norm_loss
+        norm_loss = model.normalization_loss(u_pred, dx)
+        constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
-        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "box")
+        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "harmonic")
         total_loss = pde_loss + constraint_loss
 
         # Backpropagate
@@ -1262,22 +1252,34 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     return model, normal_const
 
 
-def compute_analytical_solution(X_test, mode, gamma=0, L=1.0):
+def compute_analytical_solution(X_test, mode, gamma=0):
     """
     Compute analytical solution for comparison.
-    For gamma=0, this is the particle in a box solution.
+    For gamma=0, this is the harmonic oscillator solution.
     For gamma>0, you would need the exact solution if available.
     """
     x = X_test.flatten()
     dx = X_test[1, 0] - X_test[0, 0]
 
-    # Analytical solution for particle in a box (gamma=0)
+    # Analytical solution for harmonic oscillator (gamma=0)
     if gamma == 0:
-        # Box eigenfunction solution
-        n_actual = mode + 1  # Convert mode number to quantum number (n=0 → first excited state with n_actual=1)
-        norm_factor = np.sqrt(2.0 / L)
-        psi_analytical = norm_factor * np.sin(n_actual * np.pi * x / L)
+        # Hermite polynomial solution
+        fact_n = math.factorial(mode)
+        norm_factor = ((2.0 ** mode) * fact_n * math.sqrt(math.pi)) ** (-0.5)
 
+        if mode == 0:
+            Hn = np.ones_like(x)
+        elif mode == 1:
+            Hn = 2.0 * x
+        else:
+            # Use recurrence relation for higher modes
+            Hnm2 = np.ones_like(x)  # H_0(x)
+            Hnm1 = 2.0 * x  # H_1(x)
+            for k in range(1, mode):
+                Hn = 2.0 * x * Hnm1 - 2.0 * k * Hnm2
+                Hnm2, Hnm1 = Hnm1, Hn
+
+        psi_analytical = norm_factor * Hn * np.exp(-0.5 * x ** 2)
         # Normalize
         psi_analytical /= np.sqrt(np.sum(psi_analytical ** 2) * dx)
 
@@ -1291,7 +1293,7 @@ def compute_analytical_solution(X_test, mode, gamma=0, L=1.0):
         return None
 
 
-def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name, perturb_const=0.01, L=1.0):
+def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name, perturb_const=0.01):
     """
     Compute the absolute and relative error for a trained model.
     """
@@ -1301,10 +1303,15 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
     dx = X_test[1, 0] - X_test[0, 0]
 
     with torch.no_grad():
-        # All methods use the same approach for evaluation
-        u_pred = model.forward(X_tensor)
-        u_pred = u_pred * (perturb_const / constant)
-        full_u = model.get_complete_solution(X_tensor, u_pred)
+        if method_name == "PL-PINN":
+            # Perturbative approach
+            u_pred = model.forward(X_tensor)
+            u_pred = u_pred * (perturb_const / constant)
+            full_u = model.get_complete_solution(X_tensor, u_pred)
+        else:
+            # Use the network output as the solution
+            full_u = model.forward(X_tensor)
+
         u_np = full_u.cpu().numpy().flatten()
 
         # Normalize the solution
@@ -1315,7 +1322,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
             u_np = np.abs(u_np)
 
     # Try to get analytical solution for comparison
-    analytical = compute_analytical_solution(X_test, mode, gamma, L)
+    analytical = compute_analytical_solution(X_test, mode, gamma)
 
     if analytical is not None and gamma == 0:
         # Compute error against analytical solution
@@ -1325,9 +1332,12 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
         # For cases without analytical solution, compute PDE residual as quality metric
         X_tensor_eval = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
 
-        u_pred_eval = model.forward(X_tensor_eval)
-        u_pred_eval = u_pred_eval * (perturb_const / constant)
-        u_eval = model.get_complete_solution(X_tensor_eval, u_pred_eval)
+        if method_name == "PL-PINN":
+            u_pred_eval = model.forward(X_tensor_eval)
+            u_pred_eval = u_pred_eval * (perturb_const / constant)
+            u_eval = model.get_complete_solution(X_tensor_eval, u_pred_eval)
+        else:
+            u_eval = model.forward(X_tensor_eval)
 
         # Compute PDE residual
         u_x = torch.autograd.grad(u_eval, X_tensor_eval, torch.ones_like(u_eval),
@@ -1335,7 +1345,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
         u_xx = torch.autograd.grad(u_x, X_tensor_eval, torch.ones_like(u_x),
                                    create_graph=True, retain_graph=True)[0]
 
-        V = model.compute_potential(X_tensor_eval, "box")
+        V = model.compute_potential(X_tensor_eval, "harmonic")
         F_u = -u_xx + V * u_eval + gamma * torch.abs(u_eval) ** (p - 1) * u_eval
 
         # Chemical potential
@@ -1346,7 +1356,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
         pde_loss = torch.mean(residual ** 2)
 
         abs_error = pde_loss.item()
-        rel_error = abs_error * 100  # Convert to percentage-like metric
+        rel_error = abs_error * 100
 
     return abs_error, rel_error
 
@@ -1417,7 +1427,8 @@ def load_regular_pinn_models(filename, save_dir="comparison_results"):
                 hbar=model_data['hbar'],
                 m=model_data['m'],
                 mode=model_data['mode'],
-                gamma=model_data['gamma']
+                gamma=model_data['gamma'],
+                use_perturbation=False
             ).to(device)
             model.load_state_dict(model_data['state_dict'])
             model.eval()
@@ -1494,7 +1505,8 @@ def load_curriculum_pinn_models(filename, save_dir="comparison_results"):
                 hbar=model_data['hbar'],
                 m=model_data['m'],
                 mode=model_data['mode'],
-                gamma=model_data['gamma']
+                gamma=model_data['gamma'],
+                use_perturbation=False
             ).to(device)
             model.load_state_dict(model_data['state_dict'])
             model.eval()
@@ -1506,7 +1518,7 @@ def load_curriculum_pinn_models(filename, save_dir="comparison_results"):
 
 
 def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers, epochs,
-                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="box",
+                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="harmonic",
                                 force_retrain=False):
     """
     Train Regular PINNs or load from cache if available.
@@ -1540,7 +1552,7 @@ def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers,
         for gamma in gamma_values:
             print(f"Training Regular PINN - Mode {mode}, γ={gamma}")
             model, const = train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, tol=tol,
-                                              perturb_const=perturb_const, verbose=False)
+                                              perturb_const=perturb_const, verbose=True)
             regular_models[mode][gamma] = model
             regular_constants[mode] = const
 
@@ -1552,7 +1564,8 @@ def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers,
 
 
 def train_or_load_curriculum_pinns(modes, gamma_values, p, X_train, lb, ub, layers, epochs,
-                                   save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="box",
+                                   save_dir="comparison_results", tol=1e-5, perturb_const=0.01,
+                                   potential_type="harmonic",
                                    force_retrain=False):
     """
     Train Curriculum PINNs or load from cache if available.
@@ -1592,7 +1605,7 @@ def train_or_load_curriculum_pinns(modes, gamma_values, p, X_train, lb, ub, laye
 def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, X_test, lb, ub, layers, epochs,
                                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01,
                                                force_retrain_regular=False, force_retrain_curriculum=False,
-                                               potential_type="box"):
+                                               potential_type="harmonic"):
     """
     Create comparison table with individual caching for each method.
 
@@ -1664,7 +1677,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
                 model = regular_models[mode][gamma]
                 const = regular_constants[mode]
                 abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "Regular PINN",
-                                                          perturb_const, L=ub)
+                                                          perturb_const)
                 results.append({
                     'Method': 'Regular PINN',
                     'Mode': mode,
@@ -1682,7 +1695,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
                 model = curriculum_models[mode][gamma]
                 const = curriculum_constants[mode]
                 abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "Curriculum Training",
-                                                          perturb_const, L=ub)
+                                                          perturb_const)
                 results.append({
                     'Method': 'Curriculum Training',
                     'Mode': mode,
@@ -1699,10 +1712,10 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
             if mode in pl_pinn_models and gamma in pl_pinn_models[mode]:
                 model = pl_pinn_models[mode][gamma]
                 const = pl_constant_history[mode]
-                abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "PL-PINN (ours)",
-                                                          perturb_const, L=ub)
+                abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "PL-PINN",
+                                                          perturb_const)
                 results.append({
-                    'Method': 'PL-PINN (ours)',
+                    'Method': 'PL-PINN',
                     'Mode': mode,
                     'Gamma': gamma,
                     'Abs Error': abs_err,
@@ -1725,7 +1738,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
     print("\nPAPER-STYLE COMPARISON TABLE")
     print("-" * 60)
 
-    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN (ours)']
+    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN']
 
     # Print header
     print(f"{'Method':<20} {'abs. err':<12} {'rel. err':<10}")
@@ -1883,7 +1896,7 @@ def plot_comparison_results(results_df, save_dir="comparison_results"):
     modes = sorted(results_df['Mode'].unique())
 
     # Set up colors for methods
-    colors = {'Regular PINN': 'red', 'Curriculum Training': 'blue', 'PL-PINN (ours)': 'green'}
+    colors = {'Regular PINN': 'red', 'Curriculum Training': 'blue', 'PL-PINN': 'green'}
 
     # 1. Plot absolute error comparison
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
@@ -1971,7 +1984,7 @@ def create_latex_table(results_df, save_path=None):
     latex_lines.append("\\midrule")
 
     modes = sorted(results_df['Mode'].unique())
-    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN (ours)']
+    methods = ['Regular PINN', 'Curriculum Training', 'PL-PINN']
 
     for mode in modes:
         mode_data = results_df[results_df['Mode'] == mode]
@@ -2013,59 +2026,9 @@ def create_latex_table(results_df, save_path=None):
     return latex_table
 
 
-def get_architecture_for_mode(mode):
-    if mode <= 2:
-        return [1, 64, 64, 64, 1]  # Current working architecture
-    elif mode <= 4:
-        return [1, 128, 128, 128, 128, 1]  # Wider for modes 3-4
-    else:
-        return [1, 256, 256, 256, 256, 256, 1]  # Much wider for mode 5
-
-
-def diagnose_mode(model, mode, X_test, constant, perturb_const):
-    model.eval()
-    X_tensor = torch.tensor(X_test, dtype=torch.float32, requires_grad=True).to(device)
-    dx = X_test[1, 0] - X_test[0, 0]
-
-    with torch.no_grad():
-        # Get the raw network output
-        u_pred = model.forward(X_tensor)
-
-        # Apply the same scaling used in training
-        u_pred_scaled = u_pred * (perturb_const / constant)
-
-        # Get base solution and full solution
-        base_solution = model.box_eigenfunction(X_tensor, mode)
-        full_solution = base_solution + u_pred_scaled
-
-        # Normalize the full solution (as done in evaluation)
-        full_solution_norm = full_solution / torch.sqrt(torch.sum(full_solution ** 2) * dx)
-
-        print(f"Mode {mode} Diagnostics:")
-        print(f"  Raw network output range: {torch.min(u_pred).item():.2e} to {torch.max(u_pred).item():.2e}")
-        print(f"  Normalization constant: {constant.item():.2e}")
-        print(f"  Perturbation constant: {perturb_const:.2e}")
-        print(f"  Scaled perturbation magnitude: {torch.max(torch.abs(u_pred_scaled)).item():.2e}")
-        print(f"  Base solution magnitude: {torch.max(torch.abs(base_solution)).item():.2e}")
-        print(
-            f"  Perturbation/Base ratio: {(torch.max(torch.abs(u_pred_scaled)) / torch.max(torch.abs(base_solution))).item():.2e}")
-        print(f"  Full solution range: {torch.min(full_solution).item():.2e} to {torch.max(full_solution).item():.2e}")
-        print(f"  Boundary values: left={full_solution[0].item():.2e}, right={full_solution[-1].item():.2e}")
-        print(f"  Normalization integral: {(torch.sum(full_solution_norm ** 2) * dx).item():.6f}")
-
-        # Check if perturbation is reasonable
-        ratio = (torch.max(torch.abs(u_pred_scaled)) / torch.max(torch.abs(base_solution))).item()
-        if ratio > 0.1:
-            print(f"  ⚠️  WARNING: Perturbation is {ratio:.1%} of base - too large!")
-        elif ratio < 1e-6:
-            print(f"  ⚠️  WARNING: Perturbation is {ratio:.2e} of base - too small!")
-        else:
-            print(f"  ✓ Perturbation magnitude looks reasonable")
-
-
 if __name__ == "__main__":
     # Setup parameters
-    lb, ub = 0, 1 # Domain boundaries
+    lb, ub = -10, 10  # Domain boundaries
     N_f = 4000  # Number of collocation points
     epochs = 5001
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
@@ -2075,11 +2038,9 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    # alpha = 2.0
-    alpha = 5.0
-    #gamma_values = [k * alpha for k in range(201)]
-    # gamma_values = [k * alpha for k in range(51)]
-    gamma_values = [k * alpha for k in range(21)]
+    alpha = 1.0
+    gamma_values = [k * alpha for k in range(101)]
+    # gamma_values = [k * alpha for k in range(21)]
 
     # Include modes 0 through 5
     modes = [0, 1, 2, 3, 4, 5]
@@ -2096,14 +2057,14 @@ if __name__ == "__main__":
     for p in nonlinearity_powers:
 
         # Specify potential type
-        potential_type = "box"
+        potential_type = "harmonic"
 
         # Train neural network or load existing models
         train_new = True  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
+        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_{perturb_const}_tol_{tol}_with_pretraining_and_PL_PINN.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test"
+        p_save_dir = f"plots_p{p}_{potential_type}_paper_test_pert_const_{perturb_const}_with_pretraining_and_PL_PINN"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
@@ -2111,14 +2072,16 @@ if __name__ == "__main__":
             print("Starting training...")
             models_by_mode, mu_table, training_history, constant_history, epochs_history = train_gpe_model(
                 gamma_values, modes, p, X, lb, ub, layers, epochs, tol, perturb_const,
-                potential_type='box', lr=1e-3, verbose=True)
+                potential_type='harmonic', lr=1e-3, verbose=True)
 
             # Save results
-            save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history, filename, p_save_dir)
+            save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history, filename,
+                        p_save_dir)
         else:
             # Load existing models
             print("Loading existing models...")
-            models_by_mode, mu_table, training_history, constant_history, epochs_history = load_models(filename, p_save_dir)
+            models_by_mode, mu_table, training_history, constant_history, epochs_history = load_models(filename,
+                                                                                                       p_save_dir)
 
         # Plot wavefunctions for individual modes
         print("Generating individual mode plots...")

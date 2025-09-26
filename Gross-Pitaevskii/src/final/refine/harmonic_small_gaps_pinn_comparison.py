@@ -2061,11 +2061,11 @@ if __name__ == "__main__":
         potential_type = "harmonic"
 
         # Train neural network or load existing models
-        train_new = False  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
+        train_new = True  # Set to True to train, False to load
+        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_{perturb_const}_tol_{tol}.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test"
+        p_save_dir = f"plots_p{p}_{potential_type}_paper_test_pert_const_{perturb_const}"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:

@@ -38,15 +38,6 @@ plot_params = {
 plt.rcParams.update(plot_params)
 
 
-class SineActivation(nn.Module):
-    def __init__(self, w0=1.0):
-        super().__init__()
-        self.w0 = w0
-
-    def forward(self, x):
-        return torch.sin(self.w0 * x)
-
-
 class ShiftedTanh(nn.Module):
     """Custom activation: tanh(x) + 1 + eps"""
 
@@ -56,20 +47,6 @@ class ShiftedTanh(nn.Module):
 
     def forward(self, x):
         return torch.tanh(x) + 1.0 + self.eps
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.lin1 = nn.Linear(dim, dim)
-        self.lin2 = nn.Linear(dim, dim)
-        self.activation = SineActivation()
-
-    def forward(self, x):
-        identity = x
-        out = self.activation(self.lin1(x))
-        out = self.lin2(out)
-        return self.activation(out + identity)
 
 
 class GrossPitaevskiiPINN(nn.Module):
@@ -108,40 +85,16 @@ class GrossPitaevskiiPINN(nn.Module):
         self.L = L  # Length of the box
         self.use_perturbation = use_perturbation  # Combine the base solution with the neural network perturbation
 
-        # Now build the network after all attributes are set
-        self.network = self.build_network()
-
     def build_network(self):
         """
-        Build the neural network with tanh activation functions and residual connections.
+        Build the neural network with tanh activation functions between layers.
         """
-        if not self.use_residual:
-            # Original architecture without residual blocks
-            layers = []
-            for i in range(len(self.layers) - 1):
-                layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
-                if i < len(self.layers) - 2:
-                    layers.append(ShiftedTanh())
-            return nn.Sequential(*layers)
-        else:
-            # New architecture with residual blocks
-            modules = []
-
-            # Input layer
-            input_dim = self.layers[0]
-            hidden_dim = self.layers[1]
-            modules.append(nn.Linear(input_dim, hidden_dim))
-            modules.append(ShiftedTanh())
-
-            # Residual blocks in the middle layers
-            num_res_blocks = len(self.layers) - 3  # Subtract input, first hidden, and output
-            for _ in range(num_res_blocks):
-                modules.append(ResidualBlock(hidden_dim))
-
-            # Output layer
-            modules.append(nn.Linear(hidden_dim, self.layers[-1]))
-
-            return nn.Sequential(*modules)
+        layers = []
+        for i in range(len(self.layers) - 1):
+            layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
+            if i < len(self.layers) - 2:
+                layers.append(ShiftedTanh())
+        return nn.Sequential(*layers)
 
     def box_eigenfunction(self, x, n):
         """
@@ -167,7 +120,14 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         Forward pass through the neural network.
         """
-        return self.network(inputs)
+        # return self.network(inputs)
+        x = inputs
+        raw_output = self.network(inputs)
+
+        # Enforce ψ(0) = ψ(1) = 0
+        boundary_factor = torch.sin(torch.pi * x)  # sin(0) = sin(π) = 0
+
+        return raw_output * boundary_factor
 
     def get_complete_solution(self, x, perturbation, mode=None):
         """
@@ -183,6 +143,12 @@ class GrossPitaevskiiPINN(nn.Module):
         Compute potential function for the 1D domain.
         """
         if potential_type == "box":
+            # V0 = 1000  # Wall strength
+            # sigma = 0.05  # Wall width
+            # L =  self.L  # Box length
+            #
+            # V = V0 * (torch.exp(-(x / sigma) ** 2) +
+            #           torch.exp(-((L - x) / sigma) ** 2))
             V = torch.zeros_like(x)
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
@@ -352,8 +318,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 model.apply(lambda m: advanced_initialization(m, mode))
 
             # Adam optimizer
-            mode_lr = lr / (1 + 0.3 * mode)  # Lower LR for higher modes
-            optimizer = torch.optim.Adam(model.parameters(), lr=mode_lr)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
             # Create scheduler to decrease learning rate during training
             scheduler = CosineAnnealingWarmRestarts(
@@ -389,10 +354,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 # Calculate common constraint losses for all modes
                 boundary_loss = model.boundary_loss(boundary_points, boundary_values)
                 norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
-
-                # Combined constraint loss
-                norm_weight = 20.0 * (1 + 0.5 * mode)  # Stronger normalization for higher modes
-                constraint_loss = 10.0 * boundary_loss + norm_weight * norm_loss
+                constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
                 # Use PDE residual for all modes
                 pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, potential_type)
@@ -631,9 +593,15 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
     plt.close(fig)
 
 
-def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevskii/src/final/refine/test"):
+def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevskii/src/final/refine/test",
+                     sample_interval=4):
     """
     Plot chemical potential vs. interaction strength for different modes.
+
+    Parameters:
+    -----------
+    sample_interval : int
+        Plot every nth data point (default: 4). Set to 1 for all points.
     """
     os.makedirs(save_dir, exist_ok=True)
     plt.figure(figsize=(10, 8))
@@ -648,10 +616,28 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
             continue
 
         gamma_list, mu_list = zip(*mu_table[mode])
-        plt.plot(mu_list, gamma_list,
+
+        # Sample data points at specified interval
+        if sample_interval > 1:
+            # Take every sample_interval-th point
+            sampled_indices = range(0, len(gamma_list), sample_interval)
+            gamma_sampled = [gamma_list[idx] for idx in sampled_indices]
+            mu_sampled = [mu_list[idx] for idx in sampled_indices]
+
+            # Always include the last point if it's not already included
+            if len(gamma_list) - 1 not in sampled_indices:
+                gamma_sampled.append(gamma_list[-1])
+                mu_sampled.append(mu_list[-1])
+        else:
+            gamma_sampled = gamma_list
+            mu_sampled = mu_list
+
+        plt.plot(mu_sampled, gamma_sampled,
                  marker=markers[i % len(markers)],
                  color=colors[i % len(colors)],
                  linestyle='-',
+                 markersize=6,  # Slightly larger markers since fewer points
+                 linewidth=1.5,
                  label=f"Mode {mode}")
 
     plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
@@ -660,7 +646,14 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
     plt.grid(True)
     plt.legend(fontsize=12)
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"mu_vs_gamma_all_modes_p{p}_{potential_type}.png"), dpi=300)
+
+    # Update filename to indicate sampling if used
+    if sample_interval > 1:
+        filename = f"mu_vs_gamma_all_modes_p{p}_{potential_type}_sampled_{sample_interval}.png"
+    else:
+        filename = f"mu_vs_gamma_all_modes_p{p}_{potential_type}.png"
+
+    plt.savefig(os.path.join(save_dir, filename), dpi=300)
     plt.close()
 
 
@@ -1116,17 +1109,10 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
         # Forward pass
         u_pred = model.forward(X_tensor)
 
-        # Scale perturbation
-        # if epoch == 0:
-        #     normal_const = torch.max(u_pred).detach().clone()
-        # mode_perturb = perturb_const / (1 + 0.5 * mode)  # Smaller for higher modes
-        # u_pred = mode_perturb * u_pred / normal_const
-
         # Calculate losses
         boundary_loss = model.boundary_loss(boundary_points, boundary_values)
-        norm_loss = model.normalization_loss(model.get_complete_solution(X_tensor, u_pred), dx)
-        norm_weight = 20.0 * (1 + 0.5 * mode)  # Stronger normalization for higher modes
-        constraint_loss = 10.0 * boundary_loss + norm_weight * norm_loss
+        norm_loss = model.normalization_loss(u_pred, dx)
+        constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
         pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "box")
         total_loss = pde_loss + constraint_loss
@@ -2012,7 +1998,7 @@ def plot_comparison_results(results_df, save_dir="comparison_results"):
                     ax.semilogy(gamma_avg.index, gamma_avg.values, 'o-',
                                 label=method, color=colors.get(method, 'black'), linewidth=2)
 
-            ax.set_xlabel('Gamma', fontsize=12)
+            ax.set_xlabel(r"$\eta$ (Interaction Strength)", fontsize=12)
             ax.set_ylabel('Absolute Error', fontsize=12)
             ax.set_title(f'Mode {mode}', fontsize=14)
             ax.legend(fontsize=10)
@@ -2023,7 +2009,7 @@ def plot_comparison_results(results_df, save_dir="comparison_results"):
         axes[i].axis('off')
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "performance_by_gamma.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(save_dir, "performance_by_interaction_strength.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
     print(f"Plots saved to {save_dir}/")
@@ -2121,10 +2107,10 @@ if __name__ == "__main__":
 
         # Train neural network or load existing models
         train_new = False  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_{perturb_const}_tol_{tol}.pkl"
+        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_{perturb_const}_tol_{tol}_soft_box.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test_pert_const_{perturb_const}_with_pretraining"
+        p_save_dir = f"plots_p{p}_{potential_type}_paper_test_pert_const_{perturb_const}_with_pretraining_soft_box"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
