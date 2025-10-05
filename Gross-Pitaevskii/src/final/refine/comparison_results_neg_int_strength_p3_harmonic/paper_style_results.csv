@@ -1,19 +1,19 @@
 Mode,Method,abs_err,rel_err
-Mode 0,Regular PINN,**6.78e-05**,**0.035%**
-Mode 0,Curriculum Training,2.43e-04,0.165%
-Mode 0,PL-PINN (ours),1.60e-04,0.093%
-Mode 1,Regular PINN,2.92e-04,0.131%
-Mode 1,Curriculum Training,**1.51e-04**,**0.081%**
-Mode 1,PL-PINN (ours),4.17e-04,0.292%
-Mode 2,Regular PINN,1.33e-04,0.070%
-Mode 2,Curriculum Training,**5.56e-05**,**0.031%**
-Mode 2,PL-PINN (ours),1.27e-04,0.064%
-Mode 3,Regular PINN,1.66e-04,0.080%
-Mode 3,Curriculum Training,1.94e-04,0.089%
-Mode 3,PL-PINN (ours),**1.12e-04**,**0.058%**
-Mode 4,Regular PINN,2.03e-04,0.094%
-Mode 4,Curriculum Training,**7.70e-05**,**0.044%**
-Mode 4,PL-PINN (ours),1.13e-04,0.075%
-Mode 5,Regular PINN,9.02e-04,0.405%
-Mode 5,Curriculum Training,**6.04e-05**,**0.031%**
-Mode 5,PL-PINN (ours),1.72e-04,0.087%
+Mode 0,Vanilla PINN,7.14e-03,3.820%
+Mode 0,Curriculum Training,3.54e-03,1.983%
+Mode 0,PL-PINN,**3.05e-04**,**0.217%**
+Mode 1,Vanilla PINN,5.32e-03,2.773%
+Mode 1,Curriculum Training,6.54e-03,3.194%
+Mode 1,PL-PINN,**2.81e-04**,**0.185%**
+Mode 2,Vanilla PINN,1.14e-02,6.977%
+Mode 2,Curriculum Training,1.36e-02,7.194%
+Mode 2,PL-PINN,**3.66e-04**,**0.282%**
+Mode 3,Vanilla PINN,1.38e-02,7.602%
+Mode 3,Curriculum Training,1.35e-02,7.681%
+Mode 3,PL-PINN,**3.93e-04**,**0.301%**
+Mode 4,Vanilla PINN,1.45e-02,8.999%
+Mode 4,Curriculum Training,8.86e-03,5.518%
+Mode 4,PL-PINN,**3.24e-04**,**0.248%**
+Mode 5,Vanilla PINN,1.53e-02,9.877%
+Mode 5,Curriculum Training,1.14e-01,93.548%
+Mode 5,PL-PINN,**4.93e-04**,**0.355%**

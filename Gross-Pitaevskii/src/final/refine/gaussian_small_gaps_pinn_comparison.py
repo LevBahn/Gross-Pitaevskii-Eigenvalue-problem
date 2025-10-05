@@ -56,7 +56,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=1.0, use_residual=True):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=3.0, use_residual=True):
         """
         Parameters
         ----------
@@ -71,7 +71,7 @@ class GrossPitaevskiiPINN(nn.Module):
         gamma : float, optional
             Interaction strength parameter.
         L : float, optional
-            Length of the box (default is 1.0).
+            Length of the box (default is 3.0).
         """
         super().__init__()
         self.layers = layers
@@ -439,7 +439,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
 
 
 def plot_wavefunction(models_by_mode, X_test, gamma_values,
-                      modes, p, constant_history, perturb_const, potential_type,
+                      modes, p, constant_history, perturb_const, potential_type, lb, ub,
                       save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
     Plot wavefunctions (not densities) for different modes and gamma values.
@@ -498,18 +498,18 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
         plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(0, 1)
+        plt.xlim(lb, ub)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
 
     # Also create a combined grid figure to show all modes
     plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
-                       constant_history, perturb_const, potential_type, save_dir)
+                       constant_history, perturb_const, potential_type, lb, ub, save_dir)
 
 
 def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
-                       constant_history, perturb_const, potential_type,
+                       constant_history, perturb_const, potential_type, lb, ub,
                        save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
     Create a grid of subplots showing all modes.
@@ -578,7 +578,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
         ax.set_ylabel(r"$u(x)$", fontsize=12)
         ax.grid(True)
         ax.legend(fontsize=6)
-        ax.set_xlim(0, 1)
+        ax.set_xlim(lb, ub)
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
@@ -2288,7 +2288,7 @@ def create_comparison_table_individual_caching_with_tables(modes, gamma_values, 
 
 if __name__ == "__main__":
     # Setup parameters
-    lb, ub = 0, 1 # Domain boundaries
+    lb, ub = 0, 3 # Domain boundaries
     N_f = 4000  # Number of collocation points
     epochs = 5001
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
@@ -2321,11 +2321,11 @@ if __name__ == "__main__":
         potential_type = "gaussian"
 
         # Train neural network or load existing models
-        train_new = False  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
+        train_new = True  # Set to True to train, False to load
+        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}_length_{ub}.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test"
+        p_save_dir = f"plots_p{p}_{potential_type}_paper_test_length_{ub}"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
@@ -2345,7 +2345,7 @@ if __name__ == "__main__":
         # Plot wavefunctions for individual modes
         print("Generating individual mode plots...")
         plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
-                          potential_type, p_save_dir)
+                          potential_type, lb, ub, p_save_dir)
 
         # Plot μ vs γ for all modes
         print("Generating chemical potential vs. gamma plot...")
@@ -2360,7 +2360,7 @@ if __name__ == "__main__":
         plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
 
         # Decide if we want to run the comparison
-        run_comparison = True
+        run_comparison = False
 
         if run_comparison:
             # Comparison parameters
