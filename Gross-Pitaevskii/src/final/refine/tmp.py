@@ -95,20 +95,22 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def airy_solution(self, x, n):
         """
-        Linear eigenfunction: Ψ_n(x) = Ai(x - α_n) where α_n is the n-th Airy zero
+        Linear eigenfunction: Ψ_n(x) = Ai(x + α_n) where α_n is the n-th Airy zero
         """
-        from scipy.special import airy, ai_zeros
 
-        # Convert to numpy for calculation
+        # Convert to numpy
         x_np = x.detach().cpu().numpy()
 
-        # Get n-th zero of Airy function (these are negative values)
-        # ai_zeros returns negative values where Ai(x) = 0
-        alpha_n = ai_zeros(n + 1)[0][n]  # This is negative, e.g., -2.338 for n=0
+        # Get n-th zero of Airy function
+        alpha_n = ai_zeros(n + 1)[0][n]
 
         # Eigenfunction: Ψ_n(x) = Ai(x - α_n)
-        # Since α_n is negative, x - α_n = x - (-|α_n|) = x + |α_n|
-        psi = airy(x_np - alpha_n)[0]  # Use minus to get correct shift
+        psi = airy(x_np + alpha_n)[0]
+
+        # # Normalize: ∫|ψ|² dx = 1
+        # dx = x_np[1] - x_np[0] if len(x_np) > 1 else 0.01
+        # norm_sq = np.sum(psi ** 2) * dx
+        # psi = psi / np.sqrt(norm_sq)
 
         # Convert back to tensor
         solution = torch.tensor(psi, dtype=torch.float32).to(device)
@@ -135,8 +137,10 @@ class GrossPitaevskiiPINN(nn.Module):
         Compute potential function for the 1D domain.
         """
         if potential_type == "gravity_well":
-            # The domain is x ≥ 0
-            V = x.clone()
+            # The dimensionless form requires scaling factor
+            # V(x) = (2^(1/3)) * x
+            xi_scale = (2.0) ** (1.0 / 3.0)
+            V = xi_scale * x.clone()
 
             return V
         else:
@@ -180,11 +184,11 @@ class GrossPitaevskiiPINN(nn.Module):
         kinetic = -u_xx
         potential = V * u
         #interaction = gamma * u ** 3
-        #interaction = gamma * u ** p
-        interaction = gamma * torch.abs(u) ** (p - 1) * u
+        interaction = gamma * u ** p
+        #interaction = gamma * torch.abs(u) ** (p - 1) * u
 
-        numerator = torch.mean(u * (kinetic + potential + interaction))
-        denominator = torch.mean(u ** 2)
+        numerator = torch.sum(u * (kinetic + potential + interaction))
+        denominator = torch.sum(u ** 2)
         lambda_pde = numerator / denominator
 
         # Residual of the 1D Gross-Pitaevskii equation
@@ -259,6 +263,10 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
     dx = X_train[1, 0] - X_train[0, 0]  # Assuming uniform grid
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
+    print(f"  X_train shape: {X_train.shape}")
+    print(f"  X_train[0] = {X_train[0, 0]:.6f}, X_train[-1] = {X_train[-1, 0]:.6f}")
+    print(f"  dx = {X_train[1, 0] - X_train[0, 0]:.6f}")
+
     # Create boundary conditions
     boundary_points = torch.tensor([[lb]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((1, 1), dtype=torch.float32).to(device)
@@ -304,8 +312,16 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 # Verify the eigenvalue is correct
                 if verbose:
                     from scipy.special import ai_zeros
-                    expected_mu = ai_zeros(mode + 1)[0][mode]
+                    expected_mu = -ai_zeros(mode + 1)[0][mode]
                     print(f"  Expected μ for mode {mode}: {expected_mu:.4f}")
+
+                    x_np = X_train.flatten()
+                    alpha_n = ai_zeros(mode + 1)[0][mode]
+                    psi = airy(x_np + alpha_n)[0]
+                    print(f"  ψ(0) = {psi[0]:.6e}")
+                    print(f"  ψ(35) = {psi[-1]:.6e}")
+                    print(f"  ψ(35)/ψ(0) = {psi[-1] / psi[0]:.6e}")
+
             else:
                 # Use advanced initialization for any other starting gamma not equal 0
                 model.apply(lambda m: advanced_initialization(m, mode))
@@ -435,28 +451,33 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
 
 def plot_wavefunction(models_by_mode, X_test, gamma_values,
                       modes, p, constant_history, perturb_const, potential_type,
-                      save_dir="Gross-Pitaevskii/src/final/refine/test"):
+                      save_dir="Gross-Pitaevskii/src/final/refine/test",
+                      normalization_type="unit"):  # Add this parameter
     """
-    Plot wavefunctions (not densities) for different modes and gamma values.
+    Plot wavefunctions for different modes and gamma values.
+
+    normalization_type:
+        - "unit": normalize to ∫|ψ|² = 1 (default)
+        - "max": normalize to max|ψ| = 1 for γ=0, scale others accordingly
+        - "particle": use γ to determine effective particle number
+        - "scaling":
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    # Generate individual figures for each mode
     for mode in modes:
         if mode not in models_by_mode:
             continue
 
-        # Create individual figure
         plt.figure(figsize=(8, 6))
-
         X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
-        dx = X_test[1, 0] - X_test[0, 0]  # Spatial step size
+        dx = X_test[1, 0] - X_test[0, 0]
 
-        # Different line styles and colors
         linestyles = ['-', '--', '-.', ':', '-', '--']
         colors = ['k', 'b', 'r', 'g', 'm', 'c', 'slategray']
 
-        # Plot solutions for different gamma values
+        # Store γ=0 normalization factor for reference
+        gamma_0_norm = None
+
         for j, gamma in enumerate(gamma_values):
             if gamma not in models_by_mode[mode]:
                 continue
@@ -471,29 +492,71 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                 full_u = model.get_complete_solution(X_tensor, u_pred)
                 u_np = full_u.cpu().numpy().flatten()
 
-                # Normalization
-                u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+                # Choose normalization based on type
+                if normalization_type == "unit":
+                    # Standard: ∫|ψ|² = 1
+                    #u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                # For mode 0, ensure all wavefunctions are positive
+                    xi_scale = (2.0) ** (1.0 / 3.0)
+                    u_np *= xi_scale
+
+                    u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+
+                elif normalization_type == "max":
+
+                    xi_scale = (2.0) ** (1.0 / 3.0)
+                    u_np /= xi_scale
+
+                    # Normalize so max amplitude matches paper's scale
+                    if gamma == 0:
+                        # For γ=0, normalize to max = 1
+                        gamma_0_norm = np.max(np.abs(u_np))
+                        u_np /= gamma_0_norm
+                    else:
+                        # For γ>0, apply same normalization as γ=0
+                        if gamma_0_norm is not None:
+                            u_np /= gamma_0_norm
+                        else:
+                            u_np /= np.max(np.abs(u_np))
+
+                elif normalization_type == "particle":
+                    # Normalize using the relationship: γ ∝ N
+                    # Smaller γ → larger amplitude (fewer particles compressed)
+                    # This mimics the paper's approach
+                    norm_factor = np.sqrt(np.sum(u_np ** 2) * dx)
+                    if norm_factor > 0:
+                        u_np /= norm_factor
+                    # Apply γ-dependent scaling
+                    scale = 1.0 / np.sqrt(1.0 + gamma / 10.0)  # Adjust denominator as needed
+                    u_np *= scale
+
+                elif normalization_type == "scaling":
+                    if gamma == 0:
+                        u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+                        gamma_0_amplitude = np.max(np.abs(u_np))
+                    else:
+                        # Scale by same factor as γ=0
+                        current_norm = np.sqrt(np.sum(u_np ** 2) * dx)
+                        u_np /= current_norm
+                        u_np *= gamma_0_amplitude / np.max(np.abs(u_np))
+
+                # For mode 0, ensure positive values
                 if mode == 0:
-                    # Take absolute value to ensure positive values
-                    # This is valid for ground state (mode 0) which should be nodeless
                     u_np = np.abs(u_np)
 
-                # Plot wavefunctions
-                if gamma % 4 == 0:
+                # Plot
+                if gamma % 20 == 0:
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
                              label=f"η={gamma:.1f}")
 
-        # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
         plt.xlabel("x", fontsize=18)
         plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(0, 25)
+        plt.xlim(0, 27.8)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
@@ -712,6 +775,17 @@ def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, 
 
     if verbose:
         print(f"  Pre-training finished, final loss: {loss.item():.2e}")
+
+    if verbose:
+        print(f"  Pre-training finished, final loss: {loss.item():.2e}")
+
+        # DEBUG: Check eigenvalue after pre-training
+        X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
+        pred = model.forward(X_tensor)
+
+        # Compute eigenvalue manually
+        pde_loss, lambda_val = model.pde_loss(X_tensor, pred, gamma=0.0, p=3, potential_type='gravity_well')
+        print(f"  Eigenvalue after pre-training: {lambda_val.item():.4f}")
 
     return model
 
@@ -2198,8 +2272,8 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 0.25
-    gamma_values = [k * alpha for k in range(81)]
+    alpha = 0.5
+    gamma_values = [k * alpha for k in range(201)]
     #gamma_values = [k * alpha for k in range(51)]
 
     # Include modes 0 through 5
@@ -2244,22 +2318,22 @@ if __name__ == "__main__":
         # Plot wavefunctions for individual modes
         print("Generating individual mode plots...")
         plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
-                          potential_type, p_save_dir)
+                          potential_type, p_save_dir, normalization_type="max")
 
-        # Plot μ vs γ for all modes
-        print("Generating chemical potential vs. gamma plot...")
-        plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
-
-        # Plot combined loss history
-        print("Generating combined loss plots...")
-        plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
-        plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
-
-        print("Generating early stopping analysis plots...")
-        plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
+        # # Plot μ vs γ for all modes
+        # print("Generating chemical potential vs. gamma plot...")
+        # plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
+        #
+        # # Plot combined loss history
+        # print("Generating combined loss plots...")
+        # plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
+        # plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
+        #
+        # print("Generating early stopping analysis plots...")
+        # plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
 
         # Decide if we want to run the comparison
-        run_comparison = True
+        run_comparison = False
 
         if run_comparison:
             # Comparison parameters
