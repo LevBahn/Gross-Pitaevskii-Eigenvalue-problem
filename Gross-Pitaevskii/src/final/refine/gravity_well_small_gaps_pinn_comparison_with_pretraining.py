@@ -6,7 +6,7 @@ import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-from scipy.special import airy, hermite
+from scipy.special import airy, ai_zeros, hermite
 import pandas as pd
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,68 +95,24 @@ class GrossPitaevskiiPINN(nn.Module):
 
     def airy_solution(self, x, n):
         """
-        CORRECTED: Create gravitational trap eigenfunctions using Airy functions according to
-        equations (30-31) from the paper: Ψₙ(x) = Aₙ·Ai(x + xₙ)
-
-        For the gravity well potential V(x) = mgx (x ≥ 0), the eigenfunction is:
-        Ψₙ(x) = Aₙ * Ai((2mg/ℏ²)^(1/3) * x + xₙ)
-
-        where xₙ < 0 is the n-th zero of the Airy function Ai(z).
+        Linear eigenfunction: Ψ_n(x) = Ai(x - α_n) where α_n is the n-th Airy zero
         """
+        from scipy.special import airy, ai_zeros
+
         # Convert to numpy for calculation
         x_np = x.detach().cpu().numpy()
 
-        # CORRECTED: Proper dimensionless coordinate transformation
-        # For gravity well V(x) = mgx in dimensionless units: ξ = (2mg/ℏ²)^(1/3) * x
-        # In your dimensionless system where mg = 1, ℏ = 1, m = 1: ξ = (2)^(1/3) * x
-        xi_scale = (2.0) ** (1 / 3)
+        # Get n-th zero of Airy function (these are negative values)
+        # ai_zeros returns negative values where Ai(x) = 0
+        alpha_n = ai_zeros(n + 1)[0][n]  # This is negative, e.g., -2.338 for n=0
 
-        # Initialize wavefunction array
-        psi = np.zeros_like(x_np)
-
-        # Airy function zeros (negative values where Ai(z) = 0)
-        airy_zeros = [
-            -2.33810741, -4.08794944, -5.52055983, -6.78670809, -7.94413359,
-            -9.02265085, -10.0401743, -11.0085243, -11.9360157, -12.8287767
-        ]
-
-        # Get the nth zero
-        if n < len(airy_zeros):
-            x_n = airy_zeros[n]  # This is already negative
-        else:
-            # Asymptotic approximation for higher modes
-            x_n = -(1.5 * np.pi * (n + 0.75)) ** (2 / 3)
-
-        # CORRECTED: Apply proper domain and boundary conditions
-        # The gravity well exists for all x ≥ 0, with ψ(0) = 0 boundary condition
-        for i, x_val in enumerate(x_np):
-            if x_val >= 0:
-                # Calculate the argument for the Airy function
-                z = xi_scale * x_val + x_n
-
-                # Evaluate Airy function Ai(z)
-                ai_val = airy(z)[0]
-                psi[i] = ai_val
-            else:
-                # For x < 0, set to zero (but this region shouldn't be in your domain)
-                psi[i] = 0.0
-
-        # CORRECTED: Proper normalization
-        # Normalize over the entire domain x ≥ 0
-        if len(x_np) > 1:
-            dx = x_np[1] - x_np[0]
-            # Only normalize over the physical domain (x ≥ 0)
-            pos_mask = x_np >= 0
-            if np.any(pos_mask):
-                psi_pos = psi[pos_mask]
-                norm_integral = np.sum(psi_pos ** 2) * dx
-                if norm_integral > 1e-12:
-                    # Apply normalization factor
-                    normalization_factor = 1.0 / np.sqrt(norm_integral)
-                    psi = psi * normalization_factor
+        # Eigenfunction: Ψ_n(x) = Ai(x - α_n)
+        # Since α_n is negative, x - α_n = x - (-|α_n|) = x + |α_n|
+        psi = airy(x_np - alpha_n)[0]  # Use minus to get correct shift
 
         # Convert back to tensor
         solution = torch.tensor(psi, dtype=torch.float32).to(device)
+
         return solution
 
     def forward(self, inputs):
@@ -179,23 +135,14 @@ class GrossPitaevskiiPINN(nn.Module):
         Compute potential function for the 1D domain.
         """
         if potential_type == "gravity_well":
-            # CORRECTED: Proper gravity well potential V(x) = mgx for x ≥ 0
-            # The domain should only include x ≥ 0 for the gravity well
-            x_squeezed = x.squeeze() if len(x.shape) > 1 else x
-
-            # For the gravity well, V(x) = mgx for x ≥ 0
-            # In dimensionless units: V(x) = x
-            V = torch.clamp(x_squeezed, min=0.0)  # Ensure x ≥ 0
-
-            if len(x.shape) > 1:
-                V = V.unsqueeze(-1)
+            # The domain is x ≥ 0
+            V = x.clone()
 
             return V
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
-        return V
 
-    def pde_loss(self, inputs, predictions, gamma, p, potential_type="box", precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, gamma, p, potential_type="gravity_well", precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
         μψ = - ∇²ψ + Vψ + γ|ψ|²ψ
@@ -234,6 +181,7 @@ class GrossPitaevskiiPINN(nn.Module):
         potential = V * u
         #interaction = gamma * u ** 3
         interaction = gamma * u ** p
+        #interaction = gamma * torch.abs(u) ** (p - 1) * u
 
         numerator = torch.mean(u * (kinetic + potential + interaction))
         denominator = torch.mean(u ** 2)
@@ -271,7 +219,7 @@ class GrossPitaevskiiPINN(nn.Module):
 
 def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                     epochs, tol, perturb_const,
-                    potential_type='box', lr=1e-5, verbose=True):
+                    potential_type='gravity_well', lr=1e-5, verbose=True):
     """
     Train the GPE model for different modes and gamma values for the PL-PINN implementation.
 
@@ -312,8 +260,8 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
-    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
+    boundary_points = torch.tensor([[lb]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((1, 1), dtype=torch.float32).to(device)
 
     # Track models, chemical potentials, training history, and epochs until stopping
     models_by_mode = {}
@@ -353,6 +301,11 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 # Pre-train on analytical solution
                 model = pretrain_on_analytical_solution(model, mode, X_train,
                                                         epochs=2000, lr=1e-3, verbose=verbose)
+                # Verify the eigenvalue is correct
+                if verbose:
+                    from scipy.special import ai_zeros
+                    expected_mu = ai_zeros(mode + 1)[0][mode]
+                    print(f"  Expected μ for mode {mode}: {expected_mu:.4f}")
             else:
                 # Use advanced initialization for any other starting gamma not equal 0
                 model.apply(lambda m: advanced_initialization(m, mode))
@@ -528,7 +481,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                     u_np = np.abs(u_np)
 
                 # Plot wavefunctions
-                if gamma % 20 == 0:
+                if gamma % 4 == 0:
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
@@ -540,7 +493,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
         plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(0, 1)
+        plt.xlim(0, 25)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
@@ -608,7 +561,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
                     u_np = np.abs(u_np)
 
                 # Plot the wavefunction (not density)
-                if gamma % 20 == 0:
+                if gamma % 4 == 0:
                     ax.plot(X_test.flatten(), u_np,
                             linestyle=linestyles[j % len(linestyles)],
                             color=colors[j % len(colors)],
@@ -620,7 +573,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
         ax.set_ylabel(r"$\psi(x)$", fontsize=12)
         ax.grid(True)
         ax.legend(fontsize=6)
-        ax.set_xlim(0, 1)
+        ax.set_xlim(0, 15)
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
@@ -711,17 +664,15 @@ def advanced_initialization(m, mode):
 
 
 def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, verbose=True):
-    """Pre-train network to output the analytical eigenfunction for a particle in a box."""
+    """Pre-train network to output the analytical eigenfunction."""
     model.train()
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     with torch.no_grad():
         analytical_target = model.airy_solution(X_tensor.squeeze(), mode).unsqueeze(-1).detach()
 
-    # Use both Adam and LBFGS for better convergence
+    # Use Adam optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    closure = None  # Define closure outside the loop
 
     for epoch in range(epochs):
         if epoch < epochs - 500:
@@ -820,7 +771,7 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, 
                 epoch_nums = np.linspace(0, epochs, len(loss_history))
 
                 # Plot loss on log scale
-                if gamma % 20 == 0:
+                if gamma % 4 == 0:
                     ax.semilogy(epoch_nums, loss_history,
                                 color=colors[j % len(colors)],
                                 linestyle=linestyles[j % len(linestyles)],
@@ -1118,8 +1069,8 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
-    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
+    boundary_points = torch.tensor([[lb]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((1, 1), dtype=torch.float32).to(device)
 
     # Initialize model
     model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, use_perturbation=False).to(device)
@@ -1151,9 +1102,9 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
         # Calculate losses
         boundary_loss = model.boundary_loss(boundary_points, boundary_values)
         norm_loss = model.normalization_loss(u_pred, dx)
-        constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
+        constraint_loss = 1.0 * boundary_loss + 20.0 * norm_loss
 
-        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "box")
+        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "gravity_well")
         total_loss = pde_loss + constraint_loss
 
         # Backpropagate
@@ -1269,8 +1220,8 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
-    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
+    boundary_points = torch.tensor([[lb]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((1, 1), dtype=torch.float32).to(device)
 
     if use_warmstart:
         # For transferred models, use lower initial LR with gradual increase
@@ -1315,7 +1266,7 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
         norm_loss = model.normalization_loss(u_pred, dx)
         constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
-        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "box")
+        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "gravity_well")
         total_loss = pde_loss + constraint_loss
 
         # Backpropagate
@@ -1350,7 +1301,7 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     return model, normal_const
 
 
-def compute_analytical_solution(X_test, mode, potential_type="box", gamma=0, L=1.0):
+def compute_analytical_solution(X_test, mode, potential_type="gravity_well", gamma=0, L=1.0):
     """
     Compute analytical solution for comparison.
     For gamma=0, this provides the linear solution for different potential types.
@@ -1532,7 +1483,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
             u_np = np.abs(u_np)
 
     # Try to get analytical solution for comparison
-    analytical = compute_analytical_solution(X_test, mode, gamma)
+    analytical = compute_analytical_solution(X_test, mode, "gravity_well", gamma)
 
     if analytical is not None and gamma == 0:
         # Compute error against analytical solution
@@ -1555,7 +1506,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
         u_xx = torch.autograd.grad(u_x, X_tensor_eval, torch.ones_like(u_x),
                                    create_graph=True, retain_graph=True)[0]
 
-        V = model.compute_potential(X_tensor_eval, "box")
+        V = model.compute_potential(X_tensor_eval, "gravity_well")
         F_u = -u_xx + V * u_eval + gamma * torch.abs(u_eval) ** (p - 1) * u_eval
 
         # Chemical potential
@@ -1728,7 +1679,7 @@ def load_curriculum_pinn_models(filename, save_dir="comparison_results"):
 
 
 def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers, epochs,
-                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="box",
+                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="gravity_well",
                                 force_retrain=False):
     """
     Train Regular PINNs or load from cache if available.
@@ -1774,7 +1725,7 @@ def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers,
 
 
 def train_or_load_curriculum_pinns(modes, gamma_values, p, X_train, lb, ub, layers, epochs,
-                                   save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="box",
+                                   save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="gravity_well",
                                    force_retrain=False):
     """
     Train Curriculum PINNs or load from cache if available.
@@ -1814,7 +1765,7 @@ def train_or_load_curriculum_pinns(modes, gamma_values, p, X_train, lb, ub, laye
 def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, X_test, lb, ub, layers, epochs,
                                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01,
                                                force_retrain_regular=False, force_retrain_curriculum=False,
-                                               potential_type="box"):
+                                               potential_type="gravity_well"):
     """
     Create comparison table with individual caching for each method.
 
@@ -2237,7 +2188,7 @@ def create_latex_table(results_df, save_path=None):
 
 if __name__ == "__main__":
     # Setup parameters
-    lb, ub = 0, 15 # Domain boundaries
+    lb, ub = 0, 35 # Domain boundaries
     N_f = 4000  # Number of collocation points
     epochs = 5001
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
@@ -2247,7 +2198,7 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 5.0
+    alpha = 0.1
     gamma_values = [k * alpha for k in range(21)]
     #gamma_values = [k * alpha for k in range(51)]
 
@@ -2270,10 +2221,10 @@ if __name__ == "__main__":
 
         # Train neural network or load existing models
         train_new = True  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_{perturb_const}_tol_{tol}_with_pretraining.pkl"
+        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test_pert_const_{perturb_const}_with_pretraining"
+        p_save_dir = f"plots_p{p}_{potential_type}_paper_test"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
@@ -2281,7 +2232,7 @@ if __name__ == "__main__":
             print("Starting training...")
             models_by_mode, mu_table, training_history, constant_history, epochs_history = train_gpe_model(
                 gamma_values, modes, p, X, lb, ub, layers, epochs, tol, perturb_const,
-                potential_type='gravity_well', lr=1e-3, verbose=True)
+                potential_type='gravity_well', lr=1e-4, verbose=True)
 
             # Save results
             save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history, filename, p_save_dir)
@@ -2322,7 +2273,7 @@ if __name__ == "__main__":
             print(f"  Epochs per method: {comparison_epochs}")
 
             # Create comparison save directory
-            comparison_save_dir = f"comparison_results_p{p}_{potential_type}"
+            comparison_save_dir = f"comparison_results_p{p}_{potential_type}_with_pretraining_orig"
 
             # Run comparison with individual caching
             results_df, paper_results, best_results = create_comparison_table_individual_caching(

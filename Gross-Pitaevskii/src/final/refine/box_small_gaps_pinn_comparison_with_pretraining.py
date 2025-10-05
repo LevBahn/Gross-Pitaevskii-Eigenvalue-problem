@@ -642,7 +642,7 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
 
     plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
     plt.xlabel(r"$\lambda$ (Eigenvalue)", fontsize=18)
-    plt.title(f"Chemical Potential vs. Interaction Strength for Modes 0-5", fontsize=18)
+    plt.title(f"Eigenvalue vs. Interaction Strength for Modes 0-5", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
     plt.tight_layout()
