@@ -620,7 +620,7 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
 
     plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
     plt.xlabel(r"$\lambda$ (Eigenvalue)", fontsize=18)
-    plt.title(f"Chemical Potential vs. Interaction Strength for Modes 0-5", fontsize=18)
+    plt.title(f"Eigenvalue vs. Interaction Strength for Modes 0-5", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
     plt.tight_layout()
@@ -828,14 +828,14 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
                         trend_y = np.exp(np.array([start_loss, end_loss]))
                         plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)
 
-    plt.title("Training Progress for All Modes", fontsize=20)
+    plt.title(r"Training Progress at $\eta=0$ for Modes $0-5$", fontsize=20)
     plt.xlabel("Epochs", fontsize=18)
     plt.ylabel("Loss", fontsize=18)
     plt.grid(True, which="both", linestyle="--", alpha=0.6)
     plt.legend(fontsize=12)
     plt.tight_layout()
     # Adjust the line below as needed
-    plt.savefig(os.path.join(save_dir, f"loss_history_training_progress_p{p}_{potential_type}.png"), dpi=300)
+    plt.savefig(os.path.join(save_dir, f"loss_history_training_progress_p{p}_{potential_type}_eta_0_all_modes.png"), dpi=300)
     plt.close()
 
 

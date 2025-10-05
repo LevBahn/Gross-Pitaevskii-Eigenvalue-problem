@@ -2232,7 +2232,7 @@ if __name__ == "__main__":
             print("Starting training...")
             models_by_mode, mu_table, training_history, constant_history, epochs_history = train_gpe_model(
                 gamma_values, modes, p, X, lb, ub, layers, epochs, tol, perturb_const,
-                potential_type='gravity_well', lr=1e-4, verbose=True)
+                potential_type='gravity_well', lr=1e-3, verbose=True)
 
             # Save results
             save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history, filename, p_save_dir)

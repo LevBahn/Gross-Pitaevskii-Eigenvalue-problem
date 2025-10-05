@@ -579,9 +579,15 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
     plt.close(fig)
 
 
-def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevskii/src/final/refine/test"):
+def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevskii/src/final/refine/test",
+                     sample_interval=4):
     """
     Plot chemical potential vs. interaction strength for different modes.
+
+    Parameters:
+    -----------
+    sample_interval : int
+        Plot every nth data point (default: 4). Set to 1 for all points.
     """
     os.makedirs(save_dir, exist_ok=True)
     plt.figure(figsize=(10, 8))
@@ -590,25 +596,50 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
     markers = ['o', 's', '^', 'v', 'D', 'x', '*', '+']
     colors = ['k', 'b', 'r', 'g', 'm', 'c', 'orange', 'purple']
 
-    # Plot λ vs η for each mode
+    # Plot μ vs γ for each mode
     for i, mode in enumerate(modes):
         if mode not in mu_table:
             continue
 
         gamma_list, mu_list = zip(*mu_table[mode])
-        plt.plot(mu_list, gamma_list,
+
+        # Sample data points at specified interval
+        if sample_interval > 1:
+            # Take every sample_interval-th point
+            sampled_indices = range(0, len(gamma_list), sample_interval)
+            gamma_sampled = [gamma_list[idx] for idx in sampled_indices]
+            mu_sampled = [mu_list[idx] for idx in sampled_indices]
+
+            # Always include the last point if it's not already included
+            if len(gamma_list) - 1 not in sampled_indices:
+                gamma_sampled.append(gamma_list[-1])
+                mu_sampled.append(mu_list[-1])
+        else:
+            gamma_sampled = gamma_list
+            mu_sampled = mu_list
+
+        plt.plot(mu_sampled, gamma_sampled,
                  marker=markers[i % len(markers)],
                  color=colors[i % len(colors)],
                  linestyle='-',
+                 markersize=6,  # Slightly larger markers since fewer points
+                 linewidth=1.5,
                  label=f"Mode {mode}")
 
     plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
-    plt.xlabel(r"$\lambda$ (Chemical Potential)", fontsize=18)
-    plt.title(f"Chemical Potential vs. Interaction Strength for All Modes (p={p})", fontsize=18)
+    plt.xlabel(r"$\lambda$ (Eigenvalue)", fontsize=18)
+    plt.title(f"Eigenvalue vs. Interaction Strength for Modes 0-5", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"mu_vs_gamma_all_modes_p{p}_{potential_type}.png"), dpi=300)
+
+    # Update filename to indicate sampling if used
+    if sample_interval > 1:
+        filename = f"mu_vs_gamma_all_modes_p{p}_{potential_type}_sampled_{sample_interval}.png"
+    else:
+        filename = f"mu_vs_gamma_all_modes_p{p}_{potential_type}.png"
+
+    plt.savefig(os.path.join(save_dir, filename), dpi=300)
     plt.close()
 
 
@@ -805,14 +836,99 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
                         trend_y = np.exp(np.array([start_loss, end_loss]))
                         plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)
 
-    plt.title("Training Progress for All Modes", fontsize=20)
+    plt.title(r"Training Progress at $\eta=0$ for Modes $0-5$", fontsize=22)
     plt.xlabel("Epochs", fontsize=18)
     plt.ylabel("Loss", fontsize=18)
     plt.grid(True, which="both", linestyle="--", alpha=0.6)
-    plt.legend(fontsize=12)
+    plt.legend(fontsize=14)
     plt.tight_layout()
-    # Adjust the line below as needed
-    plt.savefig(os.path.join(save_dir, f"loss_history_training_progress_p{p}_{potential_type}.png"), dpi=300)
+    plt.savefig(os.path.join(save_dir, f"loss_history_training_progress_p{p}_{potential_type}_eta_0_all_modes.png"), dpi=300)
+    plt.close()
+
+
+def plot_mode0_gamma_loss_visualization(training_history, gamma_values_to_plot, epochs, p, potential_type,
+                                        save_dir="Gross-Pitaevskii/src/final/refine/test"):
+    """
+    Creates a visualization of the training progress for Mode 0 across different gamma values.
+    Uses the same format as plot_improved_loss_visualization but focuses on gamma variation.
+
+    Parameters:
+    -----------
+    training_history : dict
+        Dictionary containing training history for all modes and gamma values
+    gamma_values_to_plot : list
+        List of gamma values to include in the plot (e.g., [0, -4, -8, -12, -16, -20])
+    epochs : int
+        Total number of training epochs
+    p : int
+        Nonlinearity power parameter
+    potential_type : str
+        Type of potential ('harmonic', etc.)
+    save_dir : str
+        Directory to save the plot
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Plot training progress for Mode 0 across different gamma values
+    plt.figure(figsize=(12, 8))
+
+    # Restrict number of gammas plotted
+    gamma_values_to_plot = [gamma for gamma in gamma_values if gamma % 4 == 0]
+
+    # Set up colormap for different gamma values
+    colormap = plt.cm.plasma  # Using plasma colormap for good contrast
+    n_gammas = len(gamma_values_to_plot)
+    colors = [colormap(i / (n_gammas - 1)) for i in range(n_gammas)]
+
+    mode = 0  # Focus on mode 0
+
+    if mode in training_history:
+        for i, gamma in enumerate(gamma_values_to_plot):
+            if gamma in training_history[mode]:
+                loss_history = training_history[mode][gamma]['loss']
+
+                # Apply smoothing similar to the original function
+                window_size = min(10, len(loss_history) // 10)
+                if window_size > 1:
+                    ultra_smooth_loss = moving_average(loss_history, window_size)
+                    epoch_nums = np.linspace(0, epochs, len(ultra_smooth_loss))
+                    plt.semilogy(epoch_nums, ultra_smooth_loss,
+                                 color=colors[i],
+                                 linewidth=2.5,
+                                 label=f"η={gamma}")
+                else:
+                    epoch_nums = np.linspace(0, epochs, len(loss_history))
+                    plt.semilogy(epoch_nums, loss_history,
+                                 color=colors[i],
+                                 linewidth=2.5,
+                                 label=f"η={gamma}")
+
+                # Add a trend line for the final 30% of training
+                if len(loss_history) > 10:
+                    start_idx = int(len(loss_history) * 0.7)
+                    if window_size > 1:
+                        end_loss = np.log(ultra_smooth_loss[-1])
+                        start_loss = np.log(ultra_smooth_loss[start_idx])
+                        trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
+                    else:
+                        end_loss = np.log(loss_history[-1])
+                        start_loss = np.log(loss_history[start_idx])
+                        trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
+
+                    # Only add trend if there's a decrease
+                    if end_loss < start_loss:
+                        trend_y = np.exp(np.array([start_loss, end_loss]))
+                        plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.6, linewidth=1.5)
+
+    plt.title(r"Training Progress for Mode 0 Across Varying Interaction Strengths", fontsize=18)
+    plt.xlabel("Epochs", fontsize=18)
+    plt.ylabel("Loss", fontsize=18)
+    plt.grid(True, which="both", linestyle="--", alpha=0.6)
+    plt.legend(fontsize=14, loc='best')
+
+    # Use bbox_inches='tight' instead of tight_layout() to avoid warnings
+    filename = f"mode0_gamma_loss_comparison_p{p}_{potential_type}.png"
+    plt.savefig(os.path.join(save_dir, filename), dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -2074,7 +2190,7 @@ if __name__ == "__main__":
         potential_type = "harmonic"
 
         # Train neural network or load existing models
-        train_new = True  # Set to True to train, False to load
+        train_new = False  # Set to True to train, False to load
         filename = f"my_gpe_models_p{p}_{potential_type}_negative_interaction_strength_pert_const_1e-2_tol_{tol}_with_pretraining.pkl"
 
         # Create plotting and model saving directory
@@ -2110,6 +2226,7 @@ if __name__ == "__main__":
         print("Generating combined loss plots...")
         plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
         plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
+        plot_mode0_gamma_loss_visualization(training_history, gamma_values, epochs, p, potential_type, p_save_dir)
 
         print("Generating early stopping analysis plots...")
         plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
