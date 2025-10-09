@@ -187,8 +187,8 @@ class GrossPitaevskiiPINN(nn.Module):
         interaction = gamma * u ** p
         #interaction = gamma * torch.abs(u) ** (p - 1) * u
 
-        numerator = torch.sum(u * (kinetic + potential + interaction))
-        denominator = torch.sum(u ** 2)
+        numerator = torch.mean(u * (kinetic + potential + interaction))
+        denominator = torch.mean(u ** 2)
         lambda_pde = numerator / denominator
 
         # Residual of the 1D Gross-Pitaevskii equation
@@ -494,8 +494,12 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
 
                 # Choose normalization based on type
                 if normalization_type == "unit":
-
                     # Standard: ∫|ψ|² = 1
+                    #u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+
+                    xi_scale = (2.0) ** (1.0 / 3.0)
+                    u_np *= xi_scale
+
                     u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
                 elif normalization_type == "max":
@@ -552,7 +556,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
         plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(0, 20)
+        plt.xlim(0, 20.0)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
@@ -2268,8 +2272,8 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 5.0
-    gamma_values = [k * alpha for k in range(21)]
+    alpha = 0.5
+    gamma_values = [k * alpha for k in range(201)]
     #gamma_values = [k * alpha for k in range(51)]
 
     # Include modes 0 through 5
@@ -2291,10 +2295,10 @@ if __name__ == "__main__":
 
         # Train neural network or load existing models
         train_new = False  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
+        filename = f"tmp_mean.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test"
+        p_save_dir = f"tmp_mean"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
@@ -2316,9 +2320,9 @@ if __name__ == "__main__":
         plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
                           potential_type, p_save_dir, normalization_type="unit")
 
-        # # Plot μ vs γ for all modes
-        # print("Generating chemical potential vs. gamma plot...")
-        # plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
+        # Plot μ vs γ for all modes
+        print("Generating chemical potential vs. gamma plot...")
+        plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
         #
         # # Plot combined loss history
         # print("Generating combined loss plots...")
@@ -2343,7 +2347,7 @@ if __name__ == "__main__":
             print(f"  Epochs per method: {comparison_epochs}")
 
             # Create comparison save directory
-            comparison_save_dir = f"comparison_results_p{p}_{potential_type}_with_pretraining_orig"
+            comparison_save_dir = f"comparison_tmp_mean"
 
             # Run comparison with individual caching
             results_df, paper_results, best_results = create_comparison_table_individual_caching(
