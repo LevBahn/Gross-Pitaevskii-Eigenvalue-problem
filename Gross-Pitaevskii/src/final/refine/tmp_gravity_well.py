@@ -392,7 +392,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
                     # This is valid for ground state (mode 0) which should be nodeless
                     u_np = np.abs(u_np)
                 # Plot wavefunctions
-                if gamma % 4 == 0:
+                if gamma % 20 == 0:
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
@@ -1794,7 +1794,7 @@ if __name__ == "__main__":
         # Specify potential type
         potential_type = "gravity_well"
         # Train neural network or load existing models
-        train_new = True  # Set to True to train, False to load
+        train_new = False  # Set to True to train, False to load
         filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}_matt.pkl"
         # Create plotting and model saving directory
         p_save_dir = f"plots_p{p}_{potential_type}_paper_test_matt"
@@ -1825,7 +1825,7 @@ if __name__ == "__main__":
         print("Generating early stopping analysis plots...")
         plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
         # Decide if we want to run the comparison
-        run_comparison = True
+        run_comparison = False
         if run_comparison:
             # Comparison parameters
             comparison_modes = modes

@@ -308,7 +308,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
             elif gamma == 0.0:
                 # Pre-train on analytical solution
                 model = pretrain_on_analytical_solution(model, mode, X_train,
-                                                        epochs=2000, lr=1e-3, verbose=verbose)
+                                                        epochs=5000, lr=1e-3, verbose=verbose)
                 # Verify the eigenvalue is correct
                 if verbose:
                     from scipy.special import ai_zeros
@@ -319,8 +319,8 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                     alpha_n = ai_zeros(mode + 1)[0][mode]
                     psi = airy(x_np + alpha_n)[0]
                     print(f"  ψ(0) = {psi[0]:.6e}")
-                    print(f"  ψ(35) = {psi[-1]:.6e}")
-                    print(f"  ψ(35)/ψ(0) = {psi[-1] / psi[0]:.6e}")
+                    print(f"  ψ(20) = {psi[-1]:.6e}")
+                    print(f"  ψ(20)/ψ(0) = {psi[-1] / psi[0]:.6e}")
 
             else:
                 # Use advanced initialization for any other starting gamma not equal 0
@@ -352,7 +352,8 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 # Forward pass
                 u_pred = model.forward(X_tensor)
                 if epoch == 0 and gamma == 0:
-                    normal_const = torch.max(u_pred).detach().clone()
+                    base_solution = model.airy_solution(X_tensor.squeeze(), mode).unsqueeze(-1)
+                    normal_const = torch.sqrt(torch.mean(base_solution ** 2)).detach().clone()
                     constant_history[mode] = normal_const
                     u_pred = u_pred / normal_const
                     u_pred = perturb_const * u_pred
@@ -494,8 +495,12 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
 
                 # Choose normalization based on type
                 if normalization_type == "unit":
-
                     # Standard: ∫|ψ|² = 1
+                    #u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+
+                    xi_scale = (2.0) ** (1.0 / 3.0)
+                    u_np *= xi_scale
+
                     u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
                 elif normalization_type == "max":
@@ -552,7 +557,7 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
         plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(0, 20)
+        plt.xlim(0, 20.0)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
@@ -726,30 +731,43 @@ def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, 
     """Pre-train network to output the analytical eigenfunction."""
     model.train()
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
+    dx = X_train[1, 0] - X_train[0, 0]
 
     with torch.no_grad():
         analytical_target = model.airy_solution(X_tensor.squeeze(), mode).unsqueeze(-1).detach()
+        # Normalize the analytical target using RMS
+        target_norm = torch.sqrt(torch.mean(analytical_target ** 2))
+        analytical_target = analytical_target / target_norm
 
     # Use Adam optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    for epoch in range(epochs):
-        if epoch < epochs - 500:
+    # Adjust epochs based on mode difficulty
+    actual_epochs = epochs * (1 + mode // 2)  # More epochs for higher modes
+    lbfgs_switch = actual_epochs - 500
+
+    for epoch in range(actual_epochs):
+        if epoch < lbfgs_switch:
             # Adam phase
             optimizer.zero_grad()
             prediction = model.forward(X_tensor)
-            loss = torch.mean((prediction - analytical_target) ** 2)
+            # Normalize prediction the same way
+            pred_norm = torch.sqrt(torch.mean(prediction ** 2))
+            prediction_normalized = prediction / pred_norm
+            loss = torch.mean((prediction_normalized - analytical_target) ** 2)
             loss.backward()
             optimizer.step()
         else:
             # Switch to LBFGS for final refinement
-            if epoch == epochs - 500:
+            if epoch == lbfgs_switch:
                 optimizer = torch.optim.LBFGS(model.parameters(), lr=lr * 0.1, max_iter=20)
 
                 def closure():
                     optimizer.zero_grad()
                     pred = model.forward(X_tensor)
-                    l = torch.mean((pred - analytical_target) ** 2)
+                    pred_norm = torch.sqrt(torch.mean(pred ** 2))
+                    pred_normalized = pred / pred_norm
+                    l = torch.mean((pred_normalized - analytical_target) ** 2)
                     l.backward()
                     return l
 
@@ -763,8 +781,9 @@ def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, 
         if verbose and epoch % 500 == 0:
             print(f"  Pre-training epoch {epoch}, loss: {loss.item():.2e}")
 
-        # Early stopping
-        if loss.item() < 1e-12:
+        # Stricter convergence for higher modes
+        convergence_threshold = 1e-12 / (1 + mode * 0.1)
+        if loss.item() < convergence_threshold:
             if verbose:
                 print(f"  Pre-training converged at epoch {epoch}, loss: {loss.item():.2e}")
             break
@@ -772,16 +791,22 @@ def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, 
     if verbose:
         print(f"  Pre-training finished, final loss: {loss.item():.2e}")
 
-    if verbose:
-        print(f"  Pre-training finished, final loss: {loss.item():.2e}")
-
         # DEBUG: Check eigenvalue after pre-training
-        X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
-        pred = model.forward(X_tensor)
+        X_tensor_debug = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
+        pred = model.forward(X_tensor_debug)
 
-        # Compute eigenvalue manually
-        pde_loss, lambda_val = model.pde_loss(X_tensor, pred, gamma=0.0, p=3, potential_type='gravity_well')
+        # Normalize for PDE loss check
+        pred_norm = torch.sqrt(torch.mean(pred ** 2))
+        pred_normalized = pred / pred_norm
+
+        # Compute eigenvalue manually (use small perturbation for PDE loss)
+        pde_loss, lambda_val = model.pde_loss(X_tensor_debug, pred_normalized * 0.01, gamma=0.0, p=3,
+                                              potential_type='gravity_well')
         print(f"  Eigenvalue after pre-training: {lambda_val.item():.4f}")
+
+        from scipy.special import ai_zeros
+        expected_mu = -ai_zeros(mode + 1)[0][mode]
+        print(f"  Expected eigenvalue for mode {mode}: {expected_mu:.4f}")
 
     return model
 
@@ -2268,8 +2293,8 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 5.0
-    gamma_values = [k * alpha for k in range(21)]
+    alpha = 0.5
+    gamma_values = [k * alpha for k in range(201)]
     #gamma_values = [k * alpha for k in range(51)]
 
     # Include modes 0 through 5
@@ -2290,11 +2315,11 @@ if __name__ == "__main__":
         potential_type = "gravity_well"
 
         # Train neural network or load existing models
-        train_new = False  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_1e-2_tol_{tol}.pkl"
+        train_new = True  # Set to True to train, False to load
+        filename = f"tmp_sum_l2_new.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test"
+        p_save_dir = f"tmp_sum_l2_new"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
@@ -2316,9 +2341,9 @@ if __name__ == "__main__":
         plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
                           potential_type, p_save_dir, normalization_type="unit")
 
-        # # Plot μ vs γ for all modes
-        # print("Generating chemical potential vs. gamma plot...")
-        # plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
+        # Plot μ vs γ for all modes
+        print("Generating chemical potential vs. gamma plot...")
+        plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
         #
         # # Plot combined loss history
         # print("Generating combined loss plots...")
@@ -2343,7 +2368,7 @@ if __name__ == "__main__":
             print(f"  Epochs per method: {comparison_epochs}")
 
             # Create comparison save directory
-            comparison_save_dir = f"comparison_results_p{p}_{potential_type}_with_pretraining_orig"
+            comparison_save_dir = f"Comparison_tmp_sum_l2"
 
             # Run comparison with individual caching
             results_df, paper_results, best_results = create_comparison_table_individual_caching(
