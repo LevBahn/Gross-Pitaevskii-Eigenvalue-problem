@@ -6,7 +6,7 @@ import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-from scipy.special import airy, ai_zeros, hermite
+from scipy.special import hermite
 import pandas as pd
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,7 +54,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, use_residual=True, use_perturbation=True):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=1.0, use_residual=True, use_perturbation=True):
         """
         Parameters
         ----------
@@ -68,6 +68,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Mode number (default is 0).
         gamma : float, optional
             Interaction strength parameter.
+        L : float, optional
+            Length of the box (default is 1.0).
         use_perturbation: boolean, optional
             Get the complete solution by combining the base solution with the neural network perturbation. Default is
             True.
@@ -80,6 +82,7 @@ class GrossPitaevskiiPINN(nn.Module):
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
         self.gamma = gamma  # Interaction strength parameter
+        self.L = L  # Length of the box
         self.use_perturbation = use_perturbation  # Combine the base solution with the neural network perturbation
 
     def build_network(self):
@@ -93,35 +96,38 @@ class GrossPitaevskiiPINN(nn.Module):
                 layers.append(ShiftedTanh())
         return nn.Sequential(*layers)
 
-    def airy_solution(self, x, n):
+    def box_eigenfunction(self, x, n):
         """
-        Linear eigenfunction: Ψ_n(x) = Ai(x + α_n) where α_n is the n-th Airy zero
+        Compute the analytic eigenfunction for a particle in a box.
+
+        For the linear case (gamma = 0), the solution is:
+        phi_n(x) = sqrt(2/L) * sin(n*pi*x/L)
+
+        This corresponds to equation (22) in the paper.
         """
+        # For mode 0, n=1 in the sine function per equation (22)
+        n_actual = n + 1  # Convert mode number to quantum number (n=0 → first excited state with n_actual=1)
 
-        # Convert to numpy
-        x_np = x.detach().cpu().numpy()
+        # Normalization factor
+        norm_factor = torch.sqrt(torch.tensor(2.0 / self.L))
 
-        # Get n-th zero of Airy function
-        alpha_n = ai_zeros(n + 1)[0][n]
+        # Sine function with proper scaling
+        phi_n = norm_factor * torch.sin(n_actual * torch.pi * x / self.L)
 
-        # Eigenfunction: Ψ_n(x) = Ai(x - α_n)
-        psi = airy(x_np + alpha_n)[0]
-
-        # Normalize: ∫|ψ|² dx = 1
-        dx = x_np[1] - x_np[0] if len(x_np) > 1 else 0.01
-        norm_sq = np.sum(psi ** 2) * dx
-        psi = psi / np.sqrt(norm_sq)
-
-        # Convert back to tensor
-        solution = torch.tensor(psi, dtype=torch.float32).to(device)
-
-        return solution
+        return phi_n
 
     def forward(self, inputs):
         """
         Forward pass through the neural network.
         """
-        return self.network(inputs)
+        # return self.network(inputs)
+        x = inputs
+        raw_output = self.network(inputs)
+
+        # Enforce ψ(0) = ψ(1) = 0
+        boundary_factor = torch.sin(torch.pi * x)  # sin(0) = sin(π) = 0
+
+        return raw_output * boundary_factor
 
     def get_complete_solution(self, x, perturbation, mode=None):
         """
@@ -129,12 +135,12 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         if mode is None:
             mode = self.mode
-        base_solution = self.airy_solution(x, mode)
+        base_solution = self.box_eigenfunction(x, mode)
         return base_solution + perturbation
 
     def get_complete_solution_with_derivatives(self, x, perturbation, mode=None):
         """
-        Get complete solution AND its derivatives
+        Get complete solution AND its derivatives for box potential
         Returns: (u, u_x, u_xx) where u = base + perturbation
         """
         if mode is None:
@@ -142,22 +148,25 @@ class GrossPitaevskiiPINN(nn.Module):
 
         # Get base solution (numpy-based, no gradients)
         x_np = x.detach().cpu().numpy().flatten()
-        alpha_n = ai_zeros(mode + 1)[0][mode]
+        n_actual = mode + 1  # Convert mode number to quantum number
+
+        # Normalization factor
+        norm_factor = np.sqrt(2.0 / self.L)
 
         # Compute base solution and its derivatives analytically
-        ai_val, aip_val, bi_val, bip_val = airy(x_np + alpha_n)
+        # Base: psi(x) = sqrt(2/L) * sin(n*pi*x/L)
+        base_np = norm_factor * np.sin(n_actual * np.pi * x_np / self.L)
 
-        # Normalize
-        dx = x_np[1] - x_np[0] if len(x_np) > 1 else 0.01
-        norm_sq = np.sum(ai_val ** 2) * dx
-        norm_factor = np.sqrt(norm_sq)
+        # First derivative: d/dx[sin(n*pi*x/L)] = (n*pi/L) * cos(n*pi*x/L)
+        base_x_np = norm_factor * (n_actual * np.pi / self.L) * np.cos(n_actual * np.pi * x_np / self.L)
 
-        base_solution = torch.tensor(ai_val / norm_factor, dtype=torch.float32).reshape(-1, 1).to(device)
-        base_solution_x = torch.tensor(aip_val / norm_factor, dtype=torch.float32).reshape(-1, 1).to(device)
+        # Second derivative: d²/dx²[sin(n*pi*x/L)] = -(n*pi/L)² * sin(n*pi*x/L)
+        base_xx_np = -norm_factor * (n_actual * np.pi / self.L) ** 2 * np.sin(n_actual * np.pi * x_np / self.L)
 
-        # For second derivative, use numerical differentiation on aip
-        base_solution_xx_np = np.gradient(aip_val / norm_factor, dx)
-        base_solution_xx = torch.tensor(base_solution_xx_np, dtype=torch.float32).reshape(-1, 1).to(device)
+        # Convert to tensors
+        base_solution = torch.tensor(base_np, dtype=torch.float32).reshape(-1, 1).to(device)
+        base_solution_x = torch.tensor(base_x_np, dtype=torch.float32).reshape(-1, 1).to(device)
+        base_solution_xx = torch.tensor(base_xx_np, dtype=torch.float32).reshape(-1, 1).to(device)
 
         # Compute perturbation derivatives via autograd
         pert_x = torch.autograd.grad(perturbation, x, torch.ones_like(perturbation),
@@ -172,19 +181,23 @@ class GrossPitaevskiiPINN(nn.Module):
 
         return u, u_x, u_xx
 
-    def compute_potential(self, x, potential_type="gravity_well", **kwargs):
+    def compute_potential(self, x, potential_type="box", **kwargs):
         """
         Compute potential function for the 1D domain.
         """
-        if potential_type == "gravity_well":
-            # The dimensionless form requires scaling factor
-            V = x.clone()
-
-            return V
+        if potential_type == "box":
+            # V0 = 1000  # Wall strength
+            # sigma = 0.05  # Wall width
+            # L =  self.L  # Box length
+            #
+            # V = V0 * (torch.exp(-(x / sigma) ** 2) +
+            #           torch.exp(-((L - x) / sigma) ** 2))
+            V = torch.zeros_like(x)
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
+        return V
 
-    def pde_loss(self, inputs, predictions, gamma, p, potential_type="gravity_well", precomputed_potential=None):
+    def pde_loss(self, inputs, predictions, gamma, p, potential_type="box", precomputed_potential=None):
         """
         Compute the PDE loss for the Gross-Pitaevskii equation.
         μψ = - ∇²ψ + Vψ + γ|ψ|²ψ
@@ -219,17 +232,19 @@ class GrossPitaevskiiPINN(nn.Module):
             V = self.compute_potential(inputs, potential_type)
 
         # Calculate chemical potential
-        dx = inputs[1] - inputs[0] if len(inputs) > 1 else 0.01
         kinetic = -u_xx
         potential = V * u
+        #interaction = gamma * u ** 3
         interaction = gamma * u ** p
 
-        numerator = torch.sum(u * (kinetic + potential + interaction))
-        denominator = torch.sum(u ** 2)
+        numerator = torch.mean(u * (kinetic + potential + interaction))
+        denominator = torch.mean(u ** 2)
         lambda_pde = numerator / denominator
 
-        # PDE residual
+        # Residual of the 1D Gross-Pitaevskii equation
         pde_residual = kinetic + potential + interaction - lambda_pde * u
+
+        # PDE loss (mean squared residual)
         pde_loss = torch.mean(pde_residual ** 2)
 
         return pde_loss, lambda_pde
@@ -256,58 +271,9 @@ class GrossPitaevskiiPINN(nn.Module):
         return (integral - 1.0) ** 2
 
 
-def check_eigenvalue_numerical(model, X_train, mode):
-    """Check if the base Airy solution gives correct eigenvalue"""
-    from scipy.special import ai_zeros
-
-    dx = X_train[1, 0] - X_train[0, 0]
-    x_np = X_train.flatten()
-
-    # Get Airy solution in numpy
-    alpha_n = ai_zeros(mode + 1)[0][mode]
-    from scipy.special import airy
-    psi = airy(x_np + alpha_n)[0]
-
-    # Normalize
-    norm_sq = np.sum(psi ** 2) * dx
-    psi = psi / np.sqrt(norm_sq)
-
-    # Compute second derivative numerically
-    psi_x = np.gradient(psi, dx)
-    psi_xx = np.gradient(psi_x, dx)
-
-    # Compute energy terms
-    V = x_np  # gravity well potential
-    kinetic = -psi_xx
-    potential = V * psi
-
-    # Compute eigenvalue
-    numerator = np.sum(psi * (kinetic + potential)) * dx
-    denominator = np.sum(psi ** 2) * dx
-    lambda_computed = numerator / denominator
-
-    print(f"\n=== Base Airy Solution Eigenvalue Check ===")
-    print(f"∫ψ² dx = {denominator:.6f} (should be ≈1 if normalized)")
-    print(f"Computed λ = {lambda_computed:.6f}")
-    print(f"Expected λ = {-alpha_n:.6f}")
-    print(f"Error = {abs(lambda_computed + alpha_n):.6f}")
-
-    # Also check individual terms
-    kinetic_contrib = np.sum(psi * kinetic) * dx / denominator
-    potential_contrib = np.sum(psi * potential) * dx / denominator
-    print(f"\nKinetic contribution: {kinetic_contrib:.6f}")
-    print(f"Potential contribution: {potential_contrib:.6f}")
-    print(f"Total: {(kinetic_contrib + potential_contrib):.6f}")
-
-    # Check integration by parts for kinetic energy
-    kinetic_ibp = np.sum(psi_x ** 2) * dx / denominator
-    print(f"\nKinetic (integration by parts): ∫(ψ')² dx / ∫ψ² dx = {kinetic_ibp:.6f}")
-
-    return lambda_computed
-
 def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                     epochs, tol, perturb_const,
-                    potential_type='gravity_well', lr=1e-5, verbose=True):
+                    potential_type='box', lr=1e-5, verbose=True):
     """
     Train the GPE model for different modes and gamma values for the PL-PINN implementation.
 
@@ -347,11 +313,8 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
     dx = X_train[1, 0] - X_train[0, 0]  # Assuming uniform grid
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
-    print(f"  X_train shape: {X_train.shape}")
-    print(f"  X_train[0] = {X_train[0, 0]:.6f}, X_train[-1] = {X_train[-1, 0]:.6f}")
-    print(f"  dx = {X_train[1, 0] - X_train[0, 0]:.6f}")
-
     # Create boundary conditions
+    L = ub
     boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
@@ -384,7 +347,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 print(f"\nTraining for γ = {gamma:.2f}, mode = {mode}, nonlinearity p = {p}")
 
             # Initialize model for this mode and gamma
-            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma).to(device)
+            model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L).to(device)
 
             # If this isn't the first gamma value, initialize with previous model's weights
             if prev_model is not None:
@@ -393,7 +356,6 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                 # Pre-train on analytical solution
                 model = pretrain_on_analytical_solution(model, mode, X_train,
                                                         epochs=2000, lr=1e-3, verbose=verbose)
-                check_eigenvalue_numerical(model, X_train, mode=0)
             else:
                 # Use advanced initialization for any other starting gamma not equal 0
                 model.apply(lambda m: advanced_initialization(m, mode))
@@ -428,88 +390,6 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
                     constant_history[mode] = normal_const
                     u_pred = u_pred / normal_const
                     u_pred = perturb_const * u_pred
-
-                    # # Debug the scaling
-                    # print(f"\n=== Epoch 0 Scaling Debug ===")
-                    # print(f"NN output max: {torch.max(u_pred).item():.6f}")
-                    # print(f"NN output min: {torch.min(u_pred).item():.6f}")
-                    # print(f"normal_const: {normal_const.item():.6f}")
-                    #
-                    # # After scaling
-                    # u_pred_scaled = u_pred / normal_const * perturb_const
-                    # print(f"\nAfter scaling by perturb_const/normal_const:")
-                    # print(f"u_pred max: {torch.max(u_pred_scaled).item():.6f}")
-                    # print(f"u_pred min: {torch.min(u_pred_scaled).item():.6f}")
-                    #
-                    # # Get full solution
-                    # full_u = model.get_complete_solution(X_tensor, u_pred_scaled)
-                    # print(f"\nFull solution (Airy + perturbation):")
-                    # print(f"full_u max: {torch.max(full_u).item():.6f}")
-                    # print(f"full_u min: {torch.min(full_u).item():.6f}")
-                    #
-                    # # Check norm
-                    # norm = torch.sum(full_u ** 2) * dx
-                    # print(f"∫full_u² dx: {norm.item():.6f}")
-                    #
-                    # # Most importantly - check if full_u matches Airy solution
-                    # base_only = model.airy_solution(X_tensor.squeeze(), mode).unsqueeze(-1)
-                    # diff = torch.abs(full_u - base_only)
-                    # print(f"\nDifference from base Airy:")
-                    # print(f"max|full_u - airy|: {torch.max(diff).item():.6f}")
-                    # print(f"mean|full_u - airy|: {torch.mean(diff).item():.6f}")
-                    #
-                    # print("\n=== Comparing Derivative Methods ===")
-                    #
-                    # # Method 1: Autograd (used in training)
-                    # u_x_auto = torch.autograd.grad(
-                    #     outputs=full_u,
-                    #     inputs=X_tensor,
-                    #     grad_outputs=torch.ones_like(full_u),
-                    #     create_graph=True,
-                    #     retain_graph=True
-                    # )[0]
-                    #
-                    # u_xx_auto = torch.autograd.grad(
-                    #     outputs=u_x_auto,
-                    #     inputs=X_tensor,
-                    #     grad_outputs=torch.ones_like(u_x_auto),
-                    #     create_graph=True,
-                    #     retain_graph=True
-                    # )[0]
-                    #
-                    # # Method 2: Numpy gradient (used in your diagnostic)
-                    # full_u_np = full_u.detach().cpu().numpy().flatten()
-                    # u_x_np = np.gradient(full_u_np, dx)
-                    # u_xx_np = np.gradient(u_x_np, dx)
-                    #
-                    # # Convert back to compare
-                    # u_xx_np_tensor = torch.tensor(u_xx_np, dtype=torch.float32).reshape(-1, 1).to(device)
-                    #
-                    # print(f"u_xx (autograd) max: {torch.max(u_xx_auto).item():.6f}")
-                    # print(f"u_xx (numpy) max: {torch.max(u_xx_np_tensor).item():.6f}")
-                    # print(f"Difference max: {torch.max(torch.abs(u_xx_auto - u_xx_np_tensor)).item():.6f}")
-                    #
-                    # # Compute eigenvalue with numpy
-                    # V = X_tensor
-                    # kinetic_numpy = -u_xx_np_tensor
-                    # potential_numpy = V * full_u
-                    # numerator_numpy = torch.sum(full_u * (kinetic_numpy + potential_numpy)) * dx
-                    # denominator_numpy = torch.sum(full_u ** 2) * dx
-                    # lambda_auto = numerator_numpy / denominator_numpy
-                    #
-                    #
-                    # # Compute eigenvalue with autograd method
-                    # V = X_tensor
-                    # kinetic_auto = -u_xx_auto
-                    # potential_auto = V * full_u
-                    #
-                    # numerator_auto = torch.sum(full_u * (kinetic_auto + potential_auto)) * dx
-                    # denominator_auto = torch.sum(full_u ** 2) * dx
-                    # lambda_auto = numerator_auto / denominator_auto
-                    #
-                    # print(f"\nEigenvalue (autograd): {lambda_auto.item():.6f}")
-                    # print(f"Eigenvalue (numpy): 2.338079")
-                    # print(f"This explains the discrepancy!")
                 else:
                     u_pred = perturb_const * u_pred
                     u_pred = u_pred / normal_const
@@ -605,72 +485,70 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
 
 def plot_wavefunction(models_by_mode, X_test, gamma_values,
                       modes, p, constant_history, perturb_const, potential_type,
-                      save_dir="Gross-Pitaevskii/src/final/refine/test",
-                      normalization_type="unit"):
+                      save_dir="Gross-Pitaevskii/src/final/refine/test"):
     """
-    Plot wavefunctions for different modes and gamma values.
+    Plot wavefunctions (not densities) for different modes and gamma values.
     """
     os.makedirs(save_dir, exist_ok=True)
 
+    # Generate individual figures for each mode
     for mode in modes:
         if mode not in models_by_mode:
             continue
 
+        # Create individual figure
         plt.figure(figsize=(8, 6))
-        X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
-        dx = X_test[1, 0] - X_test[0, 0]
 
+        X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+        dx = X_test[1, 0] - X_test[0, 0]  # Spatial step size
+
+        # Different line styles and colors
         linestyles = ['-', '--', '-.', ':', '-', '--']
         colors = ['k', 'b', 'r', 'g', 'm', 'c', 'slategray']
 
-        # Map to replicate the old alpha=0.5 indexing pattern
-        # Old j values were: 0, 40, 80, 120, 160, 200
-        old_j_values = [0, 40, 80, 120, 160, 200]
-
+        # Plot solutions for different gamma values
         for j, gamma in enumerate(gamma_values):
             if gamma not in models_by_mode[mode]:
                 continue
 
-            if gamma % 20 == 0:
-                model = models_by_mode[mode][gamma]
-                model.eval()
-                const = constant_history[mode]
+            model = models_by_mode[mode][gamma]
+            model.eval()
+            const = constant_history[mode]
 
-                with torch.no_grad():
-                    u_pred = model.forward(X_tensor)
-                    u_pred = u_pred * (perturb_const / const)
-                    full_u = model.get_complete_solution(X_tensor, u_pred)
-                    u_np = full_u.cpu().numpy().flatten()
+            with torch.no_grad():
+                u_pred = model.forward(X_tensor)
+                u_pred = u_pred * (perturb_const / const)
+                full_u = model.get_complete_solution(X_tensor, u_pred)
+                u_np = full_u.cpu().numpy().flatten()
 
-                    # Normalization: ∫|ψ|² = 1
-                    norm = np.sqrt(np.sum(u_np ** 2) * dx)
-                    if norm > 1e-12:
-                        u_np /= norm
+                # Normalization
+                u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                    # For mode 0, ensure positive values
-                    if mode == 0:
-                        u_np = np.abs(u_np)
+                # For mode 0, ensure all wavefunctions are positive
+                if mode == 0:
+                    # Take absolute value to ensure positive values
+                    # This is valid for ground state (mode 0) which should be nodeless
+                    u_np = np.abs(u_np)
 
-                    # Use old index pattern to match old plot colors
-                    gamma_idx = int(gamma / 20)  # 0, 1, 2, 3, 4, 5 for gamma=0,20,40,60,80,100
-                    old_j = old_j_values[gamma_idx]
-
+                # Plot wavefunctions
+                if gamma % 20 == 0:
                     plt.plot(X_test.flatten(), u_np,
-                             linestyle=linestyles[old_j % len(linestyles)],
-                             color=colors[old_j % len(colors)],
+                             linestyle=linestyles[j % len(linestyles)],
+                             color=colors[j % len(colors)],
                              label=f"η={gamma:.1f}")
 
+        # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
         plt.xlabel("x", fontsize=18)
-        plt.ylabel(r"$\psi(x)$", fontsize=18)
-        # plt.ylim(-0.8, 0.8)
+        plt.ylabel(r"$u(x)$", fontsize=18)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(0, 20.0)
+        plt.xlim(0, 1)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
 
+    # Also create a combined grid figure to show all modes
     plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
                        constant_history, perturb_const, potential_type, save_dir)
 
@@ -709,50 +587,43 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
 
         ax = axes[i]
 
+        # Plot solutions for different gamma values
         for j, gamma in enumerate(gamma_values):
             if gamma not in models_by_mode[mode]:
                 continue
 
-            if gamma % 20 == 0:
-                model = models_by_mode[mode][gamma]
-                model.eval()
+            model = models_by_mode[mode][gamma]
+            model.eval()
+            const = constant_history[mode]
 
-                # NEW: Get gamma-specific constant
-                if isinstance(constant_history[mode], dict):
-                    const = constant_history[mode][gamma]
-                else:
-                    const = constant_history[mode]
+            with torch.no_grad():
+                u_pred = model.forward(X_tensor)
+                u_pred = u_pred * (perturb_const / const)
+                full_u = model.get_complete_solution(X_tensor, u_pred)
+                u_np = full_u.cpu().numpy().flatten()
 
-                with torch.no_grad():
-                    u_pred = model.forward(X_tensor)
-                    u_pred = u_pred * (perturb_const / const)
-                    full_u = model.get_complete_solution(X_tensor, u_pred)
-                    u_np = full_u.cpu().numpy().flatten()
+                # Proper normalization
+                u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                    # Proper normalization
-                    u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+                # For mode 0, ensure all wavefunctions are positive
+                if mode == 0:
+                    # Take absolute value to ensure positive values
+                    u_np = np.abs(u_np)
 
-                    # For mode 0, ensure positive values
-                    if mode == 0:
-                        u_np = np.abs(u_np)
-
-                    # Replicate old alpha=0.5 index pattern
-                    # Old: gamma / 0.5 = gamma * 2
-                    old_j = int(gamma * 2)
-
+                # Plot the wavefunction (not density)
+                if gamma % 20 == 0:
                     ax.plot(X_test.flatten(), u_np,
-                            linestyle=linestyles[old_j % len(linestyles)],
-                            color=colors[old_j % len(colors)],
+                            linestyle=linestyles[j % len(linestyles)],
+                            color=colors[j % len(colors)],
                             label=f"γ={gamma:.1f}")
 
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
         ax.set_xlabel("x", fontsize=12)
         ax.set_ylabel(r"$\psi(x)$", fontsize=12)
-        ax.set_ylim(-0.8, 0.8)
         ax.grid(True)
         ax.legend(fontsize=6)
-        ax.set_xlim(0, 35)
+        ax.set_xlim(0, 1)
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
@@ -766,7 +637,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
 
 
 def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevskii/src/final/refine/test",
-                     sample_interval=8):
+                     sample_interval=4):
     """
     Plot chemical potential vs. interaction strength for different modes.
 
@@ -842,57 +713,30 @@ def advanced_initialization(m, mode):
             m.bias.data.fill_(0.01)
 
 
-def pretrain_on_analytical_solution(model, mode, X_train, epochs=10000, lr=1e-3, verbose=True):
-    """Pre-train network to output the analytical Airy solution."""
+def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, verbose=True):
+    """Pre-train network to output the analytical eigenfunction for a particle in a box."""
     model.train()
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
-    # Precompute analytical target
     with torch.no_grad():
-        analytical_target = model.airy_solution(X_tensor.squeeze(), mode).unsqueeze(-1).detach()
+        analytical_target = model.box_eigenfunction(X_tensor.squeeze(), mode).unsqueeze(-1).detach()
 
-    # Precompute analytical derivative using finite differences
-    with torch.no_grad():
-        dx = X_train[1, 0] - X_train[0, 0]
-        # Use numpy for derivative computation
-        from scipy.special import airy, ai_zeros
-        x_np = X_train.flatten()
-        alpha_n = ai_zeros(mode + 1)[0][mode]
-
-        # Get Airy function and its derivative
-        ai, aip, bi, bip = airy(x_np + alpha_n)
-
-        # Normalize to match analytical_target
-        norm_sq = np.sum(ai ** 2) * dx
-        ai_normalized = ai / np.sqrt(norm_sq)
-        aip_normalized = aip / np.sqrt(norm_sq)
-
-        analytical_deriv = torch.tensor(aip_normalized, dtype=torch.float32).reshape(-1, 1).to(device)
-
-    # Use Adam for most of training
+    # Use both Adam and LBFGS for better convergence
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    closure = None  # Define closure outside the loop
+
     for epoch in range(epochs):
-        if epoch < epochs - 1000:
-            # Adam phase - fit both function and derivatives
+        if epoch < epochs - 500:
+            # Adam phase
             optimizer.zero_grad()
             prediction = model.forward(X_tensor)
-
-            # Function loss
-            func_loss = torch.mean((prediction - analytical_target) ** 2)
-
-            # Derivative loss to ensure smooth gradients
-            pred_x = torch.autograd.grad(prediction, X_tensor, torch.ones_like(prediction),
-                                         create_graph=True, retain_graph=True)[0]
-            deriv_loss = torch.mean((pred_x - analytical_deriv) ** 2)
-
-            # Combined loss
-            loss = func_loss + 0.1 * deriv_loss
+            loss = torch.mean((prediction - analytical_target) ** 2)
             loss.backward()
             optimizer.step()
         else:
             # Switch to LBFGS for final refinement
-            if epoch == epochs - 1000:
+            if epoch == epochs - 500:
                 optimizer = torch.optim.LBFGS(model.parameters(), lr=lr * 0.1, max_iter=20)
 
                 def closure():
@@ -909,26 +753,17 @@ def pretrain_on_analytical_solution(model, mode, X_train, epochs=10000, lr=1e-3,
             loss = optimizer.step(closure)
 
         # Logging
-        if verbose and epoch % 1000 == 0:
-            with torch.no_grad():
-                prediction = model.forward(X_tensor)
-                current_loss = torch.mean((prediction - analytical_target) ** 2)
-            print(f"  Pre-training epoch {epoch}, loss: {current_loss.item():.2e}")
+        if verbose and epoch % 500 == 0:
+            print(f"  Pre-training epoch {epoch}, loss: {loss.item():.2e}")
 
-        # Early stopping - need much lower loss
-        if isinstance(loss, torch.Tensor):
-            loss_val = loss.item()
-        else:
-            loss_val = loss
-
-        if loss_val < 1e-14:
+        # Early stopping
+        if loss.item() < 1e-12:
             if verbose:
-                print(f"  Pre-training converged at epoch {epoch}, loss: {loss_val:.2e}")
+                print(f"  Pre-training converged at epoch {epoch}, loss: {loss.item():.2e}")
             break
 
     if verbose:
-        final_loss = loss.item() if isinstance(loss, torch.Tensor) else loss
-        print(f"  Pre-training finished, final loss: {final_loss:.2e}")
+        print(f"  Pre-training finished, final loss: {loss.item():.2e}")
 
     return model
 
@@ -988,7 +823,7 @@ def plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, 
                 epoch_nums = np.linspace(0, epochs, len(loss_history))
 
                 # Plot loss on log scale
-                if gamma % 4 == 0:
+                if gamma % 20 == 0:
                     ax.semilogy(epoch_nums, loss_history,
                                 color=colors[j % len(colors)],
                                 linestyle=linestyles[j % len(linestyles)],
@@ -1095,7 +930,7 @@ def plot_mode0_gamma_loss_visualization(training_history, gamma_values_to_plot, 
     plt.figure(figsize=(12, 8))
 
     # Restrict number of gammas plotted
-    gamma_values_to_plot = [gamma for gamma in gamma_values if gamma % 4 == 0]
+    gamma_values_to_plot = [gamma for gamma in gamma_values if gamma % 20 == 0]
 
     # Set up colormap for different gamma values
     colormap = plt.cm.plasma  # Using plasma colormap for good contrast
@@ -1372,11 +1207,12 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    boundary_points = torch.tensor([[lb]], dtype=torch.float32).to(device)
-    boundary_values = torch.zeros((1, 1), dtype=torch.float32).to(device)
+    L = ub
+    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
     # Initialize model
-    model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, use_perturbation=False).to(device)
+    model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma, L=L, use_perturbation=False).to(device)
 
     # Key change: Pre-train on analytical solution for gamma=0
     if gamma == 0.0:
@@ -1405,9 +1241,9 @@ def train_regular_pinn(mode, gamma, p, X_train, lb, ub, layers, epochs, lr=1e-3,
         # Calculate losses
         boundary_loss = model.boundary_loss(boundary_points, boundary_values)
         norm_loss = model.normalization_loss(u_pred, dx)
-        constraint_loss = 1.0 * boundary_loss + 20.0 * norm_loss
+        constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
-        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "gravity_well")
+        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "box")
         total_loss = pde_loss + constraint_loss
 
         # Backpropagate
@@ -1523,8 +1359,8 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
-    boundary_points = torch.tensor([[lb]], dtype=torch.float32).to(device)
-    boundary_values = torch.zeros((1, 1), dtype=torch.float32).to(device)
+    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
     if use_warmstart:
         # For transferred models, use lower initial LR with gradual increase
@@ -1569,7 +1405,7 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
         norm_loss = model.normalization_loss(u_pred, dx)
         constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
 
-        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "gravity_well")
+        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, "box")
         total_loss = pde_loss + constraint_loss
 
         # Backpropagate
@@ -1604,160 +1440,36 @@ def train_single_model(model, gamma, p, X_train, lb, ub, epochs, initial_lr, fin
     return model, normal_const
 
 
-def compute_analytical_solution(X_test, mode, potential_type="gravity_well", gamma=0, L=1.0):
+def compute_analytical_solution(X_test, mode, gamma=0, L=1.0):
     """
     Compute analytical solution for comparison.
-    For gamma=0, this provides the linear solution for different potential types.
-    For gamma>0, returns None if no analytical solution is available.
+    For gamma=0, this is the particle in a box solution.
+    For gamma>0, you would need the exact solution if available.
     """
     x = X_test.flatten()
-    if len(X_test) <= 1:
-        raise ValueError("X_test must have at least 2 points to compute dx")
     dx = X_test[1, 0] - X_test[0, 0]
 
-    if gamma == 0:  # Linear case - analytical solutions available
+    # Analytical solution for particle in a box (gamma=0)
+    if gamma == 0:
+        # Box eigenfunction solution
+        n_actual = mode + 1  # Convert mode number to quantum number (n=0 → first excited state with n_actual=1)
+        norm_factor = np.sqrt(2.0 / L)
+        psi_analytical = norm_factor * np.sin(n_actual * np.pi * x / L)
 
-        if potential_type == "box":
-            # Box eigenfunction solution
-            n_actual = mode + 1  # Convert mode number to quantum number
-            norm_factor = np.sqrt(2.0 / L)
-            psi_analytical = norm_factor * np.sin(n_actual * np.pi * x / L)
+        # Normalize
+        psi_analytical /= np.sqrt(np.sum(psi_analytical ** 2) * dx)
 
-        elif potential_type == "gravity_well":
-            # Gravity well eigenfunction using Airy functions
-            # Airy function zeros (negative values where Ai(z) = 0)
-            airy_zeros = [
-                -2.33810741, -4.08794944, -5.52055983, -6.78670809, -7.94413359,
-                -9.02265085, -10.0401743, -11.0085243, -11.9360157, -12.8287767
-            ]
-
-            # Get the nth zero
-            if mode < len(airy_zeros):
-                x_n = airy_zeros[mode]
-            else:
-                # Asymptotic approximation for higher modes
-                x_n = -(1.5 * np.pi * (mode + 0.75)) ** (2 / 3)
-
-            # Coordinate transformation for gravity well
-            xi_scale = (2.0) ** (1 / 3)
-
-            # Initialize solution array
-            psi_analytical = np.zeros_like(x)
-
-            # Calculate Airy function for x >= 0
-            for i, x_val in enumerate(x):
-                if x_val >= 0:
-                    z = xi_scale * x_val + x_n
-                    psi_analytical[i] = airy(z)[0]
-                else:
-                    psi_analytical[i] = 0.0
-
-        elif potential_type == "harmonic":
-            # Harmonic oscillator eigenfunctions (Hermite polynomials)
-            from scipy.special import hermite
-            import math
-
-            # Hermite polynomial of order n
-            H_n = hermite(mode)(x)
-
-            # Normalization factor
-            norm_factor = (2 ** mode * math.factorial(mode) * np.sqrt(np.pi)) ** (-0.5)
-
-            # Complete wavefunction
-            psi_analytical = norm_factor * np.exp(-x ** 2 / 2) * H_n
-
-        else:
-            raise ValueError(f"Unknown potential type for analytical solution: {potential_type}")
-
-        # Normalize the solution
-        norm_integral = np.sum(psi_analytical ** 2) * dx
-        if norm_integral > 1e-12:
-            psi_analytical /= np.sqrt(norm_integral)
-
-        # For mode 0 in non-gravity potentials, ensure positive values
-        if mode == 0 and potential_type != "gravity_well":
+        # For mode 0, ensure positive
+        if mode == 0:
             psi_analytical = np.abs(psi_analytical)
 
         return psi_analytical
-
     else:
-        # For gamma > 0, analytical solutions are generally not available
-        # Exception: box potential has Jacobi elliptic function solution
-        if potential_type == "box" and gamma > 0:
-            # You could implement the Jacobi elliptic function solution here
-            # For now, return None
-            return None
-        else:
-            return None
+        # For gamma > 0, return None if no analytical solution available
+        return None
 
 
-def compare_with_analytical(model, X_test, mode, potential_type="gravity_well", gamma=0, L=1.0):
-    """
-    Compare PINN solution with analytical solution and compute error metrics.
-    """
-    # Get PINN solution
-    model.eval()
-    X_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        u_pred = model.forward(X_tensor)
-        psi_pinn = model.get_complete_solution(X_tensor, u_pred).cpu().numpy().flatten()
-
-    # Normalize PINN solution
-    dx = X_test[1, 0] - X_test[0, 0] if len(X_test) > 1 else 0.01
-
-    if potential_type == "gravity_well":
-        # Only normalize over x >= 0 domain
-        x_vals = X_test.flatten()
-        pos_mask = x_vals >= 0
-        if np.any(pos_mask):
-            psi_pos = psi_pinn[pos_mask]
-            norm_factor = np.sqrt(np.sum(psi_pos ** 2) * dx)
-            if norm_factor > 1e-12:
-                psi_pinn = psi_pinn / norm_factor
-    else:
-        # Standard normalization
-        norm_factor = np.sqrt(np.sum(psi_pinn ** 2) * dx)
-        if norm_factor > 1e-12:
-            psi_pinn = psi_pinn / norm_factor
-
-    # Get analytical solution
-    psi_analytical = compute_analytical_solution(X_test, mode, potential_type, gamma, L)
-
-    if psi_analytical is not None:
-        # Ensure same sign convention (align the solutions)
-        if np.dot(psi_pinn, psi_analytical) < 0:
-            psi_analytical = -psi_analytical
-
-        # Compute error metrics
-        l2_error = np.sqrt(np.sum((psi_pinn - psi_analytical) ** 2) * dx)
-        max_error = np.max(np.abs(psi_pinn - psi_analytical))
-
-        # Compute relative errors
-        analytical_norm = np.sqrt(np.sum(psi_analytical ** 2) * dx)
-        if analytical_norm > 1e-12:
-            relative_l2_error = l2_error / analytical_norm
-        else:
-            relative_l2_error = float('inf')
-
-        print(f"Comparison with analytical solution:")
-        print(f"  L2 error: {l2_error:.6e}")
-        print(f"  Max error: {max_error:.6e}")
-        print(f"  Relative L2 error: {relative_l2_error:.6e}")
-
-        return {
-            'psi_pinn': psi_pinn,
-            'psi_analytical': psi_analytical,
-            'l2_error': l2_error,
-            'max_error': max_error,
-            'relative_l2_error': relative_l2_error
-        }
-    else:
-        print(f"No analytical solution available for {potential_type} with gamma={gamma}")
-        return {'psi_pinn': psi_pinn, 'psi_analytical': None}
-
-
-def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name, perturb_const=0.01):
+def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name, perturb_const=0.01, L=1.0):
     """
     Compute the absolute and relative error for a trained model.
     """
@@ -1775,7 +1487,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
             # Use the network output as the solution
             full_u = model.forward(X_tensor)
 
-    u_np = full_u.detach().cpu().numpy().flatten()  # ← FIX: Added .detach()
+    u_np = full_u.detach().cpu().numpy().flatten()
 
     # Normalize the solution
     u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
@@ -1785,7 +1497,7 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
         u_np = np.abs(u_np)
 
     # Try to get analytical solution for comparison
-    analytical = compute_analytical_solution(X_test, mode, "gravity_well", gamma)
+    analytical = compute_analytical_solution(X_test, mode, gamma, L)
 
     if analytical is not None and gamma == 0:
         # Compute error against analytical solution
@@ -1802,13 +1514,13 @@ def compute_solution_error(model, constant, mode, gamma, p, X_test, method_name,
         else:
             u_eval = model.forward(X_tensor_eval)
 
-            # Compute PDE residual
+            # Compute PDE residual using autograd
             u_x = torch.autograd.grad(u_eval, X_tensor_eval, torch.ones_like(u_eval),
                                       create_graph=True, retain_graph=True)[0]
             u_xx = torch.autograd.grad(u_x, X_tensor_eval, torch.ones_like(u_x),
                                        create_graph=True, retain_graph=True)[0]
 
-        V = model.compute_potential(X_tensor_eval, "gravity_well")
+        V = model.compute_potential(X_tensor_eval, "box")
         F_u = -u_xx + V * u_eval + gamma * torch.abs(u_eval) ** (p - 1) * u_eval
 
         # Chemical potential
@@ -1981,7 +1693,7 @@ def load_curriculum_pinn_models(filename, save_dir="comparison_results"):
 
 
 def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers, epochs,
-                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="gravity_well",
+                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="box",
                                 force_retrain=False):
     """
     Train Regular PINNs or load from cache if available.
@@ -2027,7 +1739,7 @@ def train_or_load_regular_pinns(modes, gamma_values, p, X_train, lb, ub, layers,
 
 
 def train_or_load_curriculum_pinns(modes, gamma_values, p, X_train, lb, ub, layers, epochs,
-                                   save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="gravity_well",
+                                   save_dir="comparison_results", tol=1e-5, perturb_const=0.01, potential_type="box",
                                    force_retrain=False):
     """
     Train Curriculum PINNs or load from cache if available.
@@ -2067,7 +1779,7 @@ def train_or_load_curriculum_pinns(modes, gamma_values, p, X_train, lb, ub, laye
 def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, X_test, lb, ub, layers, epochs,
                                                save_dir="comparison_results", tol=1e-5, perturb_const=0.01,
                                                force_retrain_regular=False, force_retrain_curriculum=False,
-                                               potential_type="gravity_well"):
+                                               potential_type="box"):
     """
     Create comparison table with individual caching for each method.
 
@@ -2139,7 +1851,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
                 model = regular_models[mode][gamma]
                 const = regular_constants[mode]
                 abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "Vanilla PINN",
-                                                          perturb_const)
+                                                          perturb_const, L=ub)
                 results.append({
                     'Method': 'Vanilla PINN',
                     'Mode': mode,
@@ -2157,7 +1869,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
                 model = curriculum_models[mode][gamma]
                 const = curriculum_constants[mode]
                 abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "Curriculum Training",
-                                                          perturb_const)
+                                                          perturb_const, L=ub)
                 results.append({
                     'Method': 'Curriculum Training',
                     'Mode': mode,
@@ -2175,7 +1887,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
                 model = pl_pinn_models[mode][gamma]
                 const = pl_constant_history[mode]
                 abs_err, rel_err = compute_solution_error(model, const, mode, gamma, p, X_test, "PL-PINN",
-                                                          perturb_const)
+                                                          perturb_const, L=ub)
                 results.append({
                     'Method': 'PL-PINN',
                     'Mode': mode,
@@ -2490,7 +2202,7 @@ def create_latex_table(results_df, save_path=None):
 
 if __name__ == "__main__":
     # Setup parameters
-    lb, ub = 0, 35 # Domain boundaries
+    lb, ub = 0, 1 # Domain boundaries
     N_f = 4000  # Number of collocation points
     epochs = 5001
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
@@ -2500,8 +2212,8 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 0.25
-    gamma_values = [k * alpha for k in range(401)]
+    alpha = 0.5
+    gamma_values = [k * alpha for k in range(201)]
     #gamma_values = [k * alpha for k in range(51)]
 
     # Include modes 0 through 5
@@ -2519,14 +2231,14 @@ if __name__ == "__main__":
     for p in nonlinearity_powers:
 
         # Specify potential type
-        potential_type = "gravity_well"
+        potential_type = "box"
 
         # Train neural network or load existing models
-        train_new = False  # Set to True to train, False to load
-        filename = f"my_gpe_models_p{p}_{potential_type}_pert_const_{perturb_const}_tol_{tol}_with_pretraining.pkl"
+        train_new = True  # Set to True to train, False to load
+        filename = f"box_test.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"plots_p{p}_{potential_type}_paper_test_pert_const_{perturb_const}_with_pretraining"
+        p_save_dir = f"box_test"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
@@ -2534,7 +2246,7 @@ if __name__ == "__main__":
             print("Starting training...")
             models_by_mode, mu_table, training_history, constant_history, epochs_history = train_gpe_model(
                 gamma_values, modes, p, X, lb, ub, layers, epochs, tol, perturb_const,
-                potential_type='gravity_well', lr=1e-3, verbose=True)
+                potential_type='box', lr=1e-3, verbose=True)
 
             # Save results
             save_models(models_by_mode, mu_table, training_history, constant_history, epochs_history, filename, p_save_dir)
@@ -2546,7 +2258,7 @@ if __name__ == "__main__":
         # Plot wavefunctions for individual modes
         print("Generating individual mode plots...")
         plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
-                          potential_type, p_save_dir, normalization_type="unit")
+                          potential_type, p_save_dir)
 
         # Plot μ vs γ for all modes
         print("Generating chemical potential vs. gamma plot...")
@@ -2562,7 +2274,7 @@ if __name__ == "__main__":
         plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
 
         # Decide if we want to run the comparison
-        run_comparison = False
+        run_comparison = True
 
         if run_comparison:
             # Comparison parameters
@@ -2576,7 +2288,7 @@ if __name__ == "__main__":
             print(f"  Epochs per method: {comparison_epochs}")
 
             # Create comparison save directory
-            comparison_save_dir = f"comparison_results_p{p}_{potential_type}"
+            comparison_save_dir = f"comparison_results_box_test"
 
             # Run comparison with individual caching
             results_df, paper_results, best_results = create_comparison_table_individual_caching(
