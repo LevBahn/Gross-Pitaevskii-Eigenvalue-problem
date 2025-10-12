@@ -56,7 +56,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=3.0, use_residual=True):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, gamma=1.0, L=1.0, use_residual=True):
         """
         Parameters
         ----------
@@ -71,7 +71,7 @@ class GrossPitaevskiiPINN(nn.Module):
         gamma : float, optional
             Interaction strength parameter.
         L : float, optional
-            Length of the box (default is 3.0).
+            Length of the box (default is 1.0).
         """
         super().__init__()
         self.layers = layers
@@ -2288,7 +2288,7 @@ def create_comparison_table_individual_caching_with_tables(modes, gamma_values, 
 
 if __name__ == "__main__":
     # Setup parameters
-    lb, ub = 0, 3 # Domain boundaries
+    lb, ub = 0, 1 # Domain boundaries
     N_f = 4000  # Number of collocation points
     epochs = 5001
     layers = [1, 64, 64, 64, 1]  # Neural network architecture

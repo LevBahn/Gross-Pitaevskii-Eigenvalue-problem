@@ -606,56 +606,54 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
         linestyles = ['-', '--', '-.', ':', '-', '--']
         colors = ['k', 'b', 'r', 'g', 'm', 'c', 'slategray']
 
+        # Map to replicate the old alpha=0.5 indexing pattern
+        # Old j values were: 0, 40, 80, 120, 160, 200
+        old_j_values = [0, 40, 80, 120, 160, 200]
+
         for j, gamma in enumerate(gamma_values):
             if gamma not in models_by_mode[mode]:
                 continue
 
-            model = models_by_mode[mode][gamma]
-            model.eval()
-            const = constant_history[mode]
+            if gamma % 20 == 0:
+                model = models_by_mode[mode][gamma]
+                model.eval()
+                const = constant_history[mode]
 
-            # # NEW: Get gamma-specific constant
-            # if isinstance(constant_history[mode], dict):
-            #     # New structure: {mode: {gamma: const}}
-            #     const = constant_history[mode][gamma]
-            # else:
-            #     # Old structure: {mode: const} (backwards compatibility)
-            #     const = constant_history[mode]
+                with torch.no_grad():
+                    u_pred = model.forward(X_tensor)
+                    u_pred = u_pred * (perturb_const / const)
+                    full_u = model.get_complete_solution(X_tensor, u_pred)
+                    u_np = full_u.cpu().numpy().flatten()
 
-            with torch.no_grad():
-                u_pred = model.forward(X_tensor)
-                u_pred = u_pred * (perturb_const / const)
-                full_u = model.get_complete_solution(X_tensor, u_pred)
-                u_np = full_u.cpu().numpy().flatten()
+                    # Normalization: ∫|ψ|² = 1
+                    norm = np.sqrt(np.sum(u_np ** 2) * dx)
+                    if norm > 1e-12:
+                        u_np /= norm
 
-                # Simple normalization: ∫|ψ|² = 1
-                norm = np.sqrt(np.sum(u_np ** 2) * dx)
-                if norm > 1e-12:
-                    u_np /= norm
+                    # For mode 0, ensure positive values
+                    if mode == 0:
+                        u_np = np.abs(u_np)
 
-                # For mode 0, ensure positive values
-                if mode == 0:
-                    u_np = np.abs(u_np)
+                    # Use old index pattern to match old plot colors
+                    gamma_idx = int(gamma / 20)  # 0, 1, 2, 3, 4, 5 for gamma=0,20,40,60,80,100
+                    old_j = old_j_values[gamma_idx]
 
-                # Plot
-                if gamma % 20 == 0:
                     plt.plot(X_test.flatten(), u_np,
-                             linestyle=linestyles[j % len(linestyles)],
-                             color=colors[j % len(colors)],
+                             linestyle=linestyles[old_j % len(linestyles)],
+                             color=colors[old_j % len(colors)],
                              label=f"η={gamma:.1f}")
 
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
         plt.xlabel("x", fontsize=18)
-        plt.ylabel(r"$\psi(x)$", fontsize=18)  # Changed from u(x)
-        plt.ylim(-0.8, 0.8)  # Add consistent y-limits
+        plt.ylabel(r"$\psi(x)$", fontsize=18)
+        # plt.ylim(-0.8, 0.8)
         plt.grid(True)
         plt.legend(fontsize=12)
-        plt.xlim(0, 20.0)  # Increased to match paper
+        plt.xlim(0, 20.0)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"mode_{mode}_wavefunction_p{p}_{potential_type}.png"), dpi=300)
         plt.close()
 
-    # Also create a combined grid figure to show all modes
     plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
                        constant_history, perturb_const, potential_type, save_dir)
 
@@ -698,43 +696,46 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
             if gamma not in models_by_mode[mode]:
                 continue
 
-            model = models_by_mode[mode][gamma]
-            model.eval()
+            if gamma % 20 == 0:
+                model = models_by_mode[mode][gamma]
+                model.eval()
 
-            # NEW: Get gamma-specific constant
-            if isinstance(constant_history[mode], dict):
-                const = constant_history[mode][gamma]
-            else:
-                const = constant_history[mode]
+                # NEW: Get gamma-specific constant
+                if isinstance(constant_history[mode], dict):
+                    const = constant_history[mode][gamma]
+                else:
+                    const = constant_history[mode]
 
-            with torch.no_grad():
-                u_pred = model.forward(X_tensor)
-                u_pred = u_pred * (perturb_const / const)
-                full_u = model.get_complete_solution(X_tensor, u_pred)
-                u_np = full_u.cpu().numpy().flatten()
+                with torch.no_grad():
+                    u_pred = model.forward(X_tensor)
+                    u_pred = u_pred * (perturb_const / const)
+                    full_u = model.get_complete_solution(X_tensor, u_pred)
+                    u_np = full_u.cpu().numpy().flatten()
 
-                # Proper normalization
-                u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+                    # Proper normalization
+                    u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                # For mode 0, ensure positive values
-                if mode == 0:
-                    u_np = np.abs(u_np)
+                    # For mode 0, ensure positive values
+                    if mode == 0:
+                        u_np = np.abs(u_np)
 
-                # Plot
-                if gamma % 4 == 0:
+                    # Replicate old alpha=0.5 index pattern
+                    # Old: gamma / 0.5 = gamma * 2
+                    old_j = int(gamma * 2)
+
                     ax.plot(X_test.flatten(), u_np,
-                            linestyle=linestyles[j % len(linestyles)],
-                            color=colors[j % len(colors)],
+                            linestyle=linestyles[old_j % len(linestyles)],
+                            color=colors[old_j % len(colors)],
                             label=f"γ={gamma:.1f}")
 
         # Configure the subplot
         ax.set_title(f"mode {mode}", fontsize=12)
         ax.set_xlabel("x", fontsize=12)
-        ax.set_ylabel(r"$\psi(x)$", fontsize=12)  # Changed
-        ax.set_ylim(-0.8, 0.8)  # Add consistent limits
+        ax.set_ylabel(r"$\psi(x)$", fontsize=12)
+        ax.set_ylim(-0.8, 0.8)
         ax.grid(True)
         ax.legend(fontsize=6)
-        ax.set_xlim(0, 35)  # Increased
+        ax.set_xlim(0, 35)
 
     # Hide any unused subplots
     for i in range(len(modes), len(axes)):
@@ -748,7 +749,7 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
 
 
 def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevskii/src/final/refine/test",
-                     sample_interval=4):
+                     sample_interval=8):
     """
     Plot chemical potential vs. interaction strength for different modes.
 
@@ -796,7 +797,7 @@ def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevs
 
     plt.ylabel(r"$\eta$ (Interaction Strength)", fontsize=18)
     plt.xlabel(r"$\lambda$ (Eigenvalue)", fontsize=18)
-    plt.title(f"Chemical Potential vs. Interaction Strength for Modes 0-5", fontsize=18)
+    plt.title(f"Eigenvalue vs. Interaction Strength for Modes 0-5", fontsize=18)
     plt.grid(True)
     plt.legend(fontsize=12)
     plt.tight_layout()
@@ -2419,7 +2420,7 @@ if __name__ == "__main__":
         potential_type = "gravity_well"
 
         # Train neural network or load existing models
-        train_new = True  # Set to True to train, False to load
+        train_new = False  # Set to True to train, False to load
         filename = f"gravity_well_zeta.pkl"
 
         # Create plotting and model saving directory
@@ -2458,7 +2459,7 @@ if __name__ == "__main__":
         plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
 
         # Decide if we want to run the comparison
-        run_comparison = True
+        run_comparison = False
 
         if run_comparison:
             # Comparison parameters

@@ -435,6 +435,17 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
     """
     os.makedirs(save_dir, exist_ok=True)
 
+    # Map negative gamma values to old positive gamma indices for consistent coloring
+    # This ensures: 0→0, -4→20, -8→40, -12→60, -16→80, -20→100 use same colors
+    gamma_to_old_j = {
+        0: 0,
+        -4: 40,
+        -8: 80,
+        -12: 120,
+        -16: 160,
+        -20: 200
+    }
+
     # Generate individual figures for each mode
     for mode in modes:
         if mode not in models_by_mode:
@@ -469,15 +480,16 @@ def plot_wavefunction(models_by_mode, X_test, gamma_values,
 
                 # For mode 0, enforce all wavefunctions to be positive
                 if mode == 0:
-                    # Take absolute value to ensure positive values
-                    # This is valid for ground state (mode 0) which should be nodeless
                     u_np = np.abs(u_np)
 
-                # Plot wavefunctions
+                # Plot wavefunctions - use mapping to old indices for consistent colors
                 if abs(gamma) % 4 == 0:
+                    # Get the old index for this gamma value
+                    old_j = gamma_to_old_j.get(gamma, j)
+
                     plt.plot(X_test.flatten(), u_np,
-                             linestyle=linestyles[j % len(linestyles)],
-                             color=colors[j % len(colors)],
+                             linestyle=linestyles[old_j % len(linestyles)],
+                             color=colors[old_j % len(colors)],
                              label=f"η={gamma:.1f}")
 
         # Configure individual figure
@@ -523,6 +535,16 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
     linestyles = ['-', '--', '-.', ':', '-', '--']
     colors = ['k', 'b', 'r', 'g', 'm', 'c', 'slategray']
 
+    # Map negative gamma values to old positive gamma indices for consistent coloring
+    gamma_to_old_j = {
+        0: 0,
+        -4: 40,
+        -8: 80,
+        -12: 120,
+        -16: 160,
+        -20: 200
+    }
+
     # Plot each mode in its subplot
     for i, mode in enumerate(modes):
         if i >= len(axes) or mode not in models_by_mode:
@@ -535,29 +557,31 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
             if gamma not in models_by_mode[mode]:
                 continue
 
-            model = models_by_mode[mode][gamma]
-            model.eval()
-            const = constant_history[mode]
+            if abs(gamma) % 4 == 0:
+                model = models_by_mode[mode][gamma]
+                model.eval()
+                const = constant_history[mode]
 
-            with torch.no_grad():
-                u_pred = model.forward(X_tensor)
-                u_pred = u_pred * (perturb_const / const)
-                full_u = model.get_complete_solution(X_tensor, u_pred)
-                u_np = full_u.cpu().numpy().flatten()
+                with torch.no_grad():
+                    u_pred = model.forward(X_tensor)
+                    u_pred = u_pred * (perturb_const / const)
+                    full_u = model.get_complete_solution(X_tensor, u_pred)
+                    u_np = full_u.cpu().numpy().flatten()
 
-                # Proper normalization
-                u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
+                    # Proper normalization
+                    u_np /= np.sqrt(np.sum(u_np ** 2) * dx)
 
-                # For mode 0, ensure all wavefunctions are positive
-                if mode == 0:
-                    # Take absolute value to ensure positive values
-                    u_np = np.abs(u_np)
+                    # For mode 0, ensure all wavefunctions are positive
+                    if mode == 0:
+                        u_np = np.abs(u_np)
 
-                # Plot the wavefunction (not density)
-                if abs(gamma) % 4 == 0:
+                    # Get the old index for this gamma value
+                    old_j = gamma_to_old_j.get(gamma, j)
+
+                    # Plot the wavefunction
                     ax.plot(X_test.flatten(), u_np,
-                            linestyle=linestyles[j % len(linestyles)],
-                            color=colors[j % len(colors)],
+                            linestyle=linestyles[old_j % len(linestyles)],
+                            color=colors[old_j % len(colors)],
                             label=f"η={gamma:.1f}")
 
         # Configure the subplot
@@ -577,7 +601,6 @@ def plot_combined_grid(models_by_mode, X_test, gamma_values, modes, p,
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(os.path.join(save_dir, f"all_modes_combined_wavefunctions_p{p}_{potential_type}.png"), dpi=300)
     plt.close(fig)
-
 
 def plot_mu_vs_gamma(mu_table, modes, p, potential_type, save_dir="Gross-Pitaevskii/src/final/refine/test",
                      sample_interval=4):
@@ -1749,7 +1772,7 @@ def create_comparison_table_individual_caching(modes, gamma_values, p, X_train, 
     os.makedirs(save_dir, exist_ok=True)
 
     # Select gamma values for comparison
-    comparison_gammas = [0, 20, 40, 60, 80, 100]
+    comparison_gammas = [0, -4, -8, -12, -16, -20]
     comparison_gammas = [g for g in comparison_gammas if g in gamma_values]
 
     results = []
@@ -2253,8 +2276,8 @@ if __name__ == "__main__":
                 comparison_modes, comparison_gammas, p, X, X_test, lb, ub, layers,
                 comparison_epochs, save_dir=comparison_save_dir, tol=tol,
                 perturb_const=perturb_const,
-                force_retrain_regular=True,  # Set to True to retrain Regular PINNs
-                force_retrain_curriculum=True,  # Set to True to retrain Curriculum PINNs
+                force_retrain_regular=False,  # Set to True to retrain Regular PINNs
+                force_retrain_curriculum=False,  # Set to True to retrain Curriculum PINNs
                 potential_type=potential_type
             )
 
