@@ -1,4 +1,0 @@
-Mode,Method,abs_err,rel_err
-Mode 0,Regular PINN,5.98e+02,59838.811%
-Mode 0,Curriculum Training,2.22e+02,22246.973%
-Mode 0,PL-PINN (ours),**5.85e-03**,**0.955%**

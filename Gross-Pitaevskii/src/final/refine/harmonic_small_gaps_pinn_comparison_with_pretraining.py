@@ -2225,7 +2225,7 @@ if __name__ == "__main__":
         plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
 
         # Decide if we want to run the comparison
-        run_comparison = False
+        run_comparison = True
 
         if run_comparison:
             # Comparison parameters
