@@ -38,6 +38,17 @@ plot_params = {
 plt.rcParams.update(plot_params)
 
 
+class ShiftedTanh(nn.Module):
+    """Custom activation: tanh(x) + 1 + eps"""
+
+    def __init__(self, eps=np.finfo(float).eps):
+        super(ShiftedTanh, self).__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        return torch.tanh(x) + 1.0 + self.eps
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -96,7 +107,7 @@ class GrossPitaevskiiPINN(nn.Module):
             for i in range(len(self.layers) - 1):
                 layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
                 if i < len(self.layers) - 2:
-                    layers.append(nn.Tanh() + 1 + np.eps)
+                    layers.append(ShiftedTanh())
             return nn.Sequential(*layers)
         else:
             # New architecture with residual blocks
@@ -106,7 +117,7 @@ class GrossPitaevskiiPINN(nn.Module):
             input_dim = self.layers[0]
             hidden_dim = self.layers[1]
             modules.append(nn.Linear(input_dim, hidden_dim))
-            modules.append(nn.Tanh())
+            modules.append(ShiftedTanh())
 
             # Residual blocks in the middle layers
             num_res_blocks = len(self.layers) - 3  # Subtract input, first hidden, and output
