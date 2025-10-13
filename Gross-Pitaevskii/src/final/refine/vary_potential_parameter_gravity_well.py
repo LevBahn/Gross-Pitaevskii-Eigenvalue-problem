@@ -221,7 +221,7 @@ class GrossPitaevskiiPINN(nn.Module):
         # Calculate chemical potential
         dx = inputs[1] - inputs[0] if len(inputs) > 1 else 0.01
         kinetic = -u_xx
-        potential = V * u
+        potential = beta * V * u
         interaction = gamma * u ** p
 
         numerator = torch.sum(u * (kinetic + potential + interaction))
