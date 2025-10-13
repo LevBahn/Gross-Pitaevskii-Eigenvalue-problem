@@ -1030,7 +1030,7 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
             if mode in training_history and gamma in training_history[mode]:
                 loss_history = training_history[mode][gamma]['loss']
 
-                window_size = min(5, len(loss_history) // 5)
+                window_size = min(20, len(loss_history) // 5)
                 if window_size > 1:
                     ultra_smooth_loss = moving_average(loss_history, window_size)
                     epoch_nums = np.linspace(0, epochs, len(ultra_smooth_loss))

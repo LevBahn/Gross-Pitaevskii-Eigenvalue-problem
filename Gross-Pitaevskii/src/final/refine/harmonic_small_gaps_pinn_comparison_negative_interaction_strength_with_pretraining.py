@@ -832,7 +832,7 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
             if mode in training_history and gamma in training_history[mode]:
                 loss_history = training_history[mode][gamma]['loss']
 
-                window_size = min(5, len(loss_history) // 5)
+                window_size = min(20, len(loss_history) // 5)
                 if window_size > 1:
                     ultra_smooth_loss = moving_average(loss_history, window_size)
                     epoch_nums = np.linspace(0, epochs, len(ultra_smooth_loss))
@@ -896,10 +896,10 @@ def plot_mode0_gamma_loss_visualization(training_history, gamma_values_to_plot, 
     plt.figure(figsize=(12, 8))
 
     # Restrict number of gammas plotted
-    gamma_values_to_plot = [gamma for gamma in gamma_values if gamma % 4 == 0]
+    gamma_values_to_plot = [gamma for gamma in gamma_values_to_plot if gamma % 4 == 0]
 
-    # Set up colormap for different gamma values
-    colormap = plt.cm.plasma  # Using plasma colormap for good contrast
+    # Set up colormap for different gamma values (using inferno for complementary look to viridis)
+    colormap = plt.cm.inferno  # Complementary to viridis used in plot_improved_loss_visualization
     n_gammas = len(gamma_values_to_plot)
     colors = [colormap(i / (n_gammas - 1)) for i in range(n_gammas)]
 
@@ -910,21 +910,21 @@ def plot_mode0_gamma_loss_visualization(training_history, gamma_values_to_plot, 
             if gamma in training_history[mode]:
                 loss_history = training_history[mode][gamma]['loss']
 
-                # Apply smoothing similar to the original function
-                window_size = min(10, len(loss_history) // 10)
+                # Apply smoothing with matching window size
+                window_size = min(20, len(loss_history) // 5)
                 if window_size > 1:
                     ultra_smooth_loss = moving_average(loss_history, window_size)
                     epoch_nums = np.linspace(0, epochs, len(ultra_smooth_loss))
                     plt.semilogy(epoch_nums, ultra_smooth_loss,
                                  color=colors[i],
-                                 linewidth=2.5,
-                                 label=f"η={gamma}")
+                                 linewidth=2.0,  # Match plot_improved_loss_visualization
+                                 label=rf"$\eta={gamma}$")
                 else:
                     epoch_nums = np.linspace(0, epochs, len(loss_history))
                     plt.semilogy(epoch_nums, loss_history,
                                  color=colors[i],
-                                 linewidth=2.5,
-                                 label=f"η={gamma}")
+                                 linewidth=2.0,  # Match plot_improved_loss_visualization
+                                 label=rf"$\eta={gamma}$")
 
                 # Add a trend line for the final 30% of training
                 if len(loss_history) > 10:
@@ -932,24 +932,23 @@ def plot_mode0_gamma_loss_visualization(training_history, gamma_values_to_plot, 
                     if window_size > 1:
                         end_loss = np.log(ultra_smooth_loss[-1])
                         start_loss = np.log(ultra_smooth_loss[start_idx])
-                        trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
                     else:
                         end_loss = np.log(loss_history[-1])
                         start_loss = np.log(loss_history[start_idx])
-                        trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
 
                     # Only add trend if there's a decrease
                     if end_loss < start_loss:
+                        trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
                         trend_y = np.exp(np.array([start_loss, end_loss]))
-                        plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.6, linewidth=1.5)
+                        plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)  # Match alpha
 
-    plt.title(r"Training Progress for Mode 0 Across Varying Interaction Strengths", fontsize=18)
+    plt.title(r"Training Progress for Mode $0$ Across Varying $\eta$", fontsize=22)
     plt.xlabel("Epochs", fontsize=18)
     plt.ylabel("Loss", fontsize=18)
     plt.grid(True, which="both", linestyle="--", alpha=0.6)
-    plt.legend(fontsize=14, loc='best')
+    plt.legend(fontsize=14)
+    plt.tight_layout()
 
-    # Use bbox_inches='tight' instead of tight_layout() to avoid warnings
     filename = f"mode0_gamma_loss_comparison_p{p}_{potential_type}.png"
     plt.savefig(os.path.join(save_dir, filename), dpi=300, bbox_inches='tight')
     plt.close()
@@ -2255,7 +2254,7 @@ if __name__ == "__main__":
         plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
 
         # Decide if we want to run the comparison
-        run_comparison = True
+        run_comparison = False
 
         if run_comparison:
             # Comparison parameters

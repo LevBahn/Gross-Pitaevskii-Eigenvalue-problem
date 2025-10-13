@@ -38,6 +38,17 @@ plot_params = {
 plt.rcParams.update(plot_params)
 
 
+class ShiftedTanh(nn.Module):
+    """Custom activation: tanh(x) + 1 + eps"""
+
+    def __init__(self, eps=np.finfo(float).eps):
+        super(ShiftedTanh, self).__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        return torch.tanh(x) + 1.0 + self.eps
+
+
 class GrossPitaevskiiPINN(nn.Module):
     """
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
@@ -78,7 +89,7 @@ class GrossPitaevskiiPINN(nn.Module):
         for i in range(len(self.layers) - 1):
             layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
             if i < len(self.layers) - 2:
-                layers.append(nn.Tanh())
+                layers.append(ShiftedTanh())
         return nn.Sequential(*layers)
 
     def weighted_hermite(self, x: torch.Tensor, n: int) -> torch.Tensor:
@@ -801,7 +812,7 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
             if mode in training_history and gamma in training_history[mode]:
                 loss_history = training_history[mode][gamma]['loss']
 
-                window_size = min(5, len(loss_history) // 5)
+                window_size = min(20, len(loss_history) // 5)
                 if window_size > 1:
                     ultra_smooth_loss = moving_average(loss_history, window_size)
                     epoch_nums = np.linspace(0, epochs, len(ultra_smooth_loss))
