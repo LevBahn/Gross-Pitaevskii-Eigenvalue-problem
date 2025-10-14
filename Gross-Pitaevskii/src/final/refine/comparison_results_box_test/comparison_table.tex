@@ -1,0 +1,34 @@
+\begin{table}[htbp]
+\centering
+\caption{Comparison of PINN Methods for Gross-Pitaevskii Equation}
+\label{tab:pinn_comparison}
+\begin{tabular}{llcc}
+\toprule
+Mode & Method & Abs. Error & Rel. Error \\
+\midrule
+Mode 0 & Vanilla PINN & 5.32e-01 & 53.220\% \\
+ & Curriculum Training & 1.40e-01 & 14.033\% \\
+ & PL-PINN & \textbf{2.10e-02} & \textbf{2.104\%} \\
+\midrule
+Mode 1 & Vanilla PINN & 3.21e-01 & 32.143\% \\
+ & Curriculum Training & 1.68e+00 & 167.992\% \\
+ & PL-PINN & \textbf{4.44e-02} & \textbf{4.437\%} \\
+\midrule
+Mode 2 & Vanilla PINN & 6.63e-01 & 66.310\% \\
+ & Curriculum Training & 1.86e+00 & 186.029\% \\
+ & PL-PINN & \textbf{3.79e-02} & \textbf{3.794\%} \\
+\midrule
+Mode 3 & Vanilla PINN & 1.09e+00 & 113.986\% \\
+ & Curriculum Training & 9.04e+00 & 904.005\% \\
+ & PL-PINN & \textbf{6.98e-02} & \textbf{6.981\%} \\
+\midrule
+Mode 4 & Vanilla PINN & 1.13e+00 & 117.361\% \\
+ & Curriculum Training & 1.22e+00 & 122.294\% \\
+ & PL-PINN & \textbf{6.58e-02} & \textbf{6.580\%} \\
+\midrule
+Mode 5 & Vanilla PINN & 1.29e+00 & 133.691\% \\
+ & Curriculum Training & 1.06e+00 & 106.956\% \\
+ & PL-PINN & \textbf{1.13e-01} & \textbf{11.270\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
