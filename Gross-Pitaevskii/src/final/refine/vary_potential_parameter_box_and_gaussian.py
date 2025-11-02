@@ -145,7 +145,7 @@ class GrossPitaevskiiPINN(nn.Module):
         if potential_type == "box":
             V = torch.zeros_like(x)
         elif potential_type == "gaussian":
-            V = torch.exp(-x**2)
+            V = torch.exp((-x**2)/2)
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
         return V
@@ -1079,8 +1079,7 @@ if __name__ == "__main__":
     gamma = 0
 
     # Make a new constant for beta to interate over beta * V * u
-    # beta = 0.01
-    beta = 5.0
+    beta = 5
     beta_values = [k * beta for k in range(21)]
 
     # Include modes 0 through 5
@@ -1098,7 +1097,7 @@ if __name__ == "__main__":
     for p in nonlinearity_powers:
 
         # Specify potential type
-        potential_type = "box"
+        potential_type = "gaussian"
 
         # Train neural network or load existing models
         train_new = True  # Set to True to train, False to load

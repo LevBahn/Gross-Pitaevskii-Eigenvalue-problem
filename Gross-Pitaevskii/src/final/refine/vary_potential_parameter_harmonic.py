@@ -54,7 +54,7 @@ class GrossPitaevskiiPINN(nn.Module):
     Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
     """
 
-    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, beta=1.0, use_residual=True, use_perturbation=True):
+    def __init__(self, layers, hbar=1.0, m=1.0, mode=0, beta=1.0, L=1.0, use_residual=True, use_perturbation=True):
         """
         Parameters
         ----------
@@ -68,6 +68,8 @@ class GrossPitaevskiiPINN(nn.Module):
             Mode number (default is 0).
         beta : float, optional
             Potential constant parameter.
+        L : float, optional
+            Length of the box (default is 1.0).
         use_perturbation: boolean, optional
             Get the complete solution by combining the base solution with the neural network perturbation. Default is
             True.
@@ -80,6 +82,7 @@ class GrossPitaevskiiPINN(nn.Module):
         self.m = m  # Particle mass, fixed
         self.mode = mode  # Mode number (n)
         self.beta = beta # Potential constant parameter
+        self.L = L  # Length of the box
         self.use_perturbation = use_perturbation  # Combine the base solution with the neural network perturbation
 
     def build_network(self):
@@ -92,6 +95,26 @@ class GrossPitaevskiiPINN(nn.Module):
             if i < len(self.layers) - 2:
                 layers.append(ShiftedTanh())
         return nn.Sequential(*layers)
+
+    def box_eigenfunction(self, x, n):
+        """
+        Compute the analytic eigenfunction for a particle in a box.
+
+        For the linear case (gamma = 0), the solution is:
+        phi_n(x) = sqrt(2/L) * sin(n*pi*x/L)
+
+        This corresponds to equation (22) in the paper.
+        """
+        # For mode 0, n=1 in the sine function per equation (22)
+        n_actual = n + 1  # Convert mode number to quantum number (n=0 → first excited state with n_actual=1)
+
+        # Normalization factor
+        norm_factor = torch.sqrt(torch.tensor(2.0 / self.L))
+
+        # Sine function with proper scaling
+        phi_n = norm_factor * torch.sin(n_actual * torch.pi * x / self.L)
+
+        return phi_n
 
     def weighted_hermite(self, x: torch.Tensor, n: int) -> torch.Tensor:
 
@@ -131,7 +154,7 @@ class GrossPitaevskiiPINN(nn.Module):
         """
         if mode is None:
             mode = self.mode
-        base_solution = self.weighted_hermite(x, mode)
+        base_solution = self.box_eigenfunction(x, mode)
         return base_solution + perturbation
 
     def get_complete_solution_with_derivatives(self, x, perturbation, mode=None):
@@ -205,12 +228,19 @@ class GrossPitaevskiiPINN(nn.Module):
                 Hnm2, Hnm1 = Hnm1, Hn
             return Hn
 
-    def compute_potential(self, x, potential_type="harmonic", **kwargs):
+    def compute_potential(self, x, beta, potential_type="harmonic", **kwargs):
         """
         Compute potential function for the 1D domain.
         """
         if potential_type == "harmonic":
-            V = x ** 2
+            omega = kwargs.get('omega', 20.0)  # Frequency parameter
+            center = kwargs.get('center', 0.5)  # Center of domain
+            V = beta * 0.5 * (omega ** 2) * (x - center) ** 2
+            # center = 0.5
+            # # Attractive well (negative potential)
+            # depth = 20.0  # Well depth
+            # width = 0.1  # Well width
+            # V = -beta * depth * torch.exp(-((x - center) ** 2) / (2 * width ** 2))
         else:
             raise ValueError(f"Unknown potential type: {potential_type}")
         return V
@@ -221,37 +251,59 @@ class GrossPitaevskiiPINN(nn.Module):
         μψ = - ∇²ψ + Vψ + γ|ψ|²ψ
         """
         # Get the complete solution (base + perturbation) for PL-PINN. Else, use the neural network predicton
+        # if self.use_perturbation:
+        #     u, u_x, u_xx = self.get_complete_solution_with_derivatives(inputs, predictions)  # PL-PINN
+        # else:
+        #     u = predictions  # Vanilla PINN / Curriculum learning
+        #
+        #     # Compute derivatives with respect to x
+        #     u_x = torch.autograd.grad(
+        #         outputs=u,
+        #         inputs=inputs,
+        #         grad_outputs=torch.ones_like(u),
+        #         create_graph=True,
+        #         retain_graph=True
+        #     )[0]
+        #
+        #     u_xx = torch.autograd.grad(
+        #         outputs=u_x,
+        #         inputs=inputs,
+        #         grad_outputs=torch.ones_like(u_x),
+        #         create_graph=True,
+        #         retain_graph=True
+        #     )[0]
+
         if self.use_perturbation:
-            u, u_x, u_xx = self.get_complete_solution_with_derivatives(inputs, predictions)  # PL-PINN
+            u = self.get_complete_solution(inputs, predictions)  # PL-PINN algorithm
         else:
             u = predictions  # Vanilla PINN / Curriculum learning
 
-            # Compute derivatives with respect to x
-            u_x = torch.autograd.grad(
-                outputs=u,
-                inputs=inputs,
-                grad_outputs=torch.ones_like(u),
-                create_graph=True,
-                retain_graph=True
-            )[0]
+        # Compute derivatives with respect to x
+        u_x = torch.autograd.grad(
+            outputs=u,
+            inputs=inputs,
+            grad_outputs=torch.ones_like(u),
+            create_graph=True,
+            retain_graph=True
+        )[0]
 
-            u_xx = torch.autograd.grad(
-                outputs=u_x,
-                inputs=inputs,
-                grad_outputs=torch.ones_like(u_x),
-                create_graph=True,
-                retain_graph=True
-            )[0]
+        u_xx = torch.autograd.grad(
+            outputs=u_x,
+            inputs=inputs,
+            grad_outputs=torch.ones_like(u_x),
+            create_graph=True,
+            retain_graph=True
+        )[0]
 
         # Compute potential
         if precomputed_potential is not None:
             V = precomputed_potential
         else:
-            V = self.compute_potential(inputs, potential_type)
+            V = self.compute_potential(inputs, beta, potential_type)
 
         # Calculate chemical potential
         kinetic = -u_xx
-        potential = beta * V * u
+        potential = V * u
         #interaction = gamma * u ** 3
         interaction = gamma * u ** p
 
@@ -334,6 +386,7 @@ def train_gpe_model(gamma, beta_values, modes, p, X_train, lb, ub, layers,
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     # Create boundary conditions
+    L = ub
     boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
     boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
 
@@ -366,7 +419,7 @@ def train_gpe_model(gamma, beta_values, modes, p, X_train, lb, ub, layers,
                 print(f"\nTraining for β = {beta:.2f}, mode = {mode}, nonlinearity p = {p}")
 
             # Initialize model for this mode and beta
-            model = GrossPitaevskiiPINN(layers, mode=mode, beta=beta).to(device)
+            model = GrossPitaevskiiPINN(layers, mode=mode, beta=beta, L=L).to(device)
 
             # If this isn't the first beta value, initialize with previous model's weights
             if prev_model is not None:
@@ -404,7 +457,7 @@ def train_gpe_model(gamma, beta_values, modes, p, X_train, lb, ub, layers,
 
                 # Forward pass
                 u_pred = model.forward(X_tensor)
-                if epoch == 0 and beta == 1:
+                if epoch == 0 and beta == 0:
                     normal_const = torch.max(u_pred).detach().clone()
                     constant_history[mode] = normal_const
                     u_pred = u_pred / normal_const
@@ -550,11 +603,11 @@ def plot_wavefunction(models_by_mode, X_test, beta_values,
                     u_np = np.abs(u_np)
 
                 # Plot wavefunctions
-                if beta % 20 == 0:
+                if beta % 0.20 < 1e-9:
                     plt.plot(X_test.flatten(), u_np,
                              linestyle=linestyles[j % len(linestyles)],
                              color=colors[j % len(colors)],
-                             label=f"η={beta:.1f}")
+                             label=f"β={beta:.1f}")
 
         # Configure individual figure
         plt.title(f"Mode {mode} Wavefunction", fontsize=18)
@@ -738,7 +791,7 @@ def pretrain_on_analytical_solution(model, mode, X_train, epochs=5000, lr=1e-3, 
     X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
 
     with torch.no_grad():
-        analytical_target = model.weighted_hermite(X_tensor.squeeze(), mode).unsqueeze(-1).detach()
+        analytical_target = model.box_eigenfunction(X_tensor.squeeze(), mode).unsqueeze(-1).detach()
 
     # Use both Adam and LBFGS for better convergence
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -1130,9 +1183,9 @@ def plot_epochs_until_stopping(epochs_history, modes, beta_values, p, potential_
 
 if __name__ == "__main__":
     # Setup parameters
-    lb, ub = -10, 10 # Domain boundaries
+    lb, ub = 0, 1 # Domain boundaries
     N_f = 4000  # Number of collocation points
-    epochs = 2001
+    epochs = 5001
     layers = [1, 64, 64, 64, 1]  # Neural network architecture
 
     # Create uniform grid for training and testing
@@ -1143,9 +1196,8 @@ if __name__ == "__main__":
     gamma = 0
 
     # Make a new constant for beta to interate over beta * V * u
-    # beta = 0.01
-    # beta = 5.0
-    beta_values = [1, 20, 40, 60, 80, 100]
+    beta = 0.05
+    beta_values = [k * beta for k in range(21)]
 
     # Include modes 0 through 5
     modes = [0, 1, 2, 3, 4, 5]
