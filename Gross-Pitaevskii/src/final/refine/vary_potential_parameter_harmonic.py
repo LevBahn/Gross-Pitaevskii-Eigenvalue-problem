@@ -251,27 +251,49 @@ class GrossPitaevskiiPINN(nn.Module):
         μψ = - ∇²ψ + Vψ + γ|ψ|²ψ
         """
         # Get the complete solution (base + perturbation) for PL-PINN. Else, use the neural network predicton
+        # if self.use_perturbation:
+        #     u, u_x, u_xx = self.get_complete_solution_with_derivatives(inputs, predictions)  # PL-PINN
+        # else:
+        #     u = predictions  # Vanilla PINN / Curriculum learning
+        #
+        #     # Compute derivatives with respect to x
+        #     u_x = torch.autograd.grad(
+        #         outputs=u,
+        #         inputs=inputs,
+        #         grad_outputs=torch.ones_like(u),
+        #         create_graph=True,
+        #         retain_graph=True
+        #     )[0]
+        #
+        #     u_xx = torch.autograd.grad(
+        #         outputs=u_x,
+        #         inputs=inputs,
+        #         grad_outputs=torch.ones_like(u_x),
+        #         create_graph=True,
+        #         retain_graph=True
+        #     )[0]
+
         if self.use_perturbation:
-            u, u_x, u_xx = self.get_complete_solution_with_derivatives(inputs, predictions)  # PL-PINN
+            u = self.get_complete_solution(inputs, predictions)  # PL-PINN algorithm
         else:
             u = predictions  # Vanilla PINN / Curriculum learning
 
-            # Compute derivatives with respect to x
-            u_x = torch.autograd.grad(
-                outputs=u,
-                inputs=inputs,
-                grad_outputs=torch.ones_like(u),
-                create_graph=True,
-                retain_graph=True
-            )[0]
+        # Compute derivatives with respect to x
+        u_x = torch.autograd.grad(
+            outputs=u,
+            inputs=inputs,
+            grad_outputs=torch.ones_like(u),
+            create_graph=True,
+            retain_graph=True
+        )[0]
 
-            u_xx = torch.autograd.grad(
-                outputs=u_x,
-                inputs=inputs,
-                grad_outputs=torch.ones_like(u_x),
-                create_graph=True,
-                retain_graph=True
-            )[0]
+        u_xx = torch.autograd.grad(
+            outputs=u_x,
+            inputs=inputs,
+            grad_outputs=torch.ones_like(u_x),
+            create_graph=True,
+            retain_graph=True
+        )[0]
 
         # Compute potential
         if precomputed_potential is not None:
