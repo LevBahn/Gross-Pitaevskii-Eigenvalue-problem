@@ -832,7 +832,7 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
             if mode in training_history and gamma in training_history[mode]:
                 loss_history = training_history[mode][gamma]['loss']
 
-                window_size = min(20, len(loss_history) // 5)
+                window_size = min(10, len(loss_history) // 5)
                 if window_size > 1:
                     ultra_smooth_loss = moving_average(loss_history, window_size)
                     epoch_nums = np.linspace(0, epochs, len(ultra_smooth_loss))
@@ -848,16 +848,16 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
                                  label=f"Mode {mode}")
 
                 # Add a trend line (final 30% of training)
-                if len(loss_history) > 10:
-                    start_idx = int(len(loss_history) * 0.7)
-                    end_loss = np.log(ultra_smooth_loss[-1] if window_size > 1 else loss_history[-1])
-                    start_loss = np.log(ultra_smooth_loss[start_idx] if window_size > 1 else loss_history[start_idx])
-
-                    # Only add trend if there's a decrease
-                    if end_loss < start_loss:
-                        trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
-                        trend_y = np.exp(np.array([start_loss, end_loss]))
-                        plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)
+                # if len(loss_history) > 10:
+                #     start_idx = int(len(loss_history) * 0.7)
+                #     end_loss = np.log(ultra_smooth_loss[-1] if window_size > 1 else loss_history[-1])
+                #     start_loss = np.log(ultra_smooth_loss[start_idx] if window_size > 1 else loss_history[start_idx])
+                #
+                #     # Only add trend if there's a decrease
+                #     if end_loss < start_loss:
+                #         trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
+                #         trend_y = np.exp(np.array([start_loss, end_loss]))
+                #         plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)
 
     plt.title(r"Training Progress at $\eta=0$ for Modes $0-5$", fontsize=22)
     plt.xlabel("Epochs", fontsize=18)
@@ -2236,13 +2236,13 @@ if __name__ == "__main__":
                                                                                                        p_save_dir)
 
         # Plot wavefunctions for individual modes
-        print("Generating individual mode plots...")
-        plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
-                          potential_type, p_save_dir)
-
-        # Plot λ vs η for all modes
-        print("Generating chemical potential vs. gamma plot...")
-        plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
+        # print("Generating individual mode plots...")
+        # plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
+        #                   potential_type, p_save_dir)
+        #
+        # # Plot λ vs η for all modes
+        # print("Generating chemical potential vs. gamma plot...")
+        # plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
 
         # Plot combined loss history
         print("Generating combined loss plots...")

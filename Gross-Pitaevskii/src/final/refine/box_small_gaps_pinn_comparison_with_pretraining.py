@@ -818,11 +818,11 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
     colors = [colormap(i / max_mode) for i in modes]
 
     for i, mode in enumerate(modes):
-        for gamma in [0.0]:  # Focus on γ=0 for clarity
+        for gamma in [0.0]:  # Focus on η=0 for clarity
             if mode in training_history and gamma in training_history[mode]:
                 loss_history = training_history[mode][gamma]['loss']
 
-                window_size = min(20, len(loss_history) // 5)
+                window_size = min(10, len(loss_history) // 5)
                 if window_size > 1:
                     ultra_smooth_loss = moving_average(loss_history, window_size)
                     epoch_nums = np.linspace(0, epochs, len(ultra_smooth_loss))
@@ -838,25 +838,24 @@ def plot_improved_loss_visualization(training_history, modes, gamma_values, epoc
                                  label=f"Mode {mode}")
 
                 # Add a trend line (final 30% of training)
-                if len(loss_history) > 10:
-                    start_idx = int(len(loss_history) * 0.7)
-                    end_loss = np.log(ultra_smooth_loss[-1] if window_size > 1 else loss_history[-1])
-                    start_loss = np.log(ultra_smooth_loss[start_idx] if window_size > 1 else loss_history[start_idx])
+                # if len(loss_history) > 10:
+                #     start_idx = int(len(loss_history) * 0.7)
+                #     end_loss = np.log(ultra_smooth_loss[-1] if window_size > 1 else loss_history[-1])
+                #     start_loss = np.log(ultra_smooth_loss[start_idx] if window_size > 1 else loss_history[start_idx])
+                #
+                #     # Only add trend if there's a decrease
+                #     if end_loss < start_loss:
+                #         trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
+                #         trend_y = np.exp(np.array([start_loss, end_loss]))
+                #         plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)
 
-                    # Only add trend if there's a decrease
-                    if end_loss < start_loss:
-                        trend_x = np.array([epoch_nums[start_idx], epoch_nums[-1]])
-                        trend_y = np.exp(np.array([start_loss, end_loss]))
-                        plt.semilogy(trend_x, trend_y, '--', color=colors[i], alpha=0.5)
-
-    plt.title("Training Progress for All Modes", fontsize=20)
+    plt.title(r"Training Progress at $\eta=0$ for Modes $0-5$", fontsize=22)
     plt.xlabel("Epochs", fontsize=18)
     plt.ylabel("Loss", fontsize=18)
     plt.grid(True, which="both", linestyle="--", alpha=0.6)
-    plt.legend(fontsize=12)
+    plt.legend(fontsize=14)
     plt.tight_layout()
-    # Adjust the line below as needed
-    plt.savefig(os.path.join(save_dir, f"loss_history_training_progress_p{p}_{potential_type}.png"), dpi=300)
+    plt.savefig(os.path.join(save_dir, f"loss_history_training_progress_p{p}_{potential_type}_eta_0_all_modes.png"), dpi=300)
     plt.close()
 
 
@@ -2214,13 +2213,13 @@ if __name__ == "__main__":
             models_by_mode, mu_table, training_history, constant_history, epochs_history = load_models(filename, p_save_dir)
 
         # Plot wavefunctions for individual modes
-        print("Generating individual mode plots...")
-        plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
-                          potential_type, p_save_dir)
-
-        # Plot μ vs γ for all modes
-        print("Generating chemical potential vs. gamma plot...")
-        plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
+        # print("Generating individual mode plots...")
+        # plot_wavefunction(models_by_mode, X_test, gamma_values, modes, p, constant_history, perturb_const,
+        #                   potential_type, p_save_dir)
+        #
+        # # Plot μ vs γ for all modes
+        # print("Generating chemical potential vs. gamma plot...")
+        # plot_mu_vs_gamma(mu_table, modes, p, potential_type, p_save_dir)
 
         # Plot combined loss history
         print("Generating combined loss plots...")
@@ -2232,7 +2231,7 @@ if __name__ == "__main__":
         plot_epochs_until_stopping(epochs_history, modes, gamma_values, p, potential_type, p_save_dir)
 
         # Decide if we want to run the comparison
-        run_comparison = True
+        run_comparison = False
 
         if run_comparison:
             # Comparison parameters
