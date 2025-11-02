@@ -563,6 +563,16 @@ def plot_wavefunction(models_by_mode, X_test, beta_values,
     """
     os.makedirs(save_dir, exist_ok=True)
 
+    # Map negative beta values to existing scheme for consistent coloring
+    beta_ind = {
+        0: 0,
+        0.2: 40,
+        0.4: 80,
+        0.6: 120,
+        0.8: 160,
+        1.0: 200
+    }
+
     # Generate individual figures for each mode
     for mode in modes:
         if mode not in models_by_mode:
@@ -603,10 +613,13 @@ def plot_wavefunction(models_by_mode, X_test, beta_values,
                     u_np = np.abs(u_np)
 
                 # Plot wavefunctions
-                if beta % 0.20 < 1e-9:
+                if beta % 0.20 == 0 or beta % 1.0 == 0:
+                    # Get the old index for this beta value
+                    orig_j = beta_ind.get(beta, j)
+
                     plt.plot(X_test.flatten(), u_np,
-                             linestyle=linestyles[j % len(linestyles)],
-                             color=colors[j % len(colors)],
+                             linestyle=linestyles[orig_j % len(linestyles)],
+                             color=colors[orig_j % len(colors)],
                              label=f"β={beta:.1f}")
 
         # Configure individual figure
@@ -1217,7 +1230,7 @@ if __name__ == "__main__":
         potential_type = "harmonic"
 
         # Train neural network or load existing models
-        train_new = True  # Set to True to train, False to load
+        train_new = False  # Set to True to train, False to load
         filename = f"vary_potential_parameter_p{p}_{potential_type}.pkl"
 
         # Create plotting and model saving directory
