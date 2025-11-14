@@ -1,0 +1,362 @@
+import os
+
+# Workarounds for OpenMP / MKL runtime conflicts that can crash or block saving files
+# WARNING: KMP_DUPLICATE_LIB_OK=True allows duplicate OpenMP runtimes; use as a temporary/workaround.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "True")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+# Force non-interactive backend for matplotlib (must come before importing pyplot)
+import matplotlib
+matplotlib.use("Agg")  
+
+
+import torch
+import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+plot_params = {
+    "figure.dpi": "300",
+    "axes.labelsize": 20,
+    "axes.linewidth": 1.5,
+    "axes.titlesize": 20,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+    "legend.title_fontsize": 14,
+    "legend.fontsize": 16,
+    "xtick.major.size": 3.5,
+    "xtick.major.width": 1.5,
+    "xtick.minor.size": 2.5,
+    "xtick.minor.width": 1.5,
+    "ytick.major.size": 3.5,
+    "ytick.major.width": 1.5,
+    "ytick.minor.size": 2.5,
+    "ytick.minor.width": 1.5,
+}
+
+plt.rcParams.update(plot_params)
+
+
+class ShiftedTanh(nn.Module):
+    """Custom activation: tanh(x) + 1 + eps"""
+
+    def __init__(self, eps=np.finfo(float).eps):
+        super(ShiftedTanh, self).__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        return torch.tanh(x) + 1.0 + self.eps
+    
+
+class PINN(nn.Module):
+    """
+    Physics-Informed Neural Network (PINN) for solving the 1D Gross-Pitaevskii Equation.
+    """
+
+    def __init__(self, layers):
+
+        super().__init__()
+        self.layers = layers
+        self.network = self.build_network()
+        
+    def build_network(self):
+        """
+        Build the neural network with tanh activation functions between layers.
+        """
+        layers = []
+        for i in range(len(self.layers) - 1):
+            layers.append(nn.Linear(self.layers[i], self.layers[i + 1]))
+            if i < len(self.layers) - 2:
+                layers.append(ShiftedTanh())
+        return nn.Sequential(*layers)
+    
+    def forward(self, inputs):
+        return self.network(inputs)
+
+
+def box_eigenfunction(x, L):
+    x = x.to(device).float()
+
+    # For mode 0, n=1 in the sine function per equation (22)
+    n_actual = 1  # Convert mode number to quantum number (n=0 → first excited state with n_actual=1)
+
+    # Normalization factor
+    norm_factor = torch.sqrt(torch.tensor(2.0 / (2.0*L)))
+
+    # Sine function with proper scaling
+    phi_n = norm_factor * torch.cos((n_actual * torch.pi * x) / (2.0*L))
+
+    return phi_n
+
+
+
+def get_complete_solution( x, perturbation,L):
+    x = x.to(device).float()
+    base_solution = box_eigenfunction(x, L)
+    return base_solution + perturbation
+
+
+
+
+def compute_potential(x,L):
+
+    V = torch.exp(-x**2)
+
+    return V
+
+def pde_loss(inputs, beta, u, u_xx):
+
+    
+    # Compute potential
+    V = compute_potential(inputs,L)
+
+    # Calculate the eigenvalue
+    kinetic = -u_xx
+    potential = beta * V * u
+
+    numerator = torch.mean(u * (kinetic + potential))
+    denominator = torch.mean(u ** 2)
+    lambda_pde = numerator / denominator
+
+    # Residual of the 1D Gross-Pitaevskii equation
+    pde_residual = kinetic + potential - lambda_pde * u
+
+    # PDE loss (mean squared residual)
+    pde_loss = torch.mean(pde_residual ** 2)
+
+    return pde_loss, lambda_pde
+
+def boundary_loss(boundary_values, u):
+    """
+    Compute the boundary loss for the boundary conditions.
+    """
+    u_pred = torch.tensor([u[0],u[-1]])
+    
+    return torch.mean((u_pred - boundary_values) ** 2)
+
+def normalization_loss(L, u):
+    integral = torch.sqrt(torch.mean(u ** 2) * 2*L)
+    return (integral - 1.0) ** 2
+    
+
+
+def train_gpe_model(L, beta_values, X_train, layers,
+                    epochs, tol,patience, perturb_const, lr, verbose=True):
+
+    # Convert training data to tensors
+    dx = X_train[1, 0] - X_train[0, 0]  # Assuming uniform grid
+    X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
+
+
+     # Create boundary conditions
+    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
+
+    model = PINN(layers).to(device)
+    perturbation = model.forward(X_tensor)
+    pert_x = torch.autograd.grad(perturbation, X_tensor, torch.ones_like(perturbation),
+                            create_graph=True, retain_graph=True)[0]
+    normal_const = torch.sqrt((
+      torch.mean(perturbation**2).detach().clone() +  torch.mean(pert_x**2).detach().clone())*dx)
+    +  torch.max(perturbation).detach().clone()
+    const = perturb_const  / normal_const
+    perturbation = perturbation * const
+
+
+    print(f"Tolerance : {tol}, Perturbation constant : {perturb_const}")
+
+
+    if verbose:
+        print(f"\n===== Training =====")
+
+    models_by_betas = {}
+    models_by_betas[0] = box_eigenfunction(X_tensor,L)
+    
+
+    for beta in beta_values:
+
+        if verbose:
+            print(f"\nTraining for β = {beta:.4f}")
+
+
+        # Adam optimizer
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        # Create scheduler to decrease learning rate during training
+        scheduler = CosineAnnealingWarmRestarts(
+                optimizer, T_0=200, T_mult=2, eta_min=1e-6)
+
+
+        # Early stopping variables
+        best_loss = float('inf')
+        
+        patience_counter = 0
+        patience = patience  # Number of epochs to wait without improvement
+        
+
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            perturbation = model.forward(X_tensor)
+            perturbation = perturbation*const
+            u =  get_complete_solution(X_tensor , perturbation,L)
+            u_x= torch.autograd.grad(u, X_tensor, torch.ones_like(u),
+                                        create_graph=True, retain_graph=True)[0]
+            u_xx = torch.autograd.grad(u_x, X_tensor, torch.ones_like(u_x),
+                                            create_graph=True, retain_graph=True)[0]
+            
+
+
+            # Use PDE residual for all modes
+            physics_loss, lambda_value = pde_loss(X_tensor, beta, u, u_xx)
+            loss_type = "PDE residual"
+
+            # Calculate common constraint losses for all modes
+            boundary = boundary_loss(boundary_values, u)
+            norm_loss = normalization_loss(L, u)
+
+
+
+            # Total loss for optimization
+            total_loss = physics_loss + 4*norm_loss + 10*boundary
+
+            # Backpropagate
+            
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
+            optimizer.step()
+            scheduler.step(total_loss)
+
+            # Record current loss for early stopping
+            current_loss = total_loss.item()
+            if current_loss < best_loss:
+                    best_loss = current_loss
+                    patience_counter = 0
+                    u_best=u
+            else:
+                patience_counter += 1
+
+
+
+            if verbose and epoch % 500 == 0:
+                print(f"Epoch {epoch}, λ: {lambda_value.item():.4f}")
+                print(f"Total Loss: {current_loss:.10f}, {loss_type}: {physics_loss.item():.6f}, "
+                    f"norm: {norm_loss.item():.6f}",
+                    f"boundary_loss: {boundary.item():.6f}")
+                #print( f"right:{u[-1].item()}",f"left:{u[0].item()}")
+
+
+            # Early stopping conditions
+            if current_loss <= tol:
+                if verbose:
+                    print(f"Early stop: tolerance reached at epoch {epoch}, loss: {current_loss}")
+                break
+
+            if patience_counter >= patience:
+                if verbose:
+                    print(
+                        f"Early stop: no improvement for {patience} epochs at epoch {epoch}, best loss: {best_loss}")
+                break
+
+
+        models_by_betas[beta] = u_best-torch.min(u_best[0],u_best[-1])
+
+
+    return models_by_betas
+
+
+
+
+def plot_wavefunction( models_by_betas, number, X_test, lb, ub, filename):
+    # Use current working directory so it works in scripts and notebooks
+    folder = os.path.join(os.getcwd(), "plots_test")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as e:
+        print(f"[ERROR] Could not create folder {folder}: {e}")
+        return
+
+    plt.figure(figsize=(8, 6))
+    counter =1
+    u=models_by_betas[0]
+    u_np = u.detach().cpu().numpy()
+
+    plt.plot(X_test, u_np, label=f"β=0")
+
+    for beta, u in models_by_betas.items():
+        counter = counter + 1
+
+        if counter % count  == 0:
+            u_np = u.detach().cpu().numpy()  # ensure safe conversion
+            plt.plot(X_test, u_np, label=f"β={beta:.4f}")
+
+    # Create a proper file name (avoid overwriting)
+    safe_filename = f"{filename}.png"
+    fname = os.path.join(folder, safe_filename)
+
+    plt.title("Mode 0 Wavefunction", fontsize=18)
+    plt.xlabel("x", fontsize=18)
+    plt.ylabel(r"$u(x)$", fontsize=18)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+    plt.xlim(lb, ub)
+    plt.tight_layout()
+
+    plt.savefig(fname, dpi=300)
+    plt.close()
+
+    # Confirm the file exists and report absolute path
+    if os.path.exists(fname):
+        abs_path = os.path.abspath(fname)
+        size = os.path.getsize(fname)
+        print(f"[OK] Saved plot for mode 0 -> {abs_path} ({size} bytes).")
+    else:
+        print(f"[ERROR] Expected file {fname} not found after save attempt.")
+
+
+
+
+
+if __name__ == "__main__":
+    # Setup parameters
+    L=10
+    lb, ub = -L, L # Domain boundaries
+    N_f = 4000  # Number of collocation points
+    epochs = 5001
+    layers = [1,1024,1]  # Neural network architecture
+
+    # Create uniform grid for training and testing
+    X = np.linspace(lb, ub, N_f).reshape(-1, 1)
+
+    total = 10
+    delta = 0.05
+    beta_values = [ delta*(k+1) for k in range(total) ]
+   
+    count = 1
+
+    # Include modes 0 through 5
+    modes = [0]
+
+    # Set the perturbation constant
+    perturb_const = 0.0001  # q in paper
+
+    # Set the tolerance
+    tol = 0.00000001
+    patience=500
+    
+
+    # Nonlinearity powers
+    nonlinearity_powers = [0]
+
+
+    # Train models
+    print("Starting training...")
+    models_by_mode= train_gpe_model(
+        L,  beta_values,  X, layers, epochs, tol, patience, perturb_const, lr=1e-4, verbose=True)
+
+    # Plot wavefunctions for individual modes
+    print("Generating individual mode plots...")
+    plot_wavefunction(models_by_mode, count, X, lb, ub, filename = f"gau_delta_{delta}_L_{L}")
