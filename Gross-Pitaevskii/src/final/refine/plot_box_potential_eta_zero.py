@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
 import pickle
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR
 import math
 import numpy as np
 import os
 import matplotlib.pyplot as plt
 from scipy.special import hermite
 import pandas as pd
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -355,7 +356,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
             elif gamma == 0.0:
                 # Pre-train on analytical solution
                 model = pretrain_on_analytical_solution(model, mode, X_train,
-                                                        epochs=2000, lr=1e-3, verbose=verbose)
+                                                        epochs=2000, lr=1e-5, verbose=verbose)
             else:
                 # Use advanced initialization for any other starting gamma not equal 0
                 model.apply(lambda m: advanced_initialization(m, mode))
@@ -365,15 +366,24 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
             if mode == 0:
                 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
             elif mode == 1:
-                optimizer = torch.optim.Adam(model.parameters(), lr=7e-5)
+                optimizer = torch.optim.Adam(model.parameters(), lr=7e-6)
             elif mode == 2:
-                optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
+                optimizer = torch.optim.Adam(model.parameters(), lr=5e-6)
             else:  # modes 3, 4, 5
-                optimizer = torch.optim.Adam(model.parameters(), lr=3e-5)
+                optimizer = torch.optim.Adam(model.parameters(), lr=3e-6)
 
             # Create scheduler to decrease learning rate during training
-            scheduler = CosineAnnealingWarmRestarts(
-                optimizer, T_0=200, T_mult=2, eta_min=1e-6
+            # scheduler = CosineAnnealingWarmRestarts(
+            #     optimizer, T_0=200, T_mult=2, eta_min=1e-6
+            # )
+
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.5,  # Reduce LR by half
+                patience=500,  # Wait 500 epochs before reducing
+                min_lr=1e-7,
+                verbose=True
             )
 
             # Track learning history
@@ -1074,12 +1084,13 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 0.5
-    #gamma_values = [k * alpha for k in range(201)]
-    gamma_values = [0]
+    alpha = 5.0
+    gamma_values = [k * alpha for k in range(21)]
+    #gamma_values = [0]
 
     # Include modes 0 through 5
-    modes = [0, 1, 2, 3, 4, 5]
+    #modes = [0, 1, 2, 3, 4, 5]
+    modes = [0]
 
     # Set the perturbation constant
     perturb_const = 0.01  # q in paper
@@ -1097,12 +1108,12 @@ if __name__ == "__main__":
         potential_type = "box"
 
         # Train neural network or load existing models
-        train_new = False  # Set to True to train, False to load
+        train_new = True  # Set to True to train, False to load
         # filename = f"box_test.pkl"
-        filename = f"box_mode_zero_plot_data.pkl"
+        filename = f"box_mode_zero_plot_data_all_int_strengths.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"box_test"
+        p_save_dir = f"box_test_all_int_strengths"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
@@ -1130,7 +1141,7 @@ if __name__ == "__main__":
 
         # Plot combined loss history
         print("Generating combined loss plots...")
-        plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
+        # plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
         plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
         plot_mode0_gamma_loss_visualization(training_history, gamma_values, epochs, p, potential_type, p_save_dir)
 

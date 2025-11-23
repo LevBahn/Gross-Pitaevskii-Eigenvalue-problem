@@ -1006,10 +1006,10 @@ if __name__ == "__main__":
     X_test = np.linspace(lb, ub, 1000).reshape(-1, 1)
 
     # Gamma values from the paper
-    alpha = 0.25
+    alpha = 1.0
     # gamma_values = [k * alpha for k in range(201)]
     #gamma_values = [-k * alpha for k in range(81)]
-    gamma_values = [0]
+    gamma_values = [-k * alpha for k in range(21)]
 
     # Include modes 0 through 5
     modes = [0, 1, 2, 3, 4, 5]

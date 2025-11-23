@@ -351,7 +351,7 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
             # Adam optimizer
             # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
             if mode == 0:
-                optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+                optimizer = torch.optim.Adam(model.parameters(), lr=9e-6)
             elif mode == 1:
                 optimizer = torch.optim.Adam(model.parameters(), lr=7e-6)
             elif mode == 2:
@@ -363,14 +363,8 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
             # scheduler = CosineAnnealingWarmRestarts(
             #     optimizer, T_0=200, T_mult=2, eta_min=1e-6
             # )
-            scheduler = ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=0.5,  # Reduce LR by half
-                patience=500,  # Wait 500 epochs before reducing
-                min_lr=1e-7,
-                verbose=True
-            )
+            scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                          patience=3000, verbose=True, min_lr=1e-8)
 
             # Track learning history
             lambda_history = []
@@ -381,7 +375,12 @@ def train_gpe_model(gamma_values, modes, p, X_train, lb, ub, layers,
             best_loss = float('inf')
             best_model_state = None
             patience_counter = 0
-            patience = 2000  # Number of epochs to wait without improvement
+            if mode == 0:
+                patience = 3000
+            elif mode == 1:
+                patience = 2500
+            else:
+                patience = 2000
             final_epoch = epochs  # Track the actual final epoch
 
             for epoch in range(epochs):
@@ -1064,6 +1063,285 @@ def load_models(filename="gpe_models.pkl", save_dir="Gross-Pitaevskii/src/final/
             data['constant_history'], data['epochs_history'])
 
 
+def plot_improved_loss_visualization_publication(training_history, modes, gamma_values, epochs, p, potential_type,
+                                                 save_dir="harmonic_test"):
+    """
+    Creates publication-quality visualization of training progress across different modes.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    colors = plt.cm.tab10(np.linspace(0, 0.6, len(modes)))
+
+    colors_custom = [
+        '#1f77b4',  # Blue - Mode 0
+        '#ff7f0e',  # Orange - Mode 1
+        '#2ca02c',  # Green - Mode 2
+        '#d62728',  # Red - Mode 3
+        '#9467bd',  # Purple - Mode 4
+        '#8c564b',  # Brown - Mode 5
+    ]
+
+    # Plot for each mode at gamma = 0
+    gamma_to_plot = 0
+
+    for i, mode in enumerate(modes):
+        if mode in training_history and gamma_to_plot in training_history[mode]:
+            loss_history = training_history[mode][gamma_to_plot]['loss']
+
+            # Apply smoothing
+            window_size = min(50, len(loss_history) // 10)
+            if window_size > 1:
+                smooth_loss = moving_average(loss_history, window_size)
+                epoch_nums = np.linspace(0, epochs, len(smooth_loss))
+            else:
+                smooth_loss = loss_history
+                epoch_nums = np.linspace(0, epochs, len(smooth_loss))
+
+            ax.semilogy(epoch_nums, smooth_loss,
+                        color=colors_custom[i],
+                        linewidth=2.0,
+                        label=f'Mode {mode}',
+                        alpha=0.9)
+
+    ax.set_xlabel('Epochs', fontsize=14, fontweight='normal')
+    ax.set_ylabel('Loss', fontsize=14, fontweight='normal')
+
+    ax.grid(True, which="major", linestyle='-', alpha=0.2, linewidth=0.8)
+    ax.grid(True, which="minor", linestyle=':', alpha=0.1, linewidth=0.5)
+
+    ax.minorticks_on()
+
+    legend = ax.legend(
+        loc='upper right',
+        frameon=True,
+        framealpha=0.95,
+        edgecolor='black',
+        fancybox=False,
+        ncol=2,
+        fontsize=11,
+        handlelength=2.5,
+        columnspacing=1.0
+    )
+    legend.get_frame().set_linewidth(0.8)
+
+    # Set y-axis limits
+    # ax.set_ylim([1e-6, 1])  # Adjust based on data
+
+    ax.tick_params(axis='both', which='major', direction='in', length=5, width=1.2)
+    ax.tick_params(axis='both', which='minor', direction='in', length=3, width=1.0)
+
+    ax.tick_params(top=True, right=True, which='both')
+
+    plt.tight_layout()
+
+    base_filename = f"loss_history_gravity_well_potential_at_ground_state"
+
+    plt.savefig(os.path.join(save_dir, f"{base_filename}.png"),
+                dpi=300, bbox_inches='tight', facecolor='white')
+
+    plt.close()
+
+
+def train_single_model(X_train, lb, ub, layers, epochs, gamma, p, mode,
+                       lr, tol, perturb_const, potential_type, use_perturbation=True, verbose=True):
+    """
+    Train a single model (either PL-PINN or Vanilla PINN).
+
+    Parameters:
+    -----------
+    use_perturbation : bool
+        If True, trains PL-PINN (with base solution + perturbation)
+        If False, trains Vanilla PINN (direct learning)
+    """
+    # Convert training data to tensors
+    dx = X_train[1, 0] - X_train[0, 0]
+    X_tensor = torch.tensor(X_train, dtype=torch.float32, requires_grad=True).to(device)
+
+    # Create boundary conditions
+    L = ub
+    boundary_points = torch.tensor([[lb], [ub]], dtype=torch.float32).to(device)
+    boundary_values = torch.zeros((2, 1), dtype=torch.float32).to(device)
+
+    # Initialize model
+    model = GrossPitaevskiiPINN(layers, mode=mode, gamma=gamma,
+                                use_perturbation=use_perturbation).to(device)
+
+    # Pre-train
+    model = pretrain_on_analytical_solution(model, mode, X_train,
+                                             epochs=2000, lr=1e-5, verbose=verbose)
+
+    # Optimizer and scheduler
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                  patience=500, min_lr=1e-7, verbose=False)
+
+    # Track training history
+    loss_history = []
+    lambda_history = []
+
+    # Early stopping variables
+    best_loss = float('inf')
+    best_model_state = None
+    patience_counter = 0
+    patience = 2000
+
+    # Normalization constant (for PL-PINN)
+    normal_const = None
+
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+
+        # Forward pass
+        u_pred = model.forward(X_tensor)
+
+        # Apply perturbation scaling for PL-PINN
+        if use_perturbation:
+            if epoch == 0 and gamma == 0:
+                normal_const = torch.max(u_pred).detach().clone()
+                u_pred = perturb_const * u_pred / normal_const
+            else:
+                u_pred = perturb_const * u_pred / normal_const
+
+        # Calculate losses
+        boundary_loss = model.boundary_loss(boundary_points, boundary_values)
+
+        if use_perturbation:
+            full_u = model.get_complete_solution(X_tensor, u_pred)
+            norm_loss = model.normalization_loss(full_u, dx)
+        else:
+            norm_loss = model.normalization_loss(u_pred, dx)
+
+        constraint_loss = 10.0 * boundary_loss + 20.0 * norm_loss
+        pde_loss, lambda_value = model.pde_loss(X_tensor, u_pred, gamma, p, potential_type)
+
+        # Total loss
+        total_loss = pde_loss + constraint_loss
+
+        # Backpropagate
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step(total_loss)
+
+        # Track history
+        current_loss = total_loss.item()
+        if epoch % 10 == 0:
+            loss_history.append(current_loss)
+            lambda_history.append(lambda_value.item())
+
+        # Early stopping
+        if current_loss < best_loss:
+            best_loss = current_loss
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if verbose and epoch % 500 == 0:
+            method = "PL-PINN" if use_perturbation else "Vanilla PINN"
+            print(f"[{method}] Epoch {epoch}, Loss: {current_loss:.6e}, μ: {lambda_value.item():.4f}")
+
+        # Early stopping conditions
+        if current_loss <= tol or patience_counter >= patience:
+            if verbose:
+                method = "PL-PINN" if use_perturbation else "Vanilla PINN"
+                print(f"[{method}] Stopped at epoch {epoch}, Final loss: {current_loss:.6e}")
+            break
+
+    # Load best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    return model, loss_history, lambda_history
+
+
+def compare_pl_pinn_vs_vanilla(X_train, lb, ub, layers, epochs, gamma, p, mode,
+                               lr, tol, perturb_const, potential_type='box',
+                               save_dir='comparison_results'):
+    """
+    Train both PL-PINN and Vanilla PINN and compare their performance.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Train PL-PINN
+    print("\n Training PL-PINN ...")
+    pl_model, pl_loss_history, pl_lambda_history = train_single_model(
+        X_train, lb, ub, layers, epochs, gamma, p, mode,
+        lr, tol, perturb_const, potential_type, use_perturbation=True, verbose=True
+    )
+
+    # Train Vanilla PINN
+    print("\n Training Vanilla PINN ...")
+    vanilla_model, vanilla_loss_history, vanilla_lambda_history = train_single_model(
+        X_train, lb, ub, layers, epochs, gamma, p, mode,
+        lr, tol, perturb_const, potential_type, use_perturbation=False, verbose=True
+    )
+
+    # Create comparison plot
+    plot_comparison_loss(pl_loss_history, vanilla_loss_history, epochs, save_dir)
+
+    return pl_model, vanilla_model, pl_loss_history, vanilla_loss_history
+
+
+def plot_comparison_loss(pl_loss_history, vanilla_loss_history, epochs, save_dir):
+    """
+    Create a publication-quality comparison plot of training losses.
+    """
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    pl_color = '#1f77b4'  # Blue
+    vanilla_color = '#d62728'  # Red
+
+    # Create epoch arrays
+    pl_epochs = np.linspace(0, epochs, len(pl_loss_history))
+    vanilla_epochs = np.linspace(0, epochs, len(vanilla_loss_history))
+
+    # Smooth the data
+    window = min(50, len(pl_loss_history) // 10)
+    if window > 1:
+        pl_smooth = moving_average(pl_loss_history, window)
+        vanilla_smooth = moving_average(vanilla_loss_history, window)
+        pl_epochs_smooth = np.linspace(0, epochs, len(pl_smooth))
+        vanilla_epochs_smooth = np.linspace(0, epochs, len(vanilla_smooth))
+    else:
+        pl_smooth = pl_loss_history
+        vanilla_smooth = vanilla_loss_history
+        pl_epochs_smooth = pl_epochs
+        vanilla_epochs_smooth = vanilla_epochs
+
+    ax.semilogy(vanilla_epochs_smooth, vanilla_smooth,
+                color=vanilla_color, linewidth=2.5,
+                label='Vanilla PINN', alpha=0.9)
+
+    ax.semilogy(pl_epochs_smooth, pl_smooth,
+                color=pl_color, linewidth=2.5,
+                label='PL-PINN', alpha=0.9)
+
+    ax.set_xlabel('Epochs', fontsize=14)
+    ax.set_ylabel('Loss', fontsize=14)
+
+    ax.grid(True, which="major", linestyle='-', alpha=0.2, linewidth=0.8)
+    ax.grid(True, which="minor", linestyle=':', alpha=0.1, linewidth=0.5)
+    ax.minorticks_on()
+
+    legend = ax.legend(loc='best', frameon=True, framealpha=0.95,
+                       edgecolor='black', fancybox=False, fontsize=12)
+    legend.get_frame().set_linewidth(0.8)
+
+    ax.tick_params(axis='both', which='major', direction='in', length=5, width=1.2)
+    ax.tick_params(axis='both', which='minor', direction='in', length=3, width=1.0)
+    ax.tick_params(top=True, right=True, which='both')
+
+    plt.tight_layout()
+
+    filename = "pl_pinn_vs_vanilla_comparison_gravity_well_potential"
+    plt.savefig(os.path.join(save_dir, f"{filename}.png"),
+                dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+
 if __name__ == "__main__":
     # Setup parameters
     lb, ub = 0, 35 # Domain boundaries
@@ -1078,11 +1356,11 @@ if __name__ == "__main__":
     # Gamma values from the paper
     alpha = 5
     #gamma_values = [k * alpha for k in range(401)]
-    gamma_values = [k * alpha for k in range(21)]
-    #gamma_values = [0]
+    #gamma_values = [k * alpha for k in range(21)]
+    gamma_values = [0]
 
     # Include modes 0 through 5
-    modes = [0]
+    modes = [0, 1, 2, 3, 4, 5]
 
     # Set the perturbation constant
     perturb_const = 0.01  # q in paper
@@ -1100,10 +1378,10 @@ if __name__ == "__main__":
 
         # Train neural network or load existing models
         train_new = True  # Set to True to train, False to load
-        filename = f"gravity_well_all_int_strengths_zero_plot_data.pkl"
+        filename = f"gravity_well_zero_plot_data.pkl"
 
         # Create plotting and model saving directory
-        p_save_dir = f"gravity_well_all_int_strengths_test"
+        p_save_dir = f"gravity_well_test"
         os.makedirs(p_save_dir, exist_ok=True)
 
         if train_new:
@@ -1129,10 +1407,17 @@ if __name__ == "__main__":
         # print("Generating chemical potential vs. gamma plot...")
         # plot_lambda_vs_eta(mu_table, modes, p, potential_type, p_save_dir)
 
+        # # Run comparison at ground state (mode 0 and gamma = 0)
+        comparison_dir = f"{p_save_dir}/comparison"
+        compare_pl_pinn_vs_vanilla(X_train=X, lb=lb, ub=ub, layers=layers,
+                                   epochs=epochs, gamma=0, p=p, mode=0, lr=1e-5, tol=tol,
+                                   perturb_const=perturb_const, potential_type=potential_type,
+                                   save_dir=comparison_dir
+                                   )
+
         # Plot combined loss history
         print("Generating combined loss plots...")
+        plot_improved_loss_visualization_publication(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
         # plot_improved_loss_visualization(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
-        plot_all_modes_gamma_loss(training_history, modes, gamma_values, epochs, p, potential_type, p_save_dir)
-        plot_mode0_gamma_loss_visualization(training_history, gamma_values, epochs, p, potential_type, p_save_dir)
 
         print(f"Results saved to: {p_save_dir}/")
